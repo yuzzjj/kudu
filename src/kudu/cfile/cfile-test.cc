@@ -31,10 +31,11 @@ using fs::WritableBlock;
 class TestCFile : public CFileTestBase {
  protected:
   template <class DataGeneratorType>
-  void TestReadWriteFixedSizeTypes(EncodingType encoding) {
+  void TestReadWriteFixedSizeTypes(EncodingType encoding, CompressionType compression) {
     BlockId block_id;
     DataGeneratorType generator;
-    WriteTestFile(&generator, encoding, NO_COMPRESSION, 10000, SMALL_BLOCKSIZE, &block_id);
+
+    WriteTestFile(&generator, encoding, compression, 10000, SMALL_BLOCKSIZE, &block_id);
 
     gscoped_ptr<ReadableBlock> block;
     ASSERT_OK(fs_manager_->OpenBlock(block_id, &block));
@@ -352,20 +353,53 @@ TEST_F(TestCFile, TestWrite1MDuplicateFileStringsDictEncoding) {
   }
 }
 
-TEST_F(TestCFile, TestFixedSizeReadWriteUInt32) {
-  TestReadWriteFixedSizeTypes<UInt32DataGenerator<false> >(GROUP_VARINT);
-  TestReadWriteFixedSizeTypes<UInt32DataGenerator<false> >(PLAIN_ENCODING);
+TEST_F(TestCFile, TestFixedSizeReadWritePlainEncodingUInt32) {
+  TestReadWriteFixedSizeTypes<UInt32DataGenerator<false> >(GROUP_VARINT, NO_COMPRESSION);
+  TestReadWriteFixedSizeTypes<UInt32DataGenerator<false> >(PLAIN_ENCODING, NO_COMPRESSION);
 }
 
-TEST_F(TestCFile, TestFixedSizeReadWriteInt32) {
-  TestReadWriteFixedSizeTypes<Int32DataGenerator<false> >(PLAIN_ENCODING);
+TEST_F(TestCFile, TestFixedSizeReadWritePlainEncodingInt32) {
+  TestReadWriteFixedSizeTypes<Int32DataGenerator<false> >(PLAIN_ENCODING, NO_COMPRESSION);
 }
 
-TEST_F(TestCFile, TestFixedSizeReadWriteFloat) {
-  TestReadWriteFixedSizeTypes<FPDataGenerator<FLOAT, false> >(PLAIN_ENCODING);
+TEST_F(TestCFile, TestFixedSizeReadWritePlainEncodingFloat) {
+  TestReadWriteFixedSizeTypes<FPDataGenerator<FLOAT, false> >(PLAIN_ENCODING, NO_COMPRESSION);
 }
-TEST_F(TestCFile, TestFixedSizeReadWriteDouble) {
-  TestReadWriteFixedSizeTypes<FPDataGenerator<DOUBLE, false> >(PLAIN_ENCODING);
+TEST_F(TestCFile, TestFixedSizeReadWritePlainEncodingDouble) {
+  TestReadWriteFixedSizeTypes<FPDataGenerator<DOUBLE, false> >(PLAIN_ENCODING, NO_COMPRESSION);
+}
+
+// Test for BitShuffle builder for UINT8, INT8, UINT16, INT16, UINT32, INT32, FLOAT, DOUBLE
+TEST_F(TestCFile, TestFixedSizeReadWriteBitShuffleUINT8) {
+  TestReadWriteFixedSizeTypes<UInt8DataGenerator<false> >(BIT_SHUFFLE, NO_COMPRESSION);
+}
+
+TEST_F(TestCFile, TestFixedSizeReadWriteBitShuffleINT8) {
+  TestReadWriteFixedSizeTypes<Int8DataGenerator<false> >(BIT_SHUFFLE, NO_COMPRESSION);
+}
+
+TEST_F(TestCFile, TestFixedSizeReadWriteBitShuffleUINT16) {
+  TestReadWriteFixedSizeTypes<UInt16DataGenerator<false> >(BIT_SHUFFLE, NO_COMPRESSION);
+}
+
+TEST_F(TestCFile, TestFixedSizeReadWriteBitShuffleINT16) {
+  TestReadWriteFixedSizeTypes<Int16DataGenerator<false> >(BIT_SHUFFLE, NO_COMPRESSION);
+}
+
+TEST_F(TestCFile, TestFixedSizeReadWriteBitShuffleUInt32) {
+  TestReadWriteFixedSizeTypes<UInt32DataGenerator<false> >(BIT_SHUFFLE, NO_COMPRESSION);
+}
+
+TEST_F(TestCFile, TestFixedSizeReadWriteBitShuffleInt32) {
+  TestReadWriteFixedSizeTypes<Int32DataGenerator<false> >(BIT_SHUFFLE, NO_COMPRESSION);
+}
+
+TEST_F(TestCFile, TestFixedSizeReadWriteBitShuffleFloat) {
+  TestReadWriteFixedSizeTypes<FPDataGenerator<FLOAT, false> >(BIT_SHUFFLE, NO_COMPRESSION);
+}
+
+TEST_F(TestCFile, TestFixedSizeReadWriteBitShuffleDouble) {
+  TestReadWriteFixedSizeTypes<FPDataGenerator<DOUBLE, false> >(BIT_SHUFFLE, NO_COMPRESSION);
 }
 
 void EncodeStringKey(const Schema &schema, const Slice& key,

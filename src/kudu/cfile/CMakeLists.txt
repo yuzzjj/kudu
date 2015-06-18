@@ -12,6 +12,7 @@ target_link_libraries(cfile_proto
   protobuf)
 
 add_library(cfile
+  bitshuffle.c
   block_cache.cc
   block_compression.cc
   bloomfile.cc
