@@ -30,6 +30,13 @@ static const char* const kCommentColName = "l_comment";
 
 static const client::KuduColumnStorageAttributes kPlainEncoding =
     client::KuduColumnStorageAttributes(client::KuduColumnStorageAttributes::PLAIN_ENCODING);
+static const client::KuduColumnStorageAttributes kCompressedPlainEncoding =
+  client::KuduColumnStorageAttributes(client::KuduColumnStorageAttributes::PLAIN_ENCODING,
+                                      client::KuduColumnStorageAttributes::LZ4);
+static const client::KuduColumnStorageAttributes kDictEncoding =
+    client::KuduColumnStorageAttributes(client::KuduColumnStorageAttributes::DICT_ENCODING);
+static const client::KuduColumnStorageAttributes kBitShuffleEncoding =
+    client::KuduColumnStorageAttributes(client::KuduColumnStorageAttributes::BIT_SHUFFLE);
 
 static const client::KuduColumnSchema::DataType kInt64 =
     client::KuduColumnSchema::INT64;
@@ -61,28 +68,33 @@ enum {
 
 inline client::KuduSchema CreateLineItemSchema() {
   return client::KuduSchema(boost::assign::list_of
-                (client::KuduColumnSchema(kOrderKeyColName, kInt64))
-                (client::KuduColumnSchema(kLineNumberColName, kInt32))
-                (client::KuduColumnSchema(kPartKeyColName, kInt32))
-                (client::KuduColumnSchema(kSuppKeyColName, kInt32))
-                (client::KuduColumnSchema(kQuantityColName, kInt32)) // decimal??
-                (client::KuduColumnSchema(kExtendedPriceColName, kDouble))
-                (client::KuduColumnSchema(kDiscountColName, kDouble))
-                (client::KuduColumnSchema(kTaxColName, kDouble))
-                (client::KuduColumnSchema(kReturnFlagColName, kString,
-                                          false, NULL, kPlainEncoding))
-                (client::KuduColumnSchema(kLineStatusColName, kString,
-                                          false, NULL, kPlainEncoding))
-                (client::KuduColumnSchema(kShipDateColName, kString,
-                                          false, NULL, kPlainEncoding))
+                            (client::KuduColumnSchema(kOrderKeyColName, kInt64,
+                                                      false, NULL, kBitShuffleEncoding))
+                            (client::KuduColumnSchema(kLineNumberColName, kInt32,
+                                                      false, NULL, kBitShuffleEncoding))
+                            (client::KuduColumnSchema(kPartKeyColName, kInt32,
+                                                      false, NULL, kBitShuffleEncoding))
+                            (client::KuduColumnSchema(kSuppKeyColName, kInt32,
+                                                      false, NULL, kBitShuffleEncoding))
+                            (client::KuduColumnSchema(kQuantityColName, kInt32, // decimal??
+                                                      false, NULL, kBitShuffleEncoding))
+                            (client::KuduColumnSchema(kExtendedPriceColName, kDouble))
+                            (client::KuduColumnSchema(kDiscountColName, kDouble))
+                            (client::KuduColumnSchema(kTaxColName, kDouble))
+                            (client::KuduColumnSchema(kReturnFlagColName, kString,
+                                                      false, NULL, kDictEncoding))
+                            (client::KuduColumnSchema(kLineStatusColName, kString,
+                                                      false, NULL, kDictEncoding))
+                            (client::KuduColumnSchema(kShipDateColName, kString,
+                                          false, NULL, kDictEncoding))
                 (client::KuduColumnSchema(kCommitDateColName, kString,
-                                          false, NULL, kPlainEncoding))
+                                          false, NULL, kDictEncoding))
                 (client::KuduColumnSchema(kReceiptDateColName, kString,
-                                          false, NULL, kPlainEncoding))
+                                          false, NULL, kDictEncoding))
                 (client::KuduColumnSchema(kShipInstructColName, kString,
-                                          false, NULL, kPlainEncoding))
+                                          false, NULL, kDictEncoding))
                 (client::KuduColumnSchema(kShipModeColName, kString,
-                                          false, NULL, kPlainEncoding))
+                                          false, NULL, kDictEncoding))
                 (client::KuduColumnSchema(kCommentColName, kString,
                                           false, NULL, kPlainEncoding))
                 , 2);

@@ -28,6 +28,8 @@ add_library(cfile
   string_prefix_block.cc
   type_encodings.cc)
 
+set_source_files_properties(bitshuffle.c PROPERTIES COMPILE_FLAGS -mavx2)
+
 target_link_libraries(cfile
   kudu_common
   kudu_fs

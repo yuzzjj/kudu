@@ -26,7 +26,7 @@ StringDictBlockBuilder::StringDictBlockBuilder(const WriterOptions* options)
     dict_block_(options_),
     dictionary_strings_arena_(1024, 32*1024*1024),
     mode_(kCodeWordMode) {
-  data_builder_.reset(new BShufBlockBuilder<UINT32>(options_));
+  data_builder_.reset(new BShufBlockBuilder<UINT16>(options_));
   Reset();
 }
 
@@ -83,7 +83,7 @@ int StringDictBlockBuilder::AddCodeWords(const uint8_t* vals, size_t count) {
     const Slice* src = reinterpret_cast<const Slice*>(vals);
     const char* c_str = reinterpret_cast<const char*>(src->data());
     StringPiece current_item(c_str, src->size());
-    uint32_t codeword;
+    uint16_t codeword;
 
     if (!FindCopy(dictionary_, current_item, &codeword)) {
       // The dictionary block is full
@@ -178,7 +178,7 @@ Status StringDictBlockDecoder::ParseHeader() {
   Slice content(data_.data() + 4, data_.size() - 4);
 
   if (mode_ == kCodeWordMode) {
-    data_decoder_.reset(new BShufBlockDecoder<UINT32>(content));
+    data_decoder_.reset(new BShufBlockDecoder<UINT16>(content));
   } else {
     if (mode_ != kPlainStringMode) {
       return Status::Corruption("Unrecognized Dictionary encoded data block header");
@@ -219,24 +219,24 @@ Status StringDictBlockDecoder::SeekAtOrAfterValue(const void* value_void, bool* 
 
 Status StringDictBlockDecoder::CopyNextDecodeStrings(size_t* n, ColumnDataView* dst) {
   DCHECK(parsed_);
-  CHECK_EQ(dst->type_info()->type(), STRING);
+  DCHECK_EQ(dst->type_info()->type(), STRING);
   DCHECK_LE(*n, dst->nrows());
   DCHECK_EQ(dst->stride(), sizeof(Slice));
 
   Arena* out_arena = dst->arena();
   Slice* out = reinterpret_cast<Slice*>(dst->data());
 
-  codeword_buf_.resize((*n)*sizeof(uint32_t));
+  codeword_buf_.resize((*n)*sizeof(uint16_t));
 
   // Copy the codewords into a temporary buffer first.
   // And then Copy the strings corresponding to the codewords to the destination buffer.
-  BShufBlockDecoder<UINT32>* d_bptr = down_cast<BShufBlockDecoder<UINT32>*>(data_decoder_.get());
+  BShufBlockDecoder<UINT16>* d_bptr = down_cast<BShufBlockDecoder<UINT16>*>(data_decoder_.get());
   RETURN_NOT_OK(d_bptr->CopyNextValuesToArray(n, codeword_buf_.data()));
 
   for (int i = 0; i < *n; i++) {
-    uint32_t codeword = *reinterpret_cast<uint32_t*>(&codeword_buf_[i*sizeof(uint32_t)]);
+    uint16_t codeword = *reinterpret_cast<uint16_t*>(&codeword_buf_[i*sizeof(uint16_t)]);
     Slice elem = dict_decoder_->string_at_index(codeword);
-    CHECK(out_arena->RelocateSlice(elem, out));
+    CHECK(PREDICT_TRUE(out_arena->RelocateSlice(elem, out)));
     out++;
   }
   return Status::OK();

@@ -1331,7 +1331,7 @@ int64_t bshuf_decompress_lz4_block(ioc_chain *C_ptr,
     if (tmp_buf == NULL) return -1;
 
 #ifdef BSHUF_LZ4_DECOMPRESS_FAST
-    nbytes = LZ4_uncompress((char*) in + 4, tmp_buf, size * elem_size);
+    nbytes = LZ4_decompress_fast((char*) in + 4, tmp_buf, size * elem_size);
     CHECK_ERR_FREE_LZ(nbytes, tmp_buf);
     if (nbytes != nbytes_from_header) {
         free(tmp_buf);
