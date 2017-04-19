@@ -30,6 +30,7 @@ add_library(kudu_fs
   block_manager.cc
   block_manager_metrics.cc
   block_manager_util.cc
+  data_dirs.cc
   file_block_manager.cc
   fs_manager.cc
   log_block_manager.cc)
@@ -45,3 +46,7 @@ ADD_KUDU_TEST(block_manager-test)
 ADD_KUDU_TEST(block_manager_util-test)
 ADD_KUDU_TEST(block_manager-stress-test RUN_SERIAL true)
 ADD_KUDU_TEST(fs_manager-test)
+if (NOT APPLE)
+  # Will only pass on Linux.
+  ADD_KUDU_TEST(log_block_manager-test)
+endif()

@@ -15,6 +15,19 @@
 # specific language governing permissions and limitations
 # under the License.
 
+PROTOBUF_GENERATE_CPP(
+  CLIENT_PROTO_SRCS CLIENT_PROTO_HDRS CLIENT_PROTO_TGTS
+  SOURCE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..
+  BINARY_ROOT ${CMAKE_CURRENT_BINARY_DIR}/../..
+  PROTO_FILES client.proto)
+set(CLIENT_PROTO_LIBS
+  kudu_common_proto
+  token_proto)
+ADD_EXPORTABLE_LIBRARY(client_proto
+  SRCS ${CLIENT_PROTO_SRCS}
+  DEPS ${CLIENT_PROTO_LIBS}
+  NONLINK_DEPS ${CLIENT_PROTO_TGTS})
+
 set(CLIENT_SRCS
   batcher.cc
   client.cc
@@ -22,29 +35,36 @@ set(CLIENT_SRCS
   client-internal.cc
   error_collector.cc
   error-internal.cc
+  master_rpc.cc
   meta_cache.cc
+  partitioner-internal.cc
   scan_batch.cc
+  scan_configuration.cc
   scan_predicate.cc
+  scan_token-internal.cc
   scanner-internal.cc
-  session-internal.cc
+  replica-internal.cc
+  resource_metrics.cc
   schema.cc
+  session-internal.cc
   table-internal.cc
   table_alterer-internal.cc
   table_creator-internal.cc
+  tablet-internal.cc
   tablet_server-internal.cc
   value.cc
   write_op.cc
 )
 
 set(CLIENT_LIBS
-  kudu_common
-  master_proto
-  master_rpc
-  tserver_proto
-  tserver_service_proto
-  kudu_util
+  client_proto
   gutil
-  krpc)
+  krpc
+  kudu_common
+  kudu_util
+  master_proto
+  tserver_proto
+  tserver_service_proto)
 
 # Make sure we exclude tcmalloc from the exported library; we want the library
 # code to use the linking application's malloc implementation.
@@ -99,7 +119,7 @@ ADD_EXPORTABLE_LIBRARY(kudu_client
 # For a detailed explanation of the kinds of C++ changes that would break ABI
 # compatibility, see:
 #
-#   https://techbase.kde.org/Policies/Binary_Compatibility_Issues_With_C++
+#   https://community.kde.org/Policies/Binary_Compatibility_Issues_With_C++
 #
 # For more background on library versions, see:
 #
@@ -161,6 +181,7 @@ install(FILES
   stubs.h
   value.h
   write_op.h
+  resource_metrics.h
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/kudu/client)
 
 # Headers: common
@@ -236,3 +257,5 @@ endif()
 set(KUDU_TEST_LINK_LIBS kudu_client integration-tests ${KUDU_MIN_TEST_LIBS})
 ADD_KUDU_TEST(client-test)
 ADD_KUDU_TEST(client-unittest)
+ADD_KUDU_TEST(predicate-test)
+ADD_KUDU_TEST(scan_token-test)

@@ -17,10 +17,12 @@
 #ifndef KUDU_TABLET_ROWSET_MANAGER_H
 #define KUDU_TABLET_ROWSET_MANAGER_H
 
+#include <unordered_map>
 #include <vector>
 #include <utility>
 
 #include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/map-util.h"
 #include "kudu/util/status.h"
 #include "kudu/tablet/rowset.h"
 
@@ -71,11 +73,25 @@ class RowSetTree {
   void FindRowSetsWithKeyInRange(const Slice &encoded_key,
                                  std::vector<RowSet *> *rowsets) const;
 
+  // Call 'cb(rowset, index)' for each (rowset, index) pair such that
+  // 'encoded_keys[index]' may be within the bounds of 'rowset'.
+  //
+  // See IntervalTree::ForEachIntervalContainingPoints for additional
+  // information on the particular order in which the callback will be called.
+  //
+  // REQUIRES: 'encoded_keys' must be in sorted order.
+  void ForEachRowSetContainingKeys(const std::vector<Slice>& encoded_keys,
+                                   const std::function<void(RowSet*, int)>& cb) const;
+
   void FindRowSetsIntersectingInterval(const Slice &lower_bound,
                                        const Slice &upper_bound,
                                        std::vector<RowSet *> *rowsets) const;
 
   const RowSetVector &all_rowsets() const { return all_rowsets_; }
+
+  RowSet* drs_by_id(int64_t drs_id) const {
+    return FindPtrOrNull(drs_by_id_, drs_id);
+  }
 
   // Iterates over RowSetTree::RSEndpoint, guaranteed to be ordered and for
   // any rowset to appear exactly twice, once at its start slice and once at
@@ -99,6 +115,9 @@ class RowSetTree {
 
   // All of the rowsets which were put in this RowSetTree.
   RowSetVector all_rowsets_;
+
+  // The DiskRowSets in this RowSetTree, keyed by their id.
+  std::unordered_map<int64_t, RowSet*> drs_by_id_;
 
   // Rowsets for which the bounds are unknown -- e.g because they
   // are mutable (MemRowSets).

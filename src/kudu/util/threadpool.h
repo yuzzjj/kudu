@@ -21,6 +21,7 @@
 #include <gtest/gtest_prod.h>
 #include <list>
 #include <memory>
+#include <unordered_set>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,7 @@
 namespace kudu {
 
 class Histogram;
+class Thread;
 class ThreadPool;
 class Trace;
 
@@ -52,6 +54,27 @@ class Runnable {
 //    Since thread names are limited to 16 characters on Linux, it's good to
 //    choose a short name here.
 //    Required.
+//
+// trace_metric_prefix: used to prefix the names of TraceMetric counters.
+//    When a task on a thread pool has an associated trace, the thread pool
+//    implementation will increment TraceMetric counters to indicate the
+//    amount of time spent waiting in the queue as well as the amount of wall
+//    and CPU time spent executing. By default, these counters are prefixed
+//    with the name of the thread pool. For example, if the pool is named
+//    'apply', then counters such as 'apply.queue_time_us' will be
+//    incremented.
+//
+//    The TraceMetrics implementation relies on the number of distinct counter
+//    names being small. Thus, if the thread pool name itself is dynamically
+//    generated, the default behavior described above would result in an
+//    unbounded number of distinct cunter names. The 'trace_metric_prefix'
+//    setting can be used to override the prefix used in generating the trace
+//    metric names.
+//
+//    For example, the Raft thread pools are named "<tablet id>-raft" which
+//    has unbounded cardinality (a server may have thousands of different
+//    tablet IDs over its lifetime). In that case, setting the prefix to
+//    "raft" will avoid any issues.
 //
 // min_threads: Minimum number of threads we'll have at any time.
 //    Default: 0.
@@ -73,6 +96,7 @@ class ThreadPoolBuilder {
 
   // Note: We violate the style guide by returning mutable references here
   // in order to provide traditional Builder pattern conveniences.
+  ThreadPoolBuilder& set_trace_metric_prefix(const std::string& prefix);
   ThreadPoolBuilder& set_min_threads(int min_threads);
   ThreadPoolBuilder& set_max_threads(int max_threads);
   ThreadPoolBuilder& set_max_queue_size(int max_queue_size);
@@ -90,6 +114,7 @@ class ThreadPoolBuilder {
  private:
   friend class ThreadPool;
   const std::string name_;
+  std::string trace_metric_prefix_;
   int min_threads_;
   int max_threads_;
   int max_queue_size_;
@@ -132,12 +157,10 @@ class ThreadPool {
   Status SubmitClosure(const Closure& task) WARN_UNUSED_RESULT;
 
   // Submit a function binded using boost::bind(&FuncName, args...)
-  Status SubmitFunc(const boost::function<void()>& func)
-      WARN_UNUSED_RESULT;
+  Status SubmitFunc(boost::function<void()> func) WARN_UNUSED_RESULT;
 
   // Submit a Runnable class
-  Status Submit(const std::shared_ptr<Runnable>& task)
-      WARN_UNUSED_RESULT;
+  Status Submit(std::shared_ptr<Runnable> task) WARN_UNUSED_RESULT;
 
   // Wait until all the tasks are completed.
   void Wait();
@@ -176,14 +199,14 @@ class ThreadPool {
   // Initialize the thread pool by starting the minimum number of threads.
   Status Init();
 
-  // Clear all entries from queue_. Requires that lock_ is held.
-  void ClearQueue();
-
   // Dispatcher responsible for dequeueing and executing the tasks
   void DispatchThread(bool permanent);
 
   // Create new thread. Required that lock_ is held.
   Status CreateThreadUnlocked();
+
+  // Aborts if the current thread is a member of this thread pool.
+  void CheckNotPoolThreadUnlocked();
 
  private:
   FRIEND_TEST(TestThreadPool, TestThreadPoolWithNoMinimum);
@@ -213,9 +236,19 @@ class ThreadPool {
   int queue_size_;
   std::list<QueueEntry> queue_;
 
+  // Pointers to all running threads. Raw pointers are safe because a Thread
+  // may only go out of scope after being removed from threads_.
+  //
+  // Protected by lock_.
+  std::unordered_set<Thread*> threads_;
+
   scoped_refptr<Histogram> queue_length_histogram_;
   scoped_refptr<Histogram> queue_time_us_histogram_;
   scoped_refptr<Histogram> run_time_us_histogram_;
+
+  const char* queue_time_trace_metric_name_;
+  const char* run_wall_time_trace_metric_name_;
+  const char* run_cpu_time_trace_metric_name_;
 
   DISALLOW_COPY_AND_ASSIGN(ThreadPool);
 };

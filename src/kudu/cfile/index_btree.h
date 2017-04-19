@@ -18,8 +18,8 @@
 #ifndef KUDU_CFILE_INDEX_BTREE_H
 #define KUDU_CFILE_INDEX_BTREE_H
 
-#include <boost/ptr_container/ptr_vector.hpp>
 #include <memory>
+#include <vector>
 
 #include "kudu/cfile/block_handle.h"
 #include "kudu/cfile/cfile.pb.h"
@@ -28,8 +28,6 @@
 
 namespace kudu {
 namespace cfile {
-
-using boost::ptr_vector;
 
 class CFileReader;
 class CFileWriter;
@@ -63,7 +61,7 @@ class IndexTreeBuilder {
   const WriterOptions *options_;
   CFileWriter *writer_;
 
-  ptr_vector<IndexBlockBuilder> idx_blocks_;
+  std::vector<std::unique_ptr<IndexBlockBuilder>> idx_blocks_;
 
   DISALLOW_COPY_AND_ASSIGN(IndexTreeBuilder);
 };
@@ -87,6 +85,10 @@ class IndexTreeIterator {
   static IndexTreeIterator *Create(
     const CFileReader *reader,
     const BlockPointer &idx_root);
+
+  const CFileReader* cfile_reader() const {
+    return reader_;
+  }
 
  private:
   IndexBlockIterator *BottomIter();
@@ -116,7 +118,7 @@ class IndexTreeIterator {
 
   BlockPointer root_block_;
 
-  ptr_vector<SeekedIndex> seeked_indexes_;
+  std::vector<std::unique_ptr<SeekedIndex>> seeked_indexes_;
 
   DISALLOW_COPY_AND_ASSIGN(IndexTreeIterator);
 };

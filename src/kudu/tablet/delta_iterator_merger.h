@@ -42,7 +42,7 @@ class DeltaIteratorMerger : public DeltaIterator {
       const std::vector<std::shared_ptr<DeltaStore> > &stores,
       const Schema* projection,
       const MvccSnapshot &snapshot,
-      std::shared_ptr<DeltaIterator>* out);
+      std::unique_ptr<DeltaIterator>* out);
 
   ////////////////////////////////////////////////////////////
   // Implementations of DeltaIterator
@@ -57,12 +57,13 @@ class DeltaIteratorMerger : public DeltaIterator {
                                                  vector<DeltaKeyAndUpdate>* out,
                                                  Arena* arena) OVERRIDE;
   virtual bool HasNext() OVERRIDE;
+  bool MayHaveDeltas() override;
   virtual std::string ToString() const OVERRIDE;
 
  private:
-  explicit DeltaIteratorMerger(vector<std::shared_ptr<DeltaIterator> > iters);
+  explicit DeltaIteratorMerger(vector<std::unique_ptr<DeltaIterator> > iters);
 
-  std::vector<std::shared_ptr<DeltaIterator> > iters_;
+  std::vector<std::unique_ptr<DeltaIterator> > iters_;
 };
 
 } // namespace tablet

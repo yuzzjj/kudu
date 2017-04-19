@@ -38,6 +38,10 @@ void InitSpinLockContentionProfiling();
 // since the server started.
 uint64_t GetSpinLockContentionMicros();
 
+// Return the total number of microseconds spent in tcmalloc contention
+// since the server started.
+uint64_t GetTcmallocContentionMicros();
+
 // Register metrics in the given server entity which measure the amount of
 // spinlock contention.
 void RegisterSpinLockContentionMetrics(const scoped_refptr<MetricEntity>& entity);
@@ -63,7 +67,7 @@ void StartSynchronizationProfiling();
 // due to the contention buffer overflowing. If profiling is enabled during this
 // call, then the 'drop_count' may be slightly out-of-date with respect to the
 // returned samples.
-void FlushSynchronizationProfile(std::stringstream* out, int64_t* drop_count);
+void FlushSynchronizationProfile(std::ostringstream* out, int64_t* drop_count);
 
 // Stop collecting contention profiles.
 void StopSynchronizationProfiling();

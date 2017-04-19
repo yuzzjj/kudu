@@ -16,20 +16,21 @@
 // under the License.
 
 #include <fcntl.h>
+#include <sys/types.h>
+
 #include <memory>
 #include <string>
-#include <sys/types.h>
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include "kudu/gutil/bind.h"
+#include "kudu/gutil/strings/human_readable.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/strings/util.h"
 #include "kudu/util/env.h"
 #include "kudu/util/env_util.h"
 #include "kudu/util/malloc.h"
-#include "kudu/util/memenv/memenv.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h"
@@ -51,9 +52,11 @@ namespace kudu {
 
 using std::shared_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 static const uint64_t kOneMb = 1024 * 1024;
+static const uint64_t kTwoMb = 2 * kOneMb;
 
 class TestEnv : public KuduTest {
  public:
@@ -105,7 +108,7 @@ class TestEnv : public KuduTest {
   }
 
   void MakeVectors(int num_slices, int slice_size, int num_iterations,
-                   gscoped_ptr<faststring[]>* data, vector<vector<Slice > >* vec) {
+                   unique_ptr<faststring[]>* data, vector<vector<Slice > >* vec) {
     data->reset(new faststring[num_iterations * num_slices]);
     vec->resize(num_iterations);
 
@@ -127,7 +130,7 @@ class TestEnv : public KuduTest {
   }
 
   void ReadAndVerifyTestData(RandomAccessFile* raf, size_t offset, size_t n) {
-    gscoped_ptr<uint8_t[]> scratch(new uint8_t[n]);
+    unique_ptr<uint8_t[]> scratch(new uint8_t[n]);
     Slice s;
     ASSERT_OK(env_util::ReadFully(raf, offset, n, &s,
                                          scratch.get()));
@@ -139,14 +142,14 @@ class TestEnv : public KuduTest {
                         bool fast, bool pre_allocate, const WritableFileOptions& opts) {
     const string kTestPath = GetTestPath("test_env_appendvec_read_append");
     shared_ptr<WritableFile> file;
-    ASSERT_OK(env_util::OpenFileForWrite(opts, env_.get(), kTestPath, &file));
+    ASSERT_OK(env_util::OpenFileForWrite(opts, env_, kTestPath, &file));
 
     if (pre_allocate) {
       ASSERT_OK(file->PreAllocate(num_slices * slice_size * iterations));
       ASSERT_OK(file->Sync());
     }
 
-    gscoped_ptr<faststring[]> data;
+    unique_ptr<faststring[]> data;
     vector<vector<Slice> > input;
 
     MakeVectors(num_slices, slice_size, iterations, &data, &input);
@@ -154,7 +157,7 @@ class TestEnv : public KuduTest {
     shared_ptr<RandomAccessFile> raf;
 
     if (!fast) {
-      ASSERT_OK(env_util::OpenFileForRandom(env_.get(), kTestPath, &raf));
+      ASSERT_OK(env_util::OpenFileForRandom(env_, kTestPath, &raf));
     }
 
     srand(123);
@@ -184,7 +187,7 @@ class TestEnv : public KuduTest {
     ASSERT_OK(file->Close());
 
     if (fast) {
-      ASSERT_OK(env_util::OpenFileForRandom(env_.get(), kTestPath, &raf));
+      ASSERT_OK(env_util::OpenFileForRandom(env_, kTestPath, &raf));
     }
     for (int i = 0; i < iterations; i++) {
       ASSERT_NO_FATAL_FAILURE(ReadAndVerifyTestData(raf.get(), num_slices * slice_size * i,
@@ -207,8 +210,7 @@ TEST_F(TestEnv, TestPreallocate) {
   LOG(INFO) << "Testing PreAllocate()";
   string test_path = GetTestPath("test_env_wf");
   shared_ptr<WritableFile> file;
-  ASSERT_OK(env_util::OpenFileForWrite(WritableFileOptions(),
-                                       env_.get(), test_path, &file));
+  ASSERT_OK(env_util::OpenFileForWrite(env_, test_path, &file));
 
   // pre-allocate 1 MB
   ASSERT_OK(file->PreAllocate(kOneMb));
@@ -247,8 +249,7 @@ TEST_F(TestEnv, TestConsecutivePreallocate) {
   LOG(INFO) << "Testing consecutive PreAllocate()";
   string test_path = GetTestPath("test_env_wf");
   shared_ptr<WritableFile> file;
-  ASSERT_OK(env_util::OpenFileForWrite(
-      WritableFileOptions(), env_.get(), test_path, &file));
+  ASSERT_OK(env_util::OpenFileForWrite(env_, test_path, &file));
 
   // pre-allocate 64 MB
   ASSERT_OK(file->PreAllocate(64 * kOneMb));
@@ -306,7 +307,7 @@ TEST_F(TestEnv, TestHolePunch) {
     return;
   }
   string test_path = GetTestPath("test_env_wf");
-  gscoped_ptr<RWFile> file;
+  unique_ptr<RWFile> file;
   ASSERT_OK(env_->NewRWFile(test_path, &file));
 
   // Write 1 MB. The size and size-on-disk both agree.
@@ -332,6 +333,43 @@ TEST_F(TestEnv, TestHolePunch) {
   ASSERT_EQ(kOneMb, sz);
   ASSERT_OK(env_->GetFileSizeOnDisk(test_path, &new_size_on_disk));
   ASSERT_EQ(size_on_disk - punch_amount, new_size_on_disk);
+}
+
+TEST_F(TestEnv, TestTruncate) {
+  LOG(INFO) << "Testing Truncate()";
+  string test_path = GetTestPath("test_env_wf");
+  unique_ptr<RWFile> file;
+  ASSERT_OK(env_->NewRWFile(test_path, &file));
+  uint64_t size;
+  ASSERT_OK(file->Size(&size));
+  ASSERT_EQ(0, size);
+
+  // Truncate to 2 MB (up).
+  ASSERT_OK(file->Truncate(kTwoMb));
+  ASSERT_OK(file->Size(&size));
+  ASSERT_EQ(kTwoMb, size);
+  ASSERT_OK(env_->GetFileSize(test_path, &size));
+  ASSERT_EQ(kTwoMb, size);
+
+  // Truncate to 1 MB (down).
+  ASSERT_OK(file->Truncate(kOneMb));
+  ASSERT_OK(file->Size(&size));
+  ASSERT_EQ(kOneMb, size);
+  ASSERT_OK(env_->GetFileSize(test_path, &size));
+  ASSERT_EQ(kOneMb, size);
+
+  ASSERT_OK(file->Close());
+
+  // Read the whole file. Ensure it is all zeroes.
+  unique_ptr<RandomAccessFile> raf;
+  ASSERT_OK(env_->NewRandomAccessFile(test_path, &raf));
+  Slice s;
+  unique_ptr<uint8_t[]> scratch(new uint8_t[size]);
+  ASSERT_OK(env_util::ReadFully(raf.get(), 0, size, &s, scratch.get()));
+  const uint8_t* data = s.data();
+  for (int i = 0; i < size; i++) {
+    ASSERT_EQ(0, data[i]) << "Not null at position " << i;
+  }
 }
 
 class ShortReadRandomAccessFile : public RandomAccessFile {
@@ -381,26 +419,24 @@ static void WriteTestFile(Env* env, const string& path, size_t size) {
   ASSERT_OK(wf->Close());
 }
 
-
-
 TEST_F(TestEnv, TestReadFully) {
   SeedRandom();
-  const string kTestPath = "test";
+  const string kTestPath = GetTestPath("test");
   const int kFileSize = 64 * 1024;
-  gscoped_ptr<Env> mem(NewMemEnv(Env::Default()));
+  Env* env = Env::Default();
 
-  WriteTestFile(mem.get(), kTestPath, kFileSize);
+  WriteTestFile(env, kTestPath, kFileSize);
   ASSERT_NO_FATAL_FAILURE();
 
   // Reopen for read
   shared_ptr<RandomAccessFile> raf;
-  ASSERT_OK(env_util::OpenFileForRandom(mem.get(), kTestPath, &raf));
+  ASSERT_OK(env_util::OpenFileForRandom(env, kTestPath, &raf));
 
   ShortReadRandomAccessFile sr_raf(raf);
 
   const int kReadLength = 10000;
   Slice s;
-  gscoped_ptr<uint8_t[]> scratch(new uint8_t[kReadLength]);
+  unique_ptr<uint8_t[]> scratch(new uint8_t[kReadLength]);
 
   // Verify that ReadFully reads the whole requested data.
   ASSERT_OK(env_util::ReadFully(&sr_raf, 0, kReadLength, &s, scratch.get()));
@@ -440,9 +476,9 @@ TEST_F(TestEnv, TestGetExecutablePath) {
 
 TEST_F(TestEnv, TestOpenEmptyRandomAccessFile) {
   Env* env = Env::Default();
-  string test_file = JoinPathSegments(GetTestDataDirectory(), "test_file");
+  string test_file = GetTestPath("test_file");
   ASSERT_NO_FATAL_FAILURE(WriteTestFile(env, test_file, 0));
-  gscoped_ptr<RandomAccessFile> readable_file;
+  unique_ptr<RandomAccessFile> readable_file;
   ASSERT_OK(env->NewRandomAccessFile(test_file, &readable_file));
   uint64_t size;
   ASSERT_OK(readable_file->Size(&size));
@@ -454,16 +490,16 @@ TEST_F(TestEnv, TestOverwrite) {
 
   // File does not exist, create it.
   shared_ptr<WritableFile> writer;
-  ASSERT_OK(env_util::OpenFileForWrite(env_.get(), test_path, &writer));
+  ASSERT_OK(env_util::OpenFileForWrite(env_, test_path, &writer));
 
   // File exists, overwrite it.
-  ASSERT_OK(env_util::OpenFileForWrite(env_.get(), test_path, &writer));
+  ASSERT_OK(env_util::OpenFileForWrite(env_, test_path, &writer));
 
   // File exists, try to overwrite (and fail).
   WritableFileOptions opts;
   opts.mode = Env::CREATE_NON_EXISTING;
   Status s = env_util::OpenFileForWrite(opts,
-                                        env_.get(), test_path, &writer);
+                                        env_, test_path, &writer);
   ASSERT_TRUE(s.IsAlreadyPresent());
 }
 
@@ -476,7 +512,7 @@ TEST_F(TestEnv, TestReopen) {
   // Create the file and write to it.
   shared_ptr<WritableFile> writer;
   ASSERT_OK(env_util::OpenFileForWrite(WritableFileOptions(),
-                                       env_.get(), test_path, &writer));
+                                       env_, test_path, &writer));
   ASSERT_OK(writer->Append(first));
   ASSERT_EQ(first.length(), writer->Size());
   ASSERT_OK(writer->Close());
@@ -485,7 +521,7 @@ TEST_F(TestEnv, TestReopen) {
   WritableFileOptions reopen_opts;
   reopen_opts.mode = Env::OPEN_EXISTING;
   ASSERT_OK(env_util::OpenFileForWrite(reopen_opts,
-                                       env_.get(), test_path, &writer));
+                                       env_, test_path, &writer));
   ASSERT_EQ(first.length(), writer->Size());
   ASSERT_OK(writer->Append(second));
   ASSERT_EQ(first.length() + second.length(), writer->Size());
@@ -493,7 +529,7 @@ TEST_F(TestEnv, TestReopen) {
 
   // Check that the file has both strings.
   shared_ptr<RandomAccessFile> reader;
-  ASSERT_OK(env_util::OpenFileForRandom(env_.get(), test_path, &reader));
+  ASSERT_OK(env_util::OpenFileForRandom(env_, test_path, &reader));
   uint64_t size;
   ASSERT_OK(reader->Size(&size));
   ASSERT_EQ(first.length() + second.length(), size);
@@ -511,10 +547,18 @@ TEST_F(TestEnv, TestIsDirectory) {
   ASSERT_TRUE(is_dir);
 
   string not_dir = GetTestPath("not_a_directory");
-  gscoped_ptr<WritableFile> writer;
+  unique_ptr<WritableFile> writer;
   ASSERT_OK(env_->NewWritableFile(not_dir, &writer));
   ASSERT_OK(env_->IsDirectory(not_dir, &is_dir));
   ASSERT_FALSE(is_dir);
+}
+
+// Regression test for KUDU-1776.
+TEST_F(TestEnv, TestIncreaseOpenFileLimit) {
+  int64_t limit_before = env_->GetOpenFileLimit();
+  env_->IncreaseOpenFileLimit();
+  int64_t limit_after = env_->GetOpenFileLimit();
+  ASSERT_GE(limit_after, limit_before) << "Failed to retain/increase open file limit";
 }
 
 static Status TestWalkCb(vector<string>* actual,
@@ -532,7 +576,7 @@ static Status CreateDir(Env* env, const string& name, vector<string>* created) {
 }
 
 static Status CreateFile(Env* env, const string& name, vector<string>* created) {
-  gscoped_ptr<WritableFile> writer;
+  unique_ptr<WritableFile> writer;
   RETURN_NOT_OK(env->NewWritableFile(name, &writer));
   created->push_back(writer->filename());
   return Status::OK();
@@ -557,18 +601,18 @@ TEST_F(TestEnv, TestWalk) {
   string file_one = "file_1";
   string file_two = "file_2";
   vector<string> expected;
-  ASSERT_OK(CreateDir(env_.get(), root, &expected));
-  ASSERT_OK(CreateFile(env_.get(), JoinPathSegments(root, file_one), &expected));
-  ASSERT_OK(CreateFile(env_.get(), JoinPathSegments(root, file_two), &expected));
-  ASSERT_OK(CreateDir(env_.get(), subdir_a, &expected));
-  ASSERT_OK(CreateFile(env_.get(), JoinPathSegments(subdir_a, file_one), &expected));
-  ASSERT_OK(CreateFile(env_.get(), JoinPathSegments(subdir_a, file_two), &expected));
-  ASSERT_OK(CreateDir(env_.get(), subdir_b, &expected));
-  ASSERT_OK(CreateFile(env_.get(), JoinPathSegments(subdir_b, file_one), &expected));
-  ASSERT_OK(CreateFile(env_.get(), JoinPathSegments(subdir_b, file_two), &expected));
-  ASSERT_OK(CreateDir(env_.get(), subdir_c, &expected));
-  ASSERT_OK(CreateFile(env_.get(), JoinPathSegments(subdir_c, file_one), &expected));
-  ASSERT_OK(CreateFile(env_.get(), JoinPathSegments(subdir_c, file_two), &expected));
+  ASSERT_OK(CreateDir(env_, root, &expected));
+  ASSERT_OK(CreateFile(env_, JoinPathSegments(root, file_one), &expected));
+  ASSERT_OK(CreateFile(env_, JoinPathSegments(root, file_two), &expected));
+  ASSERT_OK(CreateDir(env_, subdir_a, &expected));
+  ASSERT_OK(CreateFile(env_, JoinPathSegments(subdir_a, file_one), &expected));
+  ASSERT_OK(CreateFile(env_, JoinPathSegments(subdir_a, file_two), &expected));
+  ASSERT_OK(CreateDir(env_, subdir_b, &expected));
+  ASSERT_OK(CreateFile(env_, JoinPathSegments(subdir_b, file_one), &expected));
+  ASSERT_OK(CreateFile(env_, JoinPathSegments(subdir_b, file_two), &expected));
+  ASSERT_OK(CreateDir(env_, subdir_c, &expected));
+  ASSERT_OK(CreateFile(env_, JoinPathSegments(subdir_c, file_one), &expected));
+  ASSERT_OK(CreateFile(env_, JoinPathSegments(subdir_c, file_two), &expected));
 
   // Do the walk.
   //
@@ -592,7 +636,7 @@ TEST_F(TestEnv, TestWalkCbReturnsError) {
   string new_dir = GetTestPath("foo");
   string new_file = "myfile";
   ASSERT_OK(env_->CreateDir(new_dir));
-  gscoped_ptr<WritableFile> writer;
+  unique_ptr<WritableFile> writer;
   ASSERT_OK(env_->NewWritableFile(JoinPathSegments(new_dir, new_file), &writer));
   int num_calls = 0;
   ASSERT_TRUE(env_->Walk(new_dir, Env::PRE_ORDER,
@@ -600,6 +644,32 @@ TEST_F(TestEnv, TestWalkCbReturnsError) {
 
   // Once for the directory and once for the file inside it.
   ASSERT_EQ(2, num_calls);
+}
+
+TEST_F(TestEnv, TestGlob) {
+  string dir = GetTestPath("glob");
+  ASSERT_OK(env_->CreateDir(dir));
+
+  vector<string> filenames = { "fuzz", "fuzzy", "fuzzyiest", "buzz" };
+  vector<pair<string, size_t>> matchers = {
+    { "file", 0 },
+    { "fuzz", 1 },
+    { "fuzz*", 3 },
+    { "?uzz", 2 },
+  };
+
+  for (const auto& name : filenames) {
+    unique_ptr<WritableFile> file;
+    ASSERT_OK(env_->NewWritableFile(JoinPathSegments(dir, name), &file));
+  }
+
+  for (const auto& matcher : matchers) {
+    SCOPED_TRACE(strings::Substitute("pattern: $0, expected matches: $1",
+                                     matcher.first, matcher.second));
+    vector<string> matches;
+    ASSERT_OK(env_->Glob(JoinPathSegments(dir, matcher.first), &matches));
+    ASSERT_EQ(matcher.second, matches.size());
+  }
 }
 
 TEST_F(TestEnv, TestGetBlockSize) {
@@ -614,15 +684,33 @@ TEST_F(TestEnv, TestGetBlockSize) {
 
   // Try with a file.
   string path = GetTestPath("foo");
-  gscoped_ptr<WritableFile> writer;
+  unique_ptr<WritableFile> writer;
   ASSERT_OK(env_->NewWritableFile(path, &writer));
   ASSERT_OK(env_->GetBlockSize(path, &block_size));
   ASSERT_GT(block_size, 0);
 }
 
+TEST_F(TestEnv, TestGetFileModifiedTime) {
+  string path = GetTestPath("mtime");
+  unique_ptr<WritableFile> writer;
+  ASSERT_OK(env_->NewWritableFile(path, &writer));
+
+  int64_t initial_time;
+  ASSERT_OK(env_->GetFileModifiedTime(writer->filename(), &initial_time));
+
+  // HFS has 1 second mtime granularity.
+  AssertEventually([&] {
+    int64_t after_time;
+    writer->Append(" ");
+    writer->Sync();
+    ASSERT_OK(env_->GetFileModifiedTime(writer->filename(), &after_time));
+    ASSERT_LT(initial_time, after_time);
+  }, MonoDelta::FromSeconds(5));
+}
+
 TEST_F(TestEnv, TestRWFile) {
   // Create the file.
-  gscoped_ptr<RWFile> file;
+  unique_ptr<RWFile> file;
   ASSERT_OK(env_->NewRWFile(GetTestPath("foo"), &file));
 
   // Append to it.
@@ -631,7 +719,7 @@ TEST_F(TestEnv, TestRWFile) {
 
   // Read from it.
   Slice result;
-  gscoped_ptr<uint8_t[]> scratch(new uint8_t[kTestData.length()]);
+  unique_ptr<uint8_t[]> scratch(new uint8_t[kTestData.length()]);
   ASSERT_OK(file->Read(0, kTestData.length(), &result, scratch.get()));
   ASSERT_EQ(result, kTestData);
   uint64_t sz;
@@ -643,7 +731,7 @@ TEST_F(TestEnv, TestRWFile) {
   ASSERT_OK(file->Write(kTestData.length(), kTestData));
   ASSERT_OK(file->Write(1, kTestData));
   string kNewTestData = "aabcdebcdeabcde";
-  gscoped_ptr<uint8_t[]> scratch2(new uint8_t[kNewTestData.length()]);
+  unique_ptr<uint8_t[]> scratch2(new uint8_t[kNewTestData.length()]);
   ASSERT_OK(file->Read(0, kNewTestData.length(), &result, scratch2.get()));
 
   // Retest.
@@ -668,7 +756,7 @@ TEST_F(TestEnv, TestCanonicalize) {
   for (const string& synonym : synonyms) {
     string result;
     ASSERT_OK(env_->Canonicalize(synonym, &result));
-    ASSERT_EQ(GetTestDataDirectory(), result);
+    ASSERT_EQ(test_dir_, result);
   }
 
   string dir = GetTestPath("some_dir");
@@ -697,9 +785,76 @@ TEST_F(TestEnv, TestCopyFile) {
   Env* env = Env::Default();
   NO_FATALS(WriteTestFile(env, orig_path, kFileSize));
   ASSERT_OK(env_util::CopyFile(env, orig_path, copy_path, WritableFileOptions()));
-  gscoped_ptr<RandomAccessFile> copy;
+  unique_ptr<RandomAccessFile> copy;
   ASSERT_OK(env->NewRandomAccessFile(copy_path, &copy));
   NO_FATALS(ReadAndVerifyTestData(copy.get(), 0, kFileSize));
+}
+
+// Simple regression test for NewTempRWFile().
+TEST_F(TestEnv, TestTempRWFile) {
+  string tmpl = "foo.XXXXXX";
+  string path;
+  unique_ptr<RWFile> file;
+
+  ASSERT_OK(env_->NewTempRWFile(RWFileOptions(), tmpl, &path, &file));
+  ASSERT_NE(path, tmpl);
+  ASSERT_EQ(0, path.find("foo."));
+  ASSERT_OK(file->Close());
+  ASSERT_OK(env_->DeleteFile(path));
+}
+
+// Test that when we write data to disk we see SpaceInfo.free_bytes go down.
+TEST_F(TestEnv, TestGetSpaceInfoFreeBytes) {
+  const string kDataDir = GetTestPath("parent");
+  const string kTestFilePath = JoinPathSegments(kDataDir, "testfile");
+  const int kFileSizeBytes = 256;
+  ASSERT_OK(env_->CreateDir(kDataDir));
+
+  // Loop in case there are concurrent tests running that are modifying the
+  // filesystem.
+  AssertEventually([&] {
+    if (env_->FileExists(kTestFilePath)) {
+      ASSERT_OK(env_->DeleteFile(kTestFilePath)); // Clean up the previous iteration.
+    }
+    SpaceInfo before_space_info;
+    ASSERT_OK(env_->GetSpaceInfo(kDataDir, &before_space_info));
+
+    NO_FATALS(WriteTestFile(env_, kTestFilePath, kFileSizeBytes));
+
+    SpaceInfo after_space_info;
+    ASSERT_OK(env_->GetSpaceInfo(kDataDir, &after_space_info));
+    ASSERT_GE(before_space_info.free_bytes - after_space_info.free_bytes, kFileSizeBytes);
+  });
+}
+
+// Basic sanity check for GetSpaceInfo().
+TEST_F(TestEnv, TestGetSpaceInfoBasicInvariants) {
+  string path = GetTestDataDirectory();
+  SpaceInfo space_info;
+  ASSERT_OK(env_->GetSpaceInfo(path, &space_info));
+  ASSERT_GT(space_info.capacity_bytes, 0);
+  ASSERT_LE(space_info.free_bytes, space_info.capacity_bytes);
+  VLOG(1) << "Path " << path << " has capacity "
+          << HumanReadableNumBytes::ToString(space_info.capacity_bytes)
+          << " (" << HumanReadableNumBytes::ToString(space_info.free_bytes) << " free)";
+}
+
+TEST_F(TestEnv, TestChangeDir) {
+  string orig_dir;
+  ASSERT_OK(env_->GetCurrentWorkingDir(&orig_dir));
+
+  string cwd;
+  ASSERT_OK(env_->ChangeDir("/"));
+  ASSERT_OK(env_->GetCurrentWorkingDir(&cwd));
+  ASSERT_EQ("/", cwd);
+
+  ASSERT_OK(env_->ChangeDir(test_dir_));
+  ASSERT_OK(env_->GetCurrentWorkingDir(&cwd));
+  ASSERT_EQ(test_dir_, cwd);
+
+  ASSERT_OK(env_->ChangeDir(orig_dir));
+  ASSERT_OK(env_->GetCurrentWorkingDir(&cwd));
+  ASSERT_EQ(orig_dir, cwd);
 }
 
 }  // namespace kudu

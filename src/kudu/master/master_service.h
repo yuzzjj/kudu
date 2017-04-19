@@ -36,6 +36,20 @@ class MasterServiceImpl : public MasterServiceIf {
  public:
   explicit MasterServiceImpl(Master* server);
 
+  // Authorize an RPC call which must be from a client.
+  bool AuthorizeClient(const google::protobuf::Message* req,
+                       google::protobuf::Message* resp,
+                       rpc::RpcContext *context) override;
+
+  // Authorize an RPC call which must be from within the Kudu service.
+  bool AuthorizeService(const google::protobuf::Message* req,
+                        google::protobuf::Message* resp,
+                        rpc::RpcContext *context) override;
+
+  bool AuthorizeClientOrService(const google::protobuf::Message* req,
+                                google::protobuf::Message* resp,
+                                rpc::RpcContext *context) override;
+
   virtual void Ping(const PingRequestPB* req,
                     PingResponsePB* resp,
                     rpc::RpcContext* rpc) OVERRIDE;
@@ -83,6 +97,12 @@ class MasterServiceImpl : public MasterServiceIf {
   virtual void GetMasterRegistration(const GetMasterRegistrationRequestPB* req,
                                      GetMasterRegistrationResponsePB* resp,
                                      rpc::RpcContext* rpc) OVERRIDE;
+
+  virtual void ConnectToMaster(const ConnectToMasterRequestPB* req,
+                               ConnectToMasterResponsePB* resp,
+                               rpc::RpcContext* rpc) OVERRIDE;
+
+  bool SupportsFeature(uint32_t feature) const override;
 
  private:
   Master* server_;

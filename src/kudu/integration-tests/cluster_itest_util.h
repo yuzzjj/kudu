@@ -74,7 +74,7 @@ namespace itest {
 
 struct TServerDetails {
   NodeInstancePB instance_id;
-  master::TSRegistrationPB registration;
+  ServerRegistrationPB registration;
   gscoped_ptr<tserver::TabletServerServiceProxy> tserver_proxy;
   gscoped_ptr<tserver::TabletServerAdminServiceProxy> tserver_admin_proxy;
   gscoped_ptr<consensus::ConsensusServiceProxy> consensus_proxy;
@@ -156,6 +156,22 @@ Status WaitUntilCommittedConfigOpIdIndexIs(int64_t opid_index,
                                            const std::string& tablet_id,
                                            const MonoDelta& timeout);
 
+enum WaitForLeader {
+  DONT_WAIT_FOR_LEADER = 0,
+  WAIT_FOR_LEADER = 1
+};
+
+// Wait for the specified number of replicas to be reported by the master for
+// the given tablet. Fails when leader is not found or number of replicas
+// did not match up, or timeout waiting for leader.
+Status WaitForReplicasReportedToMaster(
+    const std::shared_ptr<master::MasterServiceProxy>& master_proxy,
+    int num_replicas, const std::string& tablet_id,
+    const MonoDelta& timeout,
+    WaitForLeader wait_for_leader,
+    bool* has_leader,
+    master::TabletLocationsPB* tablet_locations);
+
 // Wait until the last commited OpId has index exactly 'opid_index'.
 Status WaitUntilCommittedOpIdIndexIs(int64_t opid_index,
                                      TServerDetails* replica,
@@ -181,6 +197,12 @@ Status FindTabletLeader(const TabletServerMap& tablet_servers,
                         const std::string& tablet_id,
                         const MonoDelta& timeout,
                         TServerDetails** leader);
+
+// Grabs list of followers using FindTabletLeader() above.
+Status FindTabletFollowers(const TabletServerMap& tablet_servers,
+                           const string& tablet_id,
+                           const MonoDelta& timeout,
+                           vector<TServerDetails*>* followers);
 
 // Start an election on the specified tserver.
 // 'timeout' only refers to the RPC asking the peer to start an election. The
@@ -269,6 +291,17 @@ Status WaitForNumTabletsOnTS(
     const MonoDelta& timeout,
     std::vector<tserver::ListTabletsResponsePB::StatusAndSchemaPB>* tablets);
 
+// Check if the tablet is in the specified state.
+Status CheckIfTabletInState(TServerDetails* ts,
+                            const std::string& tablet_id,
+                            tablet::TabletStatePB expected_state,
+                            const MonoDelta& timeout);
+
+// Check if the given tablet is RUNNING.
+Status CheckIfTabletRunning(TServerDetails* ts,
+                            const std::string& tablet_id,
+                            const MonoDelta& timeout);
+
 // Wait until the specified replica is in the specified state.
 Status WaitUntilTabletInState(TServerDetails* ts,
                               const std::string& tablet_id,
@@ -288,14 +321,23 @@ Status DeleteTablet(const TServerDetails* ts,
                     const MonoDelta& timeout,
                     tserver::TabletServerErrorPB::Code* error_code = NULL);
 
-// Cause the remote to initiate remote bootstrap using the specified host as a
+// Repeatedly try to delete the tablet, retrying on failure up to the
+// specified timeout. Deletion can fail when other operations, such as
+// bootstrap or tablet copy, are running.
+void DeleteTabletWithRetries(const TServerDetails* ts,
+                             const std::string& tablet_id,
+                             tablet::TabletDataState delete_type,
+                             const boost::optional<int64_t>& config_opid_index,
+                             const MonoDelta& timeout);
+
+// Cause the remote to initiate tablet copy using the specified host as a
 // source.
-Status StartRemoteBootstrap(const TServerDetails* ts,
-                            const std::string& tablet_id,
-                            const std::string& bootstrap_source_uuid,
-                            const HostPort& bootstrap_source_addr,
-                            int64_t caller_term,
-                            const MonoDelta& timeout);
+Status StartTabletCopy(const TServerDetails* ts,
+                       const std::string& tablet_id,
+                       const std::string& copy_source_uuid,
+                       const HostPort& copy_source_addr,
+                       int64_t caller_term,
+                       const MonoDelta& timeout);
 
 } // namespace itest
 } // namespace kudu

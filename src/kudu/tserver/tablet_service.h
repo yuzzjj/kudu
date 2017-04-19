@@ -32,6 +32,10 @@ class Schema;
 class Status;
 class Timestamp;
 
+namespace server {
+class ServerBase;
+} // namespace server
+
 namespace tablet {
 class Tablet;
 class TabletPeer;
@@ -47,6 +51,14 @@ class TabletServer;
 class TabletServiceImpl : public TabletServerServiceIf {
  public:
   explicit TabletServiceImpl(TabletServer* server);
+
+  bool AuthorizeClient(const google::protobuf::Message* req,
+                       google::protobuf::Message* resp,
+                       rpc::RpcContext* rpc) override;
+
+  bool AuthorizeClientOrServiceUser(const google::protobuf::Message* req,
+                                    google::protobuf::Message* resp,
+                                    rpc::RpcContext* rpc) override;
 
   virtual void Ping(const PingRequestPB* req,
                     PingResponsePB* resp,
@@ -71,6 +83,8 @@ class TabletServiceImpl : public TabletServerServiceIf {
                         ChecksumResponsePB* resp,
                         rpc::RpcContext* context) OVERRIDE;
 
+  bool SupportsFeature(uint32_t feature) const override;
+
   virtual void Shutdown() OVERRIDE;
 
  private:
@@ -91,7 +105,7 @@ class TabletServiceImpl : public TabletServerServiceIf {
   Status HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
                               const rpc::RpcContext* rpc_context,
                               const Schema& projection,
-                              const std::shared_ptr<tablet::Tablet>& tablet,
+                              tablet::TabletPeer* tablet_peer,
                               gscoped_ptr<RowwiseIterator>* iter,
                               Timestamp* snap_timestamp);
 
@@ -101,6 +115,11 @@ class TabletServiceImpl : public TabletServerServiceIf {
 class TabletServiceAdminImpl : public TabletServerAdminServiceIf {
  public:
   explicit TabletServiceAdminImpl(TabletServer* server);
+
+  bool AuthorizeServiceUser(const google::protobuf::Message* req,
+                            google::protobuf::Message* resp,
+                            rpc::RpcContext* rpc) override;
+
   virtual void CreateTablet(const CreateTabletRequestPB* req,
                             CreateTabletResponsePB* resp,
                             rpc::RpcContext* context) OVERRIDE;
@@ -119,10 +138,14 @@ class TabletServiceAdminImpl : public TabletServerAdminServiceIf {
 
 class ConsensusServiceImpl : public consensus::ConsensusServiceIf {
  public:
-  ConsensusServiceImpl(const scoped_refptr<MetricEntity>& metric_entity,
-                       TabletPeerLookupIf* tablet_manager_);
+  ConsensusServiceImpl(server::ServerBase* server,
+                       TabletPeerLookupIf* tablet_manager);
 
   virtual ~ConsensusServiceImpl();
+
+  bool AuthorizeServiceUser(const google::protobuf::Message* req,
+                            google::protobuf::Message* resp,
+                            rpc::RpcContext* rpc) override;
 
   virtual void UpdateConsensus(const consensus::ConsensusRequestPB *req,
                                consensus::ConsensusResponsePB *resp,
@@ -135,6 +158,10 @@ class ConsensusServiceImpl : public consensus::ConsensusServiceIf {
   virtual void ChangeConfig(const consensus::ChangeConfigRequestPB* req,
                          consensus::ChangeConfigResponsePB* resp,
                          rpc::RpcContext* context) OVERRIDE;
+
+  virtual void UnsafeChangeConfig(const consensus::UnsafeChangeConfigRequestPB* req,
+                                  consensus::UnsafeChangeConfigResponsePB* resp,
+                                  rpc::RpcContext* context) OVERRIDE;
 
   virtual void GetNodeInstance(const consensus::GetNodeInstanceRequestPB* req,
                                consensus::GetNodeInstanceResponsePB* resp,
@@ -156,11 +183,12 @@ class ConsensusServiceImpl : public consensus::ConsensusServiceIf {
                                  consensus::GetConsensusStateResponsePB *resp,
                                  rpc::RpcContext *context) OVERRIDE;
 
-  virtual void StartRemoteBootstrap(const consensus::StartRemoteBootstrapRequestPB* req,
-                                    consensus::StartRemoteBootstrapResponsePB* resp,
+  virtual void StartTabletCopy(const consensus::StartTabletCopyRequestPB* req,
+                                    consensus::StartTabletCopyResponsePB* resp,
                                     rpc::RpcContext* context) OVERRIDE;
 
  private:
+  server::ServerBase* server_;
   TabletPeerLookupIf* tablet_manager_;
 };
 

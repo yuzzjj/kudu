@@ -23,7 +23,6 @@
 
 #include "kudu/common/row.h"
 #include "kudu/common/schema.h"
-#include "kudu/gutil/algorithm.h"
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/tablet/delta_compaction.h"
 #include "kudu/tablet/diskrowset.h"
@@ -42,6 +41,7 @@ DECLARE_int32(tablet_delta_store_minor_compact_max);
 
 using std::is_sorted;
 using std::shared_ptr;
+using std::unique_ptr;
 using std::unordered_set;
 
 namespace kudu {
@@ -173,7 +173,7 @@ TEST_F(TestRowSet, TestRandomRead) {
 
   // Read un-updated row.
   VerifyRandomRead(*rs, "hello 000000000000050",
-                   "(string key=hello 000000000000050, uint32 val=50)");
+                   R"((string key="hello 000000000000050", uint32 val=50))");
   NO_FATALS();
 
   // Update the row.
@@ -182,7 +182,7 @@ TEST_F(TestRowSet, TestRandomRead) {
 
   // Read it again -- should see the updated value.
   VerifyRandomRead(*rs, "hello 000000000000050",
-                   "(string key=hello 000000000000050, uint32 val=12345)");
+                   R"((string key="hello 000000000000050", uint32 val=12345))");
   NO_FATALS();
 
   // Try to read a row which comes before the first key.
@@ -222,13 +222,13 @@ TEST_F(TestRowSet, TestDelete) {
     // Reading the MVCC snapshot prior to deletion should show the row.
     ASSERT_OK(DumpRowSet(*rs, schema_, snap_before_delete, &rows));
     ASSERT_EQ(2, rows.size());
-    EXPECT_EQ("(string key=hello 000000000000000, uint32 val=0)", rows[0]);
-    EXPECT_EQ("(string key=hello 000000000000001, uint32 val=1)", rows[1]);
+    EXPECT_EQ(R"((string key="hello 000000000000000", uint32 val=0))", rows[0]);
+    EXPECT_EQ(R"((string key="hello 000000000000001", uint32 val=1))", rows[1]);
 
     // Reading the MVCC snapshot after the deletion should hide the row.
     ASSERT_OK(DumpRowSet(*rs, schema_, snap_after_delete, &rows));
     ASSERT_EQ(1, rows.size());
-    EXPECT_EQ("(string key=hello 000000000000001, uint32 val=1)", rows[0]);
+    EXPECT_EQ(R"((string key="hello 000000000000001", uint32 val=1))", rows[0]);
 
     // Trying to delete or update the same row again should fail.
     OperationResultPB result;
@@ -332,7 +332,7 @@ TEST_F(TestRowSet, TestFlushedUpdatesRespectMVCC) {
   RowChangeListEncoder update(&update_buf);
   for (uint32_t i = 2; i <= 5; i++) {
     {
-      ScopedTransaction tx(&mvcc_);
+      ScopedTransaction tx(&mvcc_, clock_->Now());
       tx.StartApplying();
       update.Reset();
       update.AddColumnUpdate(schema_.column(1), schema_.column_id(1), &i);
@@ -361,9 +361,9 @@ TEST_F(TestRowSet, TestFlushedUpdatesRespectMVCC) {
   for (int i = 0; i < 5; i++) {
     SCOPED_TRACE(i);
     gscoped_ptr<RowwiseIterator> iter;
-    ASSERT_OK(rs->NewRowIterator(&schema_, snaps[i], &iter));
-    string data = InitAndDumpIterator(iter.Pass());
-    EXPECT_EQ(StringPrintf("(string key=row, uint32 val=%d)", i + 1), data);
+    ASSERT_OK(rs->NewRowIterator(&schema_, snaps[i], UNORDERED, &iter));
+    string data = InitAndDumpIterator(std::move(iter));
+    EXPECT_EQ(StringPrintf(R"((string key="row", uint32 val=%d))", i + 1), data);
   }
 
   // Flush deltas to disk and ensure that the historical versions are still
@@ -373,11 +373,10 @@ TEST_F(TestRowSet, TestFlushedUpdatesRespectMVCC) {
   for (int i = 0; i < 5; i++) {
     SCOPED_TRACE(i);
     gscoped_ptr<RowwiseIterator> iter;
-    ASSERT_OK(rs->NewRowIterator(&schema_, snaps[i], &iter));
-    string data = InitAndDumpIterator(iter.Pass());
-    EXPECT_EQ(StringPrintf("(string key=row, uint32 val=%d)", i + 1), data);
+    ASSERT_OK(rs->NewRowIterator(&schema_, snaps[i], UNORDERED, &iter));
+    string data = InitAndDumpIterator(std::move(iter));
+    EXPECT_EQ(StringPrintf(R"((string key="row", uint32 val=%d))", i + 1), data);
   }
-
 }
 
 // Similar to TestDMSFlush above, except does not actually verify
@@ -447,7 +446,7 @@ TEST_F(TestRowSet, TestMakeDeltaIteratorMergerUnlocked) {
   int num_stores = dt->redo_delta_stores_.size();
   vector<shared_ptr<DeltaStore> > compacted_stores;
   vector<BlockId> compacted_blocks;
-  shared_ptr<DeltaIterator> merge_iter;
+  unique_ptr<DeltaIterator> merge_iter;
   ASSERT_OK(dt->MakeDeltaIteratorMergerUnlocked(0, num_stores - 1, &schema_,
                                                        &compacted_stores,
                                                        &compacted_blocks, &merge_iter));
@@ -490,21 +489,25 @@ TEST_F(TestRowSet, TestCompactStores) {
   ASSERT_OK(rs->FlushDeltas());
   // One file isn't enough for minor compactions, but a major compaction can run.
   ASSERT_EQ(0, rs->DeltaStoresCompactionPerfImprovementScore(RowSet::MINOR_DELTA_COMPACTION));
-  BetweenZeroAndOne(rs->DeltaStoresCompactionPerfImprovementScore(RowSet::MAJOR_DELTA_COMPACTION));
+  NO_FATALS(BetweenZeroAndOne(rs->DeltaStoresCompactionPerfImprovementScore(
+      RowSet::MAJOR_DELTA_COMPACTION)));
 
   // Write a second delta file.
   UpdateExistingRows(rs.get(), FLAGS_update_fraction, nullptr);
   ASSERT_OK(rs->FlushDeltas());
   // Two files is enough for all delta compactions.
-  BetweenZeroAndOne(rs->DeltaStoresCompactionPerfImprovementScore(RowSet::MINOR_DELTA_COMPACTION));
-  BetweenZeroAndOne(rs->DeltaStoresCompactionPerfImprovementScore(RowSet::MAJOR_DELTA_COMPACTION));
+  NO_FATALS(BetweenZeroAndOne(rs->DeltaStoresCompactionPerfImprovementScore(
+      RowSet::MINOR_DELTA_COMPACTION)));
+  NO_FATALS(BetweenZeroAndOne(rs->DeltaStoresCompactionPerfImprovementScore(
+      RowSet::MAJOR_DELTA_COMPACTION)));
 
   // Write a third delta file.
   UpdateExistingRows(rs.get(), FLAGS_update_fraction, nullptr);
   ASSERT_OK(rs->FlushDeltas());
   // We're hitting the max for minor compactions but not for major compactions.
   ASSERT_EQ(1, rs->DeltaStoresCompactionPerfImprovementScore(RowSet::MINOR_DELTA_COMPACTION));
-  BetweenZeroAndOne(rs->DeltaStoresCompactionPerfImprovementScore(RowSet::MAJOR_DELTA_COMPACTION));
+  NO_FATALS(BetweenZeroAndOne(rs->DeltaStoresCompactionPerfImprovementScore(
+      RowSet::MAJOR_DELTA_COMPACTION)));
 
   // Compact the deltafiles
   DeltaTracker *dt = rs->delta_tracker();
@@ -517,23 +520,58 @@ TEST_F(TestRowSet, TestCompactStores) {
   ASSERT_EQ(1,  num_stores);
   // Back to one store, can't minor compact.
   ASSERT_EQ(0, rs->DeltaStoresCompactionPerfImprovementScore(RowSet::MINOR_DELTA_COMPACTION));
-  BetweenZeroAndOne(rs->DeltaStoresCompactionPerfImprovementScore(RowSet::MAJOR_DELTA_COMPACTION));
+  NO_FATALS(BetweenZeroAndOne(rs->DeltaStoresCompactionPerfImprovementScore(
+      RowSet::MAJOR_DELTA_COMPACTION)));
 
   // Verify that the resulting deltafile is valid
   vector<shared_ptr<DeltaStore> > compacted_stores;
   vector<BlockId> compacted_blocks;
-  shared_ptr<DeltaIterator> merge_iter;
+  unique_ptr<DeltaIterator> merge_iter;
   ASSERT_OK(dt->MakeDeltaIteratorMergerUnlocked(0, num_stores - 1, &schema_,
-                                                       &compacted_stores,
-                                                       &compacted_blocks, &merge_iter));
+                                                &compacted_stores,
+                                                &compacted_blocks, &merge_iter));
   vector<string> results;
   ASSERT_OK(DebugDumpDeltaIterator(REDO, merge_iter.get(), schema_,
-                                          ITERATE_OVER_ALL_ROWS,
-                                          &results));
+                                   ITERATE_OVER_ALL_ROWS,
+                                   &results));
   for (const string &str : results) {
     VLOG(1) << str;
   }
   ASSERT_TRUE(is_sorted(results.begin(), results.end()));
+}
+
+TEST_F(TestRowSet, TestGCAncientStores) {
+  // Disable lazy open so that major delta compactions don't require manual REDO initialization.
+  FLAGS_cfile_lazy_open = false;
+
+  // Write some base data.
+  // Note: Our test methods here don't write UNDO delete deltas.
+  WriteTestRowSet();
+  shared_ptr<DiskRowSet> rs;
+  ASSERT_OK(OpenTestRowSet(&rs));
+  DeltaTracker *dt = rs->delta_tracker();
+  ASSERT_EQ(0, dt->CountUndoDeltaStores());
+  ASSERT_EQ(0, dt->CountRedoDeltaStores());
+
+  // Write and flush a new REDO delta file.
+  UpdateExistingRows(rs.get(), FLAGS_update_fraction, nullptr);
+  ASSERT_OK(rs->FlushDeltas());
+  ASSERT_EQ(0, dt->CountUndoDeltaStores());
+  ASSERT_EQ(1, dt->CountRedoDeltaStores());
+
+  // Convert the REDO delta to an UNDO delta.
+  ASSERT_OK(rs->MajorCompactDeltaStores(HistoryGcOpts::Disabled()));
+  ASSERT_EQ(1, dt->CountUndoDeltaStores()); // From doing the major delta compaction.
+  ASSERT_EQ(0, dt->CountRedoDeltaStores());
+
+  // Delete all the UNDO deltas. There shouldn't be any delta stores left.
+  int64_t blocks_deleted;
+  int64_t bytes_deleted;
+  ASSERT_OK(dt->DeleteAncientUndoDeltas(clock_->Now(), &blocks_deleted, &bytes_deleted));
+  ASSERT_GT(blocks_deleted, 0);
+  ASSERT_GT(bytes_deleted, 0);
+  ASSERT_EQ(0, dt->CountUndoDeltaStores());
+  ASSERT_EQ(0, dt->CountRedoDeltaStores());
 }
 
 } // namespace tablet

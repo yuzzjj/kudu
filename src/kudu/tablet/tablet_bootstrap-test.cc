@@ -17,33 +17,27 @@
 
 #include "kudu/consensus/log-test-base.h"
 
+#include <memory>
 #include <vector>
 
 #include "kudu/common/iterator.h"
 #include "kudu/consensus/consensus_meta.h"
+#include "kudu/consensus/consensus-test-util.h"
 #include "kudu/consensus/log_anchor_registry.h"
 #include "kudu/consensus/log_util.h"
+#include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/opid_util.h"
-#include "kudu/consensus/consensus-test-util.h"
 #include "kudu/server/logical_clock.h"
-#include "kudu/server/metadata.h"
 #include "kudu/tablet/tablet_bootstrap.h"
 #include "kudu/tablet/tablet-test-util.h"
 #include "kudu/tablet/tablet_metadata.h"
 
 using std::shared_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 namespace kudu {
-
-namespace log {
-
-extern const char* kTestTable;
-extern const char* kTestTablet;
-
-} // namespace log
-
 namespace tablet {
 
 using consensus::ConsensusBootstrapInfo;
@@ -76,6 +70,7 @@ class BootstrapTest : public LogTestBase {
     RETURN_NOT_OK(TabletMetadata::LoadOrCreate(fs_manager_.get(),
                                                log::kTestTablet,
                                                log::kTestTable,
+                                               log::kTestTableId,
                                                schema,
                                                partition.first,
                                                partition.second,
@@ -99,15 +94,15 @@ class BootstrapTest : public LogTestBase {
   Status RunBootstrapOnTestTablet(const scoped_refptr<TabletMetadata>& meta,
                                   shared_ptr<Tablet>* tablet,
                                   ConsensusBootstrapInfo* boot_info) {
-    gscoped_ptr<TabletStatusListener> listener(new TabletStatusListener(meta));
     scoped_refptr<LogAnchorRegistry> log_anchor_registry(new LogAnchorRegistry());
     // Now attempt to recover the log
     RETURN_NOT_OK(BootstrapTablet(
         meta,
         scoped_refptr<Clock>(LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp)),
         shared_ptr<MemTracker>(),
+        scoped_refptr<rpc::ResultTracker>(),
         NULL,
-        listener.get(),
+        nullptr, // no status listener
         tablet,
         &log_,
         log_anchor_registry,
@@ -125,11 +120,12 @@ class BootstrapTest : public LogTestBase {
                           "Unable to load test tablet metadata");
 
     consensus::RaftConfigPB config;
-    config.set_local(true);
-    config.add_peers()->set_permanent_uuid(meta->fs_manager()->uuid());
     config.set_opid_index(consensus::kInvalidOpIdIndex);
+    consensus::RaftPeerPB* peer = config.add_peers();
+    peer->set_permanent_uuid(meta->fs_manager()->uuid());
+    peer->set_member_type(consensus::RaftPeerPB::VOTER);
 
-    gscoped_ptr<ConsensusMetadata> cmeta;
+    unique_ptr<ConsensusMetadata> cmeta;
     RETURN_NOT_OK_PREPEND(ConsensusMetadata::Create(meta->fs_manager(), meta->tablet_id(),
                                                     meta->fs_manager()->uuid(),
                                                     config, kMinimumTerm, &cmeta),
@@ -148,7 +144,7 @@ class BootstrapTest : public LogTestBase {
     // see the bootstrapped operation. This is likely due to KUDU-138 -- perhaps
     // we aren't properly setting up the clock after bootstrap.
     MvccSnapshot snap = MvccSnapshot::CreateSnapshotIncludingAllTransactions();
-    ASSERT_OK(tablet->NewRowIterator(schema_, snap, Tablet::UNORDERED, &iter));
+    ASSERT_OK(tablet->NewRowIterator(schema_, snap, UNORDERED, &iter));
     ASSERT_OK(iter->Init(nullptr));
     ASSERT_OK(IterateToStringList(iter.get(), results));
     for (const string& result : *results) {
@@ -159,7 +155,7 @@ class BootstrapTest : public LogTestBase {
 
 // Tests a normal bootstrap scenario
 TEST_F(BootstrapTest, TestBootstrap) {
-  BuildLog();
+  ASSERT_OK(BuildLog());
 
   AppendReplicateBatch(MakeOpId(1, current_index_));
   ASSERT_OK(RollLog());
@@ -175,10 +171,33 @@ TEST_F(BootstrapTest, TestBootstrap) {
   ASSERT_EQ(1, results.size());
 }
 
+// Test that we don't overflow opids. Regression test for KUDU-1933.
+TEST_F(BootstrapTest, TestBootstrapHighOpIdIndex) {
+  // Start appending with a log index 3 under the int32 max value.
+  // Append 6 log entries, which will roll us right through the int32 max.
+  const int64_t first_log_index = std::numeric_limits<int32_t>::max() - 3;
+  const int kNumEntries = 6;
+  ASSERT_OK(BuildLog());
+  current_index_ = first_log_index;
+  for (int i = 0; i < kNumEntries; i++) {
+    AppendReplicateBatchAndCommitEntryPairsToLog(1);
+  }
+
+  // Kick off tablet bootstrap and ensure everything worked.
+  shared_ptr<Tablet> tablet;
+  ConsensusBootstrapInfo boot_info;
+  ASSERT_OK(BootstrapTestTablet(-1, -1, &tablet, &boot_info));
+  OpId last_opid;
+  last_opid.set_term(1);
+  last_opid.set_index(current_index_ - 1);
+  ASSERT_OPID_EQ(last_opid, boot_info.last_id);
+  ASSERT_OPID_EQ(last_opid, boot_info.last_committed_id);
+}
+
 // Tests attempting a local bootstrap of a tablet that was in the middle of a
-// remote bootstrap before "crashing".
-TEST_F(BootstrapTest, TestIncompleteRemoteBootstrap) {
-  BuildLog();
+// tablet copy before "crashing".
+TEST_F(BootstrapTest, TestIncompleteTabletCopy) {
+  ASSERT_OK(BuildLog());
 
   ASSERT_OK(PersistTestTabletMetadataState(TABLET_DATA_COPYING));
   shared_ptr<Tablet> tablet;
@@ -201,7 +220,7 @@ TEST_F(BootstrapTest, TestIncompleteRemoteBootstrap) {
 // 5) We crash, requiring a recovery of Segment_2 which now contains
 // the orphan 'Commit A'.
 TEST_F(BootstrapTest, TestOrphanCommit) {
-  BuildLog();
+  ASSERT_OK(BuildLog());
 
   OpId opid = MakeOpId(1, current_index_);
 
@@ -229,7 +248,7 @@ TEST_F(BootstrapTest, TestOrphanCommit) {
     // commits.
     AppendCommit(opid);
     log::SegmentSequence segments;
-    ASSERT_OK(log_->GetLogReader()->GetSegmentsSnapshot(&segments));
+    ASSERT_OK(log_->reader()->GetSegmentsSnapshot(&segments));
     fs_manager_->env()->DeleteFile(segments[0]->path());
   }
   {
@@ -244,9 +263,33 @@ TEST_F(BootstrapTest, TestOrphanCommit) {
     vector<string> results;
     IterateTabletRows(tablet.get(), &results);
     ASSERT_EQ(1, results.size());
-    ASSERT_EQ("(int32 key=1, int32 int_val=0, string string_val=this is a test insert)",
+    ASSERT_EQ(R"((int32 key=1, int32 int_val=0, string string_val="this is a test insert"))",
               results[0]);
     ASSERT_EQ(2, tablet->metadata()->last_durable_mrs_id());
+  }
+}
+
+// Regression test for KUDU-1477: we should successfully start up
+// even if a pending commit contains only failed operations.
+TEST_F(BootstrapTest, TestPendingFailedCommit) {
+  ASSERT_OK(BuildLog());
+
+  OpId opid_1 = MakeOpId(1, current_index_++);
+  OpId opid_2 = MakeOpId(1, current_index_++);
+
+  // Step 2) Write the corresponding COMMIT in the second segment,
+  // with a status indicating that the writes had 'NotFound' results.
+  AppendReplicateBatch(opid_1);
+  AppendReplicateBatch(opid_2);
+  AppendCommitWithNotFoundOpResults(opid_2);
+
+  {
+    shared_ptr<Tablet> tablet;
+    ConsensusBootstrapInfo boot_info;
+
+    // Step 3) Apply the operations in the log to the tablet and flush
+    // the tablet to disk.
+    ASSERT_OK(BootstrapTestTablet(-1, -1, &tablet, &boot_info));
   }
 }
 
@@ -258,7 +301,7 @@ TEST_F(BootstrapTest, TestOrphanCommit) {
 // This should result in the orphan COMMIT being ignored, but the last
 // REPLICATE/COMMIT messages ending up in the tablet.
 TEST_F(BootstrapTest, TestNonOrphansAfterOrphanCommit) {
-  BuildLog();
+  ASSERT_OK(BuildLog());
 
   OpId opid = MakeOpId(1, current_index_);
 
@@ -268,7 +311,7 @@ TEST_F(BootstrapTest, TestNonOrphansAfterOrphanCommit) {
   AppendCommit(opid);
 
   log::SegmentSequence segments;
-  ASSERT_OK(log_->GetLogReader()->GetSegmentsSnapshot(&segments));
+  ASSERT_OK(log_->reader()->GetSegmentsSnapshot(&segments));
   fs_manager_->env()->DeleteFile(segments[0]->path());
 
   current_index_ += 2;
@@ -289,7 +332,7 @@ TEST_F(BootstrapTest, TestNonOrphansAfterOrphanCommit) {
 
   // 'key=3' means the REPLICATE message was inserted when current_id_ was 3, meaning
   // that only the non-orphan commit went in.
-  ASSERT_EQ("(int32 key=3, int32 int_val=0, string string_val=this is a test insert)",
+  ASSERT_EQ(R"((int32 key=3, int32 int_val=0, string string_val="this is a test insert"))",
             results[0]);
 }
 
@@ -297,7 +340,7 @@ TEST_F(BootstrapTest, TestNonOrphansAfterOrphanCommit) {
 // Bootstrap should not replay the operation, but should return it in
 // the ConsensusBootstrapInfo
 TEST_F(BootstrapTest, TestOrphanedReplicate) {
-  BuildLog();
+  ASSERT_OK(BuildLog());
 
   // Append a REPLICATE with no commit
   int replicate_index = current_index_++;
@@ -318,16 +361,16 @@ TEST_F(BootstrapTest, TestOrphanedReplicate) {
 
   // The consensus bootstrap info should include the orphaned REPLICATE.
   ASSERT_EQ(1, boot_info.orphaned_replicates.size());
-  ASSERT_STR_CONTAINS(boot_info.orphaned_replicates[0]->ShortDebugString(),
+  ASSERT_STR_CONTAINS(SecureShortDebugString(*boot_info.orphaned_replicates[0]),
                       "this is a test mutate");
 
   // And it should also include the latest opids.
-  EXPECT_EQ("term: 1 index: 1", boot_info.last_id.ShortDebugString());
+  EXPECT_EQ("term: 1 index: 1", SecureShortDebugString(boot_info.last_id));
 }
 
 // Bootstrap should fail if no ConsensusMetadata file exists.
 TEST_F(BootstrapTest, TestMissingConsensusMetadata) {
-  BuildLog();
+  ASSERT_OK(BuildLog());
 
   scoped_refptr<TabletMetadata> meta;
   ASSERT_OK(LoadTestTabletMetadata(-1, -1, &meta));
@@ -341,7 +384,7 @@ TEST_F(BootstrapTest, TestMissingConsensusMetadata) {
 }
 
 TEST_F(BootstrapTest, TestOperationOverwriting) {
-  BuildLog();
+  ASSERT_OK(BuildLog());
 
   OpId opid = MakeOpId(1, 1);
 
@@ -372,14 +415,14 @@ TEST_F(BootstrapTest, TestOperationOverwriting) {
   IterateTabletRows(tablet.get(), &results);
   ASSERT_EQ(1, results.size());
 
-  ASSERT_EQ("(int32 key=1, int32 int_val=0, string string_val=this is a test insert)",
+  ASSERT_EQ(R"((int32 key=1, int32 int_val=0, string string_val="this is a test insert"))",
             results[0]);
 }
 
 // Tests that when we have out-of-order commits that touch the same rows, operations are
 // still applied and in the correct order.
 TEST_F(BootstrapTest, TestOutOfOrderCommits) {
-  BuildLog();
+  ASSERT_OK(BuildLog());
 
   consensus::ReplicateRefPtr replicate = consensus::make_scoped_refptr_replicate(
       new consensus::ReplicateMsg());
@@ -415,7 +458,7 @@ TEST_F(BootstrapTest, TestOutOfOrderCommits) {
   MemStoreTargetPB* target = mutate->add_mutated_stores();
   target->set_mrs_id(1);
 
-  AppendCommit(mutate_commit.Pass());
+  AppendCommit(std::move(mutate_commit));
 
   gscoped_ptr<consensus::CommitMsg> insert_commit(new consensus::CommitMsg);
   insert_commit->set_op_type(consensus::WRITE_OP);
@@ -425,7 +468,7 @@ TEST_F(BootstrapTest, TestOutOfOrderCommits) {
   target = insert->add_mutated_stores();
   target->set_mrs_id(1);
 
-  AppendCommit(insert_commit.Pass());
+  AppendCommit(std::move(insert_commit));
 
   ConsensusBootstrapInfo boot_info;
   shared_ptr<Tablet> tablet;
@@ -436,14 +479,14 @@ TEST_F(BootstrapTest, TestOutOfOrderCommits) {
   IterateTabletRows(tablet.get(), &results);
   ASSERT_EQ(1, results.size());
 
-  ASSERT_EQ("(int32 key=10, int32 int_val=2, string string_val=this is a test mutate)",
+  ASSERT_EQ(R"((int32 key=10, int32 int_val=2, string string_val="this is a test mutate"))",
             results[0]);
 }
 
 // Tests that when we have two consecutive replicates but the commit message for the
 // first one is missing, both appear as pending in ConsensusInfo.
 TEST_F(BootstrapTest, TestMissingCommitMessage) {
-  BuildLog();
+  ASSERT_OK(BuildLog());
 
   consensus::ReplicateRefPtr replicate = consensus::make_scoped_refptr_replicate(
       new consensus::ReplicateMsg());
@@ -479,7 +522,7 @@ TEST_F(BootstrapTest, TestMissingCommitMessage) {
   MemStoreTargetPB* target = mutate->add_mutated_stores();
   target->set_mrs_id(1);
 
-  AppendCommit(mutate_commit.Pass());
+  AppendCommit(std::move(mutate_commit));
 
   ConsensusBootstrapInfo boot_info;
   shared_ptr<Tablet> tablet;
@@ -497,7 +540,7 @@ TEST_F(BootstrapTest, TestMissingCommitMessage) {
 // that is higher than a timestamp assigned to a write operation that follows
 // it in the log.
 TEST_F(BootstrapTest, TestConsensusOnlyOperationOutOfOrderTimestamp) {
-  BuildLog();
+  ASSERT_OK(BuildLog());
 
   // Append NO_OP.
   ReplicateRefPtr noop_replicate = make_scoped_refptr_replicate(new ReplicateMsg());
@@ -526,7 +569,7 @@ TEST_F(BootstrapTest, TestConsensusOnlyOperationOutOfOrderTimestamp) {
   mutate_commit->set_op_type(consensus::NO_OP);
   *mutate_commit->mutable_commited_op_id() = noop_replicate->get()->id();
 
-  AppendCommit(mutate_commit.Pass());
+  AppendCommit(std::move(mutate_commit));
 
   // ...and WRITE_OP...
   mutate_commit.reset(new consensus::CommitMsg);
@@ -537,7 +580,7 @@ TEST_F(BootstrapTest, TestConsensusOnlyOperationOutOfOrderTimestamp) {
   MemStoreTargetPB* target = mutate->add_mutated_stores();
   target->set_mrs_id(1);
 
-  AppendCommit(mutate_commit.Pass());
+  AppendCommit(std::move(mutate_commit));
 
   ConsensusBootstrapInfo boot_info;
   shared_ptr<Tablet> tablet;

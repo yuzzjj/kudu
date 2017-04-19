@@ -19,13 +19,12 @@
 #define KUDU_FS_BLOCK_MANAGER_H
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
-#include <stdint.h>
 #include <string>
 #include <vector>
 
 #include "kudu/fs/block_id.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -35,6 +34,7 @@ DECLARE_bool(block_coalesce_close);
 
 namespace kudu {
 
+class Env;
 class MemTracker;
 class MetricEntity;
 class Slice;
@@ -207,16 +207,22 @@ class BlockManager {
   //
   // Does not modify 'block' on error.
   virtual Status CreateBlock(const CreateBlockOptions& opts,
-                                      gscoped_ptr<WritableBlock>* block) = 0;
+                             std::unique_ptr<WritableBlock>* block) = 0;
 
   // Like the above but uses default options.
-  virtual Status CreateBlock(gscoped_ptr<WritableBlock>* block) = 0;
+  virtual Status CreateBlock(std::unique_ptr<WritableBlock>* block) = 0;
 
   // Opens an existing block for reading.
   //
+  // While it is safe to delete a block that has already been opened, it is
+  // not safe to do so concurrently with the OpenBlock() call itself. In some
+  // block manager implementations this may result in unusual behavior. For
+  // example, OpenBlock() may succeed but subsequent ReadableBlock operations
+  // may fail.
+  //
   // Does not modify 'block' on error.
   virtual Status OpenBlock(const BlockId& block_id,
-                           gscoped_ptr<ReadableBlock>* block) = 0;
+                           std::unique_ptr<ReadableBlock>* block) = 0;
 
   // Deletes an existing block, allowing its space to be reclaimed by the
   // filesystem. The change is immediately made durable.
@@ -232,8 +238,14 @@ class BlockManager {
   // On success, guarantees that outstanding data is durable.
   virtual Status CloseBlocks(const std::vector<WritableBlock*>& blocks) = 0;
 
- protected:
-  static const char* kInstanceMetadataFileName;
+  // Retrieves the IDs of all blocks under management by this block manager.
+  // These include ReadableBlocks as well as WritableBlocks.
+  //
+  // Returned block IDs are not guaranteed to be in any particular order,
+  // nor is the order guaranteed to be deterministic. Furthermore, if
+  // concurrent operations are ongoing, some of the blocks themselves may not
+  // even exist after the call.
+  virtual Status GetAllBlockIds(std::vector<BlockId>* block_ids) = 0;
 };
 
 // Closes a group of blocks.
@@ -252,7 +264,7 @@ class ScopedWritableBlockCloser {
     STLDeleteElements(&blocks_);
   }
 
-  void AddBlock(gscoped_ptr<WritableBlock> block) {
+  void AddBlock(std::unique_ptr<WritableBlock> block) {
     blocks_.push_back(block.release());
   }
 
@@ -273,6 +285,10 @@ class ScopedWritableBlockCloser {
  private:
   std::vector<WritableBlock*> blocks_;
 };
+
+// Compute an upper bound for a file cache embedded within a block manager
+// using resource limits obtained from the system.
+int64_t GetFileCacheCapacityForBlockManager(Env* env);
 
 } // namespace fs
 } // namespace kudu

@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <glog/logging.h>
-#include <time.h>
+#include <ctime>
 
+#include <glog/logging.h>
+
+#include "kudu/cfile/cfile_util.h"
 #include "kudu/common/iterator.h"
 #include "kudu/common/row.h"
 #include "kudu/common/scan_spec.h"
@@ -30,20 +32,21 @@
 #include "kudu/util/slice.h"
 #include "kudu/util/test_macros.h"
 
-using std::shared_ptr;
-using std::unordered_set;
-
-namespace kudu {
-namespace tablet {
-
-using fs::ReadableBlock;
-
 DEFINE_int32(testflush_num_inserts, 1000,
              "Number of rows inserted in TestFlush");
 DEFINE_int32(testiterator_num_inserts, 1000,
              "Number of rows inserted in TestRowIterator/TestInsert");
 DEFINE_int32(testcompaction_num_rows, 1000,
              "Number of rows per rowset in TestCompaction");
+
+using std::shared_ptr;
+using std::unique_ptr;
+
+namespace kudu {
+namespace tablet {
+
+using cfile::ReaderOptions;
+using fs::ReadableBlock;
 
 template<class SETUP>
 class TestTablet : public TabletTestBase<SETUP> {
@@ -81,11 +84,11 @@ TYPED_TEST(TestTablet, TestFlush) {
   ASSERT_EQ(1, undo_blocks.size());
 
   // Read the undo delta, we should get one undo mutation (delete) for each row.
-  gscoped_ptr<ReadableBlock> block;
+  unique_ptr<ReadableBlock> block;
   ASSERT_OK(this->fs_manager()->OpenBlock(undo_blocks[0], &block));
 
   shared_ptr<DeltaFileReader> dfr;
-  ASSERT_OK(DeltaFileReader::Open(block.Pass(), undo_blocks[0], &dfr, UNDO));
+  ASSERT_OK(DeltaFileReader::Open(std::move(block), UNDO, ReaderOptions(), &dfr));
   // Assert there were 'max_rows' deletions in the undo delta (one for each inserted row)
   ASSERT_EQ(dfr->delta_stats().delete_count(), max_rows);
 }
@@ -203,7 +206,7 @@ TYPED_TEST(TestTablet, TestInsertDuplicateKey) {
 
   // Insert again, should fail!
   Status s = this->InsertTestRow(&writer, 12345, 0);
-  ASSERT_STR_CONTAINS(s.ToString(), "entry already present in memrowset");
+  ASSERT_STR_CONTAINS(s.ToString(), "key already present");
 
   ASSERT_EQ(1, this->TabletCount());
 
@@ -217,6 +220,69 @@ TYPED_TEST(TestTablet, TestInsertDuplicateKey) {
   ASSERT_EQ(1, this->TabletCount());
 }
 
+// Tests that we are able to handle reinserts properly.
+//
+// Namely tests that:
+// - We're able to perform multiple reinserts in a MRS, flush them
+//   and that all versions of the row are still visible.
+// - After we've flushed the reinserts above, we can perform a
+//   new reinsert in a new MRS, flush that MRS and compact the row
+//   DRS together, all while preserving the full row history.
+TYPED_TEST(TestTablet, TestReinserts) {
+  LocalTabletWriter writer(this->tablet().get(), &this->client_schema_);
+
+  vector<MvccSnapshot> snaps;
+  // In the first snap there's no row.
+  snaps.push_back(MvccSnapshot(*this->tablet()->mvcc_manager()));
+
+  // Insert one row.
+  ASSERT_OK(this->InsertTestRow(&writer, 1, 0));
+
+  // In the second snap the row exists and has value 0.
+  snaps.push_back(MvccSnapshot(*this->tablet()->mvcc_manager()));
+
+  // Now delete the test row.
+  ASSERT_OK(this->DeleteTestRow(&writer, 1));
+
+  // In the third snap the row doesn't exist.
+  snaps.push_back(MvccSnapshot(*this->tablet()->mvcc_manager()));
+
+  // Reinsert the row.
+  ASSERT_OK(this->InsertTestRow(&writer, 1, 1));
+
+  // In the fourth snap the row exists again and has value 1.
+  snaps.push_back(MvccSnapshot(*this->tablet()->mvcc_manager()));
+
+  // .. and delete the row again.
+  ASSERT_OK(this->DeleteTestRow(&writer, 1));
+
+  // In the fifth snap the row has been deleted.
+  snaps.push_back(MvccSnapshot(*this->tablet()->mvcc_manager()));
+
+  // Now flush the MRS all versions of the tablet should be visible,
+  // depending on the chosen snapshot.
+  ASSERT_OK(this->tablet()->Flush());
+
+  vector<vector<string>* > expected_rows;
+  CollectRowsForSnapshots(this->tablet().get(), this->client_schema_,
+                          snaps, &expected_rows);
+
+  ASSERT_EQ(expected_rows.size(), 5);
+  ASSERT_EQ(expected_rows[0]->size(), 0) << "Got the wrong result from snap: "
+                                         << snaps[0].ToString();
+  ASSERT_EQ(expected_rows[1]->size(), 1) << "Got the wrong result from snap: "
+                                         << snaps[1].ToString();
+  ASSERT_STR_CONTAINS((*expected_rows[1])[0], "int32 key_idx=1, int32 val=0)");
+  ASSERT_EQ(expected_rows[2]->size(), 0) << "Got the wrong result from snap: "
+                                         << snaps[2].ToString();
+  ASSERT_EQ(expected_rows[3]->size(), 1) << "Got the wrong result from snap: "
+                                         << snaps[3].ToString();
+  ASSERT_STR_CONTAINS((*expected_rows[3])[0], "int32 key_idx=1, int32 val=1)");
+  ASSERT_EQ(expected_rows[4]->size(), 0) << "Got the wrong result from snap: "
+                                         << snaps[4].ToString();
+
+  STLDeleteElements(&expected_rows);
+}
 
 // Test flushes and compactions dealing with deleted rows.
 TYPED_TEST(TestTablet, TestDeleteWithFlushAndCompact) {
@@ -397,6 +463,22 @@ TYPED_TEST(TestTablet, TestRowIteratorSimple) {
   ASSERT_FALSE(iter->HasNext());
 }
 
+// Hook implementation which runs a lambda function during the 'duplicating'
+// phase of compaction.
+template<class HookFunc>
+class RunDuringDuplicatingRowSetPhase : public Tablet::FlushCompactCommonHooks {
+ public:
+  explicit RunDuringDuplicatingRowSetPhase(HookFunc hook)
+      : hook_(std::move(hook)) {}
+
+  Status PostSwapInDuplicatingRowSet() override {
+    hook_();
+    return Status::OK();
+  }
+ private:
+  const HookFunc hook_;
+};
+
 TYPED_TEST(TestTablet, TestRowIteratorOrdered) {
   // Create interleaved keys in each rowset, so they are clearly not in order
   const int kNumRows = 128;
@@ -413,43 +495,65 @@ TYPED_TEST(TestTablet, TestRowIteratorOrdered) {
     }
   }
 
-  MvccSnapshot snap(*this->tablet()->mvcc_manager());
-  // Iterate through with a few different block sizes.
-  for (int numBlocks = 1; numBlocks < 5; numBlocks*=2) {
-    const int rowsPerBlock = kNumRows / numBlocks;
-    // Make a new ordered iterator for the current snapshot.
-    gscoped_ptr<RowwiseIterator> iter;
+  // We'll test ordered scans a few times, covering before, during, and
+  // after a compaction.
+  auto RunScans = [this, kNumRows]() {
+    MvccSnapshot snap(*this->tablet()->mvcc_manager());
+    // Iterate through with a few different block sizes.
+    for (int numBlocks = 1; numBlocks < 5; numBlocks*=2) {
+      const int rowsPerBlock = kNumRows / numBlocks;
+      // Make a new ordered iterator for the current snapshot.
+      gscoped_ptr<RowwiseIterator> iter;
 
-    ASSERT_OK(this->tablet()->NewRowIterator(this->client_schema_, snap, Tablet::ORDERED, &iter));
-    ASSERT_OK(iter->Init(nullptr));
+      ASSERT_OK(this->tablet()->NewRowIterator(this->client_schema_, snap, ORDERED, &iter));
+      ASSERT_OK(iter->Init(nullptr));
 
-    // Iterate the tablet collecting rows.
-    vector<shared_ptr<faststring> > rows;
-    for (int i = 0; i < numBlocks; i++) {
-      RowBlock block(this->schema_, rowsPerBlock, &this->arena_);
-      ASSERT_TRUE(iter->HasNext());
-      ASSERT_OK(iter->NextBlock(&block));
-      ASSERT_EQ(rowsPerBlock, block.nrows()) << "unexpected number of rows returned";
-      for (int j = 0; j < rowsPerBlock; j++) {
-        RowBlockRow row = block.row(j);
-        shared_ptr<faststring> encoded(new faststring());
-        this->client_schema_.EncodeComparableKey(row, encoded.get());
-        rows.push_back(encoded);
+      // Iterate the tablet collecting rows.
+      vector<shared_ptr<faststring> > rows;
+      for (int i = 0; i < numBlocks; i++) {
+        RowBlock block(this->schema_, rowsPerBlock, &this->arena_);
+        ASSERT_TRUE(iter->HasNext());
+        ASSERT_OK(iter->NextBlock(&block));
+        ASSERT_EQ(rowsPerBlock, block.nrows()) << "unexpected number of rows returned";
+        for (int j = 0; j < rowsPerBlock; j++) {
+          RowBlockRow row = block.row(j);
+          shared_ptr<faststring> encoded(new faststring());
+          this->client_schema_.EncodeComparableKey(row, encoded.get());
+          rows.push_back(encoded);
+        }
       }
+      // Verify the collected rows, checking that they are sorted.
+      for (int j = 1; j < rows.size(); j++) {
+        // Use the schema for comparison, since this test is run with different schemas.
+        ASSERT_LT((*rows[j-1]).ToString(), (*rows[j]).ToString());
+      }
+      ASSERT_FALSE(iter->HasNext());
+      ASSERT_EQ(kNumRows, rows.size());
     }
-    // Verify the collected rows, checking that they are sorted.
-    for (int j = 1; j < rows.size(); j++) {
-      // Use the schema for comparison, since this test is run with different schemas.
-      ASSERT_LT((*rows[j-1]).ToString(), (*rows[j]).ToString());
-    }
-    ASSERT_FALSE(iter->HasNext());
-    ASSERT_EQ(kNumRows, rows.size());
+  };
+
+  {
+    SCOPED_TRACE("With no compaction");
+    NO_FATALS(RunScans());
+  }
+
+  {
+    SCOPED_TRACE("With duplicating rowset");
+    shared_ptr<Tablet::FlushCompactCommonHooks> hooks_shared(
+        new RunDuringDuplicatingRowSetPhase<decltype(RunScans)>(RunScans));
+    this->tablet()->SetFlushCompactCommonHooksForTests(hooks_shared);
+    ASSERT_OK(this->tablet()->Compact(Tablet::FORCE_COMPACT_ALL));
+    NO_FATALS();
+  }
+
+  {
+    SCOPED_TRACE("After compaction");
+    NO_FATALS(RunScans());
   }
 }
 
-
 template<class SETUP>
-bool TestSetupExpectsNulls(int32_t key_idx) {
+bool TestSetupExpectsNulls(int32_t /*key_idx*/) {
   return false;
 }
 
@@ -552,20 +656,47 @@ TYPED_TEST(TestTablet, TestInsertsPersist) {
   this->InsertTestRows(0, max_rows, 0);
   ASSERT_EQ(max_rows, this->TabletCount());
 
+  // Get current timestamp.
+  Timestamp t = this->tablet()->clock()->Now();
+
   // Flush it.
   ASSERT_OK(this->tablet()->Flush());
 
   ASSERT_EQ(max_rows, this->TabletCount());
 
-  // Close and re-open tablet
+  // Close and re-open tablet.
+  // TODO: Should we be reopening the tablet in a different way to persist the
+  // clock / timestamps?
   this->TabletReOpen();
 
   // Ensure that rows exist
   ASSERT_EQ(max_rows, this->TabletCount());
-  this->VerifyTestRows(0, max_rows);
+  this->VerifyTestRowsWithTimestampAndVerifier(0, max_rows, t, boost::none);
 
   // TODO: add some more data, re-flush
 }
+
+TYPED_TEST(TestTablet, TestUpsert) {
+  vector<string> rows;
+  this->UpsertTestRows(0, 1, 1000);
+
+  // UPSERT a row that is in MRS.
+  this->UpsertTestRows(0, 1, 1001);
+
+  ASSERT_OK(this->IterateToStringList(&rows));
+  EXPECT_EQ(vector<string>{ this->setup_.FormatDebugRow(0, 1001, false) }, rows);
+
+  // Flush it.
+  ASSERT_OK(this->tablet()->Flush());
+  ASSERT_OK(this->IterateToStringList(&rows));
+  EXPECT_EQ(vector<string>{ this->setup_.FormatDebugRow(0, 1001, false) }, rows);
+
+  // UPSERT a row that is in DRS.
+  this->UpsertTestRows(0, 1, 1002);
+  ASSERT_OK(this->IterateToStringList(&rows));
+  EXPECT_EQ(vector<string>{ this->setup_.FormatDebugRow(0, 1002, false) }, rows);
+}
+
 
 // Test that when a row has been updated many times, it always yields
 // the most recent value.
@@ -621,8 +752,6 @@ TYPED_TEST(TestTablet, TestMultipleUpdates) {
   ASSERT_EQ(this->setup_.FormatDebugRow(0, 6, false), out_rows[0]);
   ASSERT_EQ(this->setup_.FormatDebugRow(1, 0, false), out_rows[1]);
 }
-
-
 
 TYPED_TEST(TestTablet, TestCompaction) {
   uint64_t max_rows = this->ClampRowCount(FLAGS_testcompaction_num_rows);
@@ -916,7 +1045,7 @@ TYPED_TEST(TestTablet, TestMetricsInit) {
   // Create a tablet, but do not open it
   this->CreateTestTablet();
   MetricRegistry* registry = this->harness()->metrics_registry();
-  std::stringstream out;
+  std::ostringstream out;
   JsonWriter writer(&out, JsonWriter::PRETTY);
   ASSERT_OK(registry->WriteAsJson(&writer, { "*" }, MetricJsonOptions()));
   // Open tablet, should still work
@@ -925,37 +1054,39 @@ TYPED_TEST(TestTablet, TestMetricsInit) {
 }
 
 // Test that we find the correct log segment size for different indexes.
-TEST(TestTablet, TestGetLogRetentionSizeForIndex) {
-  std::map<int64_t, int64_t> idx_size_map;
-  // We build a map that represents 3 logs. The key is the index where that log ends, and the value
-  // is its size.
-  idx_size_map[3] = 1;
-  idx_size_map[6] = 10;
-  idx_size_map[9] = 100;
+TEST(TestTablet, TestGetReplaySizeForIndex) {
+  std::map<int64_t, int64_t> replay_size_map;
 
-  // The default value should return a size of 0.
+  // We build a map that represents 3 logs.
+  // See Log::GetReplaySizeMap(...) for details.
+  replay_size_map[100] = 45;
+  replay_size_map[200] = 25;
+  replay_size_map[300] = 10;
+
+  // -1 indicates that no logs are anchored, and thus we it should report
+  // no logs need to be replayed.
   int64_t min_log_index = -1;
-  ASSERT_EQ(Tablet::GetLogRetentionSizeForIndex(min_log_index, idx_size_map), 0);
+  EXPECT_EQ(Tablet::GetReplaySizeForIndex(min_log_index, replay_size_map), 0);
 
-  // A value at the beginning of the first segment retains all the logs.
+  // A value in or before the first segment retains all the logs.
   min_log_index = 1;
-  ASSERT_EQ(Tablet::GetLogRetentionSizeForIndex(min_log_index, idx_size_map), 111);
+  EXPECT_EQ(Tablet::GetReplaySizeForIndex(min_log_index, replay_size_map), 45);
 
   // A value at the end of the first segment also retains everything.
-  min_log_index = 3;
-  ASSERT_EQ(Tablet::GetLogRetentionSizeForIndex(min_log_index, idx_size_map), 111);
+  min_log_index = 100;
+  EXPECT_EQ(Tablet::GetReplaySizeForIndex(min_log_index, replay_size_map), 45);
 
   // Beginning of second segment, only retain that one and the next.
-  min_log_index = 4;
-  ASSERT_EQ(Tablet::GetLogRetentionSizeForIndex(min_log_index, idx_size_map), 110);
+  min_log_index = 101;
+  EXPECT_EQ(Tablet::GetReplaySizeForIndex(min_log_index, replay_size_map), 25);
 
   // Beginning of third segment, only retain that one.
-  min_log_index = 7;
-  ASSERT_EQ(Tablet::GetLogRetentionSizeForIndex(min_log_index, idx_size_map), 100);
+  min_log_index = 201;
+  EXPECT_EQ(Tablet::GetReplaySizeForIndex(min_log_index, replay_size_map), 10);
 
   // A value after all the passed segments, doesn't retain anything.
-  min_log_index = 10;
-  ASSERT_EQ(Tablet::GetLogRetentionSizeForIndex(min_log_index, idx_size_map), 0);
+  min_log_index = 301;
+  EXPECT_EQ(Tablet::GetReplaySizeForIndex(min_log_index, replay_size_map), 0);
 }
 
 } // namespace tablet

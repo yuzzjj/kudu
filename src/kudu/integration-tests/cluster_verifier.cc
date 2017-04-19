@@ -24,6 +24,7 @@
 #include "kudu/client/row_result.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/cluster_verifier.h"
+#include "kudu/integration-tests/log_verifier.h"
 #include "kudu/integration-tests/external_mini_cluster.h"
 #include "kudu/tools/ksck_remote.h"
 #include "kudu/util/monotime.h"
@@ -58,12 +59,11 @@ void ClusterVerifier::SetScanConcurrency(int concurrency) {
 }
 
 void ClusterVerifier::CheckCluster() {
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(checksum_options_.timeout);
+  MonoTime deadline = MonoTime::Now() + checksum_options_.timeout;
 
   Status s;
   double sleep_time = 0.1;
-  while (MonoTime::Now(MonoTime::FINE).ComesBefore(deadline)) {
+  while (MonoTime::Now() < deadline) {
     s = DoKsck();
     if (s.ok()) {
       break;
@@ -75,25 +75,35 @@ void ClusterVerifier::CheckCluster() {
     SleepFor(MonoDelta::FromSeconds(sleep_time));
   }
   ASSERT_OK(s);
+
+  // Verify that the committed op indexes match up across the servers.
+  // We have to use "AssertEventually" here because many tests verify clusters
+  // while they are still running, and the verification can fail spuriously in
+  // the case that
+  LogVerifier lv(cluster_);
+  AssertEventually([&]() {
+      ASSERT_OK(lv.VerifyCommittedOpIdsMatch());
+    });
 }
 
 Status ClusterVerifier::DoKsck() {
-  Sockaddr addr = cluster_->leader_master()->bound_rpc_addr();
+  HostPort hp = cluster_->leader_master()->bound_rpc_hostport();
 
   std::shared_ptr<KsckMaster> master;
-  RETURN_NOT_OK(RemoteKsckMaster::Build(addr, &master));
+  RETURN_NOT_OK(RemoteKsckMaster::Build({ hp.ToString() }, &master));
   std::shared_ptr<KsckCluster> cluster(new KsckCluster(master));
   std::shared_ptr<Ksck> ksck(new Ksck(cluster));
+
+  // Some unit tests create or remove replicas of tablets, which
+  // we shouldn't consider fatal.
+  ksck->set_check_replica_count(false);
 
   // This is required for everything below.
   RETURN_NOT_OK(ksck->CheckMasterRunning());
   RETURN_NOT_OK(ksck->FetchTableAndTabletInfo());
-  RETURN_NOT_OK(ksck->CheckTabletServersRunning());
+  RETURN_NOT_OK(ksck->FetchInfoFromTabletServers());
   RETURN_NOT_OK(ksck->CheckTablesConsistency());
-
-  vector<string> tables;
-  vector<string> tablets;
-  RETURN_NOT_OK(ksck->ChecksumData(tables, tablets, checksum_options_));
+  RETURN_NOT_OK(ksck->ChecksumData(checksum_options_));
   return Status::OK();
 }
 
@@ -107,15 +117,17 @@ Status ClusterVerifier::DoCheckRowCount(const std::string& table_name,
                                         ComparisonMode mode,
                                         int expected_row_count) {
   client::sp::shared_ptr<client::KuduClient> client;
-  client::KuduClientBuilder builder;
-  RETURN_NOT_OK_PREPEND(cluster_->CreateClient(builder,
-                                               &client),
+  RETURN_NOT_OK_PREPEND(cluster_->CreateClient(nullptr, &client),
                         "Unable to connect to cluster");
   client::sp::shared_ptr<client::KuduTable> table;
   RETURN_NOT_OK_PREPEND(client->OpenTable(table_name, &table),
                         "Unable to open table");
   client::KuduScanner scanner(table.get());
-  CHECK_OK(scanner.SetProjectedColumns(vector<string>()));
+  CHECK_OK(scanner.SetReadMode(client::KuduScanner::READ_AT_SNAPSHOT));
+  CHECK_OK(scanner.SetFaultTolerant());
+  // Allow a long scan timeout for verification.
+  CHECK_OK(scanner.SetTimeoutMillis(60 * 1000));
+  CHECK_OK(scanner.SetProjectedColumns({}));
   RETURN_NOT_OK_PREPEND(scanner.Open(), "Unable to open scanner");
   int count = 0;
   vector<client::KuduRowResult> rows;
@@ -138,12 +150,11 @@ void ClusterVerifier::CheckRowCountWithRetries(const std::string& table_name,
                                                ComparisonMode mode,
                                                int expected_row_count,
                                                const MonoDelta& timeout) {
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(timeout);
+  MonoTime deadline = MonoTime::Now() + timeout;
   Status s;
   while (true) {
     s = DoCheckRowCount(table_name, mode, expected_row_count);
-    if (s.ok() || deadline.ComesBefore(MonoTime::Now(MonoTime::FINE))) break;
+    if (s.ok() || deadline < MonoTime::Now()) break;
     LOG(WARNING) << "CheckRowCount() has not succeeded yet: " << s.ToString()
                  << "... will retry";
     SleepFor(MonoDelta::FromMilliseconds(100));

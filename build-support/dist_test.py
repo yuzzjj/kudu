@@ -39,7 +39,7 @@ import subprocess
 import time
 
 TEST_TIMEOUT_SECS = int(os.environ.get('TEST_TIMEOUT_SECS', '900'))
-ARTIFACT_ARCHIVE_GLOBS = ["build/*/test-logs/*"]
+ARTIFACT_ARCHIVE_GLOBS = ["build/*/test-logs/**/*"]
 ISOLATE_SERVER = os.environ.get('ISOLATE_SERVER',
                                 "http://isolate.cloudera.org:4242/")
 DIST_TEST_HOME = os.environ.get('DIST_TEST_HOME',
@@ -63,13 +63,12 @@ DEPS_FOR_ALL = \
      "build-support/lsan-suppressions.txt",
 
      # The LLVM symbolizer is necessary for suppressions to work
-     "thirdparty/installed/bin/llvm-symbolizer",
+     "thirdparty/installed/uninstrumented/bin/llvm-symbolizer",
 
      # Tests that use the external minicluster require these.
      # TODO: declare these dependencies per-test.
      "build/latest/bin/kudu-tserver",
      "build/latest/bin/kudu-master",
-     "build/latest/bin/kudu-ts-cli",
 
      # parser-test requires these data files.
      # TODO: again, we should do this with some per-test metadata file.
@@ -77,9 +76,21 @@ DEPS_FOR_ALL = \
      #".../example-deletes.txt",
      #".../example-tweets.txt",
 
-     # Tests that require tooling require these.
-     "build/latest/bin/kudu-admin",
+     # Tests that require tooling require this.
+     "build/latest/bin/kudu",
      ]
+
+# The number of shards to split tests into. This is set on a per-test basis
+# since it's only worth doing when a test has lots of separate cases and
+# more than one of them runs relatively long.
+NUM_SHARDS_BY_TEST = {
+  'cfile-test': 4,
+  'client-test': 8,
+  'delete_table-test': 8,
+  'flex_partitioning-itest': 8,
+  'mt-tablet-test': 4,
+  'raft_consensus-itest': 8
+}
 
 
 class StagingDir(object):
@@ -120,7 +131,7 @@ def abs_to_rel(abs_path, staging):
 
 
 def get_test_commandlines():
-  ctest_bin = os.path.join(rel_to_abs("thirdparty/installed/bin/ctest"))
+  ctest_bin = os.path.join(rel_to_abs("thirdparty/installed/common/bin/ctest"))
   p = subprocess.Popen([ctest_bin, "-V", "-N", "-LE", "no_dist_test"], stdout=subprocess.PIPE)
   out, err = p.communicate()
   if p.returncode != 0:
@@ -139,7 +150,7 @@ def get_test_commandlines():
 def is_lib_blacklisted(lib):
   # These particular system libraries, we should ship to the remote nodes.
   # No need to ship things like libc, libstdcxx, etc.
-  if "boost" in lib or "oauth" in lib:
+  if "oauth" in lib:
     return False
   if lib.startswith("/lib") or lib.startswith("/usr"):
     return True
@@ -164,7 +175,9 @@ def copy_system_library(lib):
   if not os.path.exists(sys_lib_dir):
     os.makedirs(sys_lib_dir)
   dst = os.path.join(sys_lib_dir, os.path.basename(lib))
-  if not os.path.exists(dst):
+  # Copy if it doesn't exist, or the mtimes don't match.
+  # Using shutil.copy2 preserves the mtime after the copy (like cp -p)
+  if not os.path.exists(dst) or os.stat(dst).st_mtime != os.stat(lib).st_mtime:
     logging.info("Copying system library %s to %s...", lib, dst)
     shutil.copy2(rel_to_abs(lib), dst)
   return dst
@@ -179,7 +192,10 @@ def ldd_deps(exe):
   If the provided 'exe' is not a binary executable, returns
   an empty list.
   """
-  if exe.endswith(".sh"):
+  if (exe.endswith(".pl") or
+      exe.endswith(".py") or
+      exe.endswith(".sh") or
+      exe.endswith(".txt")):
     return []
   p = subprocess.Popen(["ldd", exe], stdout=subprocess.PIPE)
   out, err = p.communicate()
@@ -205,18 +221,9 @@ def ldd_deps(exe):
   return ret
 
 
-def num_shards_for_test(test_name):
-  if 'raft_consensus-itest' in test_name:
-    return 8
-  if 'cfile-test' in test_name:
-    return 4
-  if 'mt-tablet-test' in test_name:
-    return 4
-  return 1
-
-
 def create_archive_input(staging, argv,
-                         disable_sharding=False):
+                         disable_sharding=False,
+                         collect_tmpdir=False):
   """
   Generates .gen.json and .isolate files corresponding to the
   test command 'argv'. The outputs are placed in the specified
@@ -240,7 +247,13 @@ def create_archive_input(staging, argv,
     if os.path.isdir(d):
       d += "/"
     deps.append(d)
-  for d in deps:
+    # DEPS_FOR_ALL may include binaries whose dependencies are not dependencies
+    # of the test executable. We must include those dependencies in the archive
+    # for the binaries to be usable.
+    deps.extend(ldd_deps(d))
+
+  # Deduplicate dependencies included via DEPS_FOR_ALL.
+  for d in set(deps):
     # System libraries will end up being relative paths out
     # of the build tree. We need to copy those into the build
     # tree somewhere.
@@ -251,7 +264,7 @@ def create_archive_input(staging, argv,
   if disable_sharding:
     num_shards = 1
   else:
-    num_shards = num_shards_for_test(test_name)
+    num_shards = NUM_SHARDS_BY_TEST.get(test_name, 1)
   for shard in xrange(0, num_shards):
     out_archive = os.path.join(staging.dir, '%s.%d.gen.json' % (test_name, shard))
     out_isolate = os.path.join(staging.dir, '%s.%d.isolate' % (test_name, shard))
@@ -263,6 +276,8 @@ def create_archive_input(staging, argv,
                '-e', 'KUDU_ALLOW_SLOW_TESTS=%s' % os.environ.get('KUDU_ALLOW_SLOW_TESTS', 1),
                '-e', 'KUDU_COMPRESS_TEST_OUTPUT=%s' % \
                       os.environ.get('KUDU_COMPRESS_TEST_OUTPUT', 0)]
+    if collect_tmpdir:
+      command += ["--collect-tmpdir"]
     command.append('--')
     command += argv[1:]
 
@@ -348,7 +363,7 @@ def submit_tasks(staging, options):
         "Set the DIST_TEST_HOME environment variable to the path to the dist_test directory. " \
         % DIST_TEST_HOME,
     raise OSError("Cannot find path to dist_test tools")
-  client_py_path = os.path.join(DIST_TEST_HOME, "client.py")
+  client_py_path = os.path.join(DIST_TEST_HOME, "bin", "client")
   try:
     cmd = [client_py_path, "submit"]
     if options.no_wait:
@@ -374,8 +389,8 @@ def run_all_tests(parser, options):
   staging = StagingDir.new()
   for command in commands:
     create_archive_input(staging, command,
-        disable_sharding=options.disable_sharding)
-
+                         disable_sharding=options.disable_sharding,
+                         collect_tmpdir=options.collect_tmpdir)
   run_isolate(staging)
   create_task_json(staging, flaky_test_set=get_flakies())
   submit_tasks(staging, options)
@@ -393,7 +408,8 @@ def loop_test(parser, options):
   command = ["run-test.sh", options.cmd] + options.args
   staging = StagingDir.new()
   create_archive_input(staging, command,
-                       disable_sharding=options.disable_sharding)
+                       disable_sharding=options.disable_sharding,
+                       collect_tmpdir=options.collect_tmpdir)
   run_isolate(staging)
   create_task_json(staging, options.num_instances)
   submit_tasks(staging, options)
@@ -415,6 +431,8 @@ def main(argv):
   p = argparse.ArgumentParser()
   p.add_argument("--disable-sharding", dest="disable_sharding", action="store_true",
                  help="Disable automatic sharding of tests", default=False)
+  p.add_argument("--collect-tmpdir", dest="collect_tmpdir", action="store_true",
+                 help="Collect the test tmpdir of failed tasks as test artifacts", default=False)
   p.add_argument("--no-wait", dest="no_wait", action="store_true",
                  help="Return without waiting for the job to complete", default=False)
   sp = p.add_subparsers()

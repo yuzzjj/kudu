@@ -24,13 +24,10 @@
 #include <vector>
 
 #include "kudu/cfile/cfile_writer.h"
+#include "kudu/tablet/compaction.h"
 #include "kudu/tablet/deltafile.h"
 
 namespace kudu {
-
-namespace metadata {
-class RowSetMetadata;
-} // namespace metadata
 
 namespace tablet {
 
@@ -54,9 +51,10 @@ class MajorDeltaCompaction {
   // in an ALTER scenario?
   MajorDeltaCompaction(
       FsManager* fs_manager, const Schema& base_schema, CFileSet* base_data,
-      std::shared_ptr<DeltaIterator> delta_iter,
+      std::unique_ptr<DeltaIterator> delta_iter,
       std::vector<std::shared_ptr<DeltaStore> > included_stores,
-      const std::vector<ColumnId>& col_ids);
+      std::vector<ColumnId> col_ids,
+      HistoryGcOpts history_gc_opts);
   ~MajorDeltaCompaction();
 
   // Executes the compaction.
@@ -103,6 +101,8 @@ class MajorDeltaCompaction {
   // The column ids to compact.
   const std::vector<ColumnId> column_ids_;
 
+  const HistoryGcOpts history_gc_opts_;
+
   // Inputs:
   //-----------------
 
@@ -113,7 +113,7 @@ class MajorDeltaCompaction {
   const SharedDeltaStoreVector included_stores_;
 
   // The merged view of the deltas from included_stores_.
-  const std::shared_ptr<DeltaIterator> delta_iter_;
+  const std::unique_ptr<DeltaIterator> delta_iter_;
 
   // Outputs:
   gscoped_ptr<MultiColumnWriter> base_data_writer_;

@@ -73,6 +73,55 @@ TEST(MockHybridClockTest, TestMockedSystemClock) {
             HybridClock::TimestampFromMicrosecondsAndLogicalValue(time, 1).ToUint64());
 }
 
+// Test that, if the rate at which the clock is read is greater than the maximum
+// resolution of the logical counter (12 bits in our implementation), it properly
+// "overflows" into the physical portion of the clock, and maintains all ordering
+// guarantees even as the physical clock continues to increase.
+//
+// This is a regression test for KUDU-1345.
+TEST(MockHybridClockTest, TestClockDealsWithWrapping) {
+  google::FlagSaver saver;
+  FLAGS_use_mock_wall_clock = true;
+  scoped_refptr<HybridClock> clock(new HybridClock());
+  clock->SetMockClockWallTimeForTests(1000);
+  clock->Init();
+
+  Timestamp prev = clock->Now();
+
+  // Update the clock from 10us in the future
+  clock->Update(HybridClock::TimestampFromMicroseconds(1010));
+
+  // Now read the clock value enough times so that the logical value wraps
+  // over, and should increment the _physical_ portion of the clock.
+  for (int i = 0; i < 10000; i++) {
+    Timestamp now = clock->Now();
+    ASSERT_GT(now.value(), prev.value());
+    prev = now;
+  }
+  ASSERT_EQ(1012, HybridClock::GetPhysicalValueMicros(prev));
+
+  // Advance the time microsecond by microsecond, and ensure the clock never
+  // goes backwards.
+  for (int time = 1001; time < 1020; time++) {
+    clock->SetMockClockWallTimeForTests(time);
+    Timestamp now = clock->Now();
+
+    // Clock should run strictly forwards.
+    ASSERT_GT(now.value(), prev.value());
+
+    // Additionally, once the physical time surpasses the logical time, we should
+    // be running on the physical clock. Otherwise, we should stick with the physical
+    // time we had rolled forward to above.
+    if (time > 1012) {
+      ASSERT_EQ(time, HybridClock::GetPhysicalValueMicros(now));
+    } else {
+      ASSERT_EQ(1012, HybridClock::GetPhysicalValueMicros(now));
+    }
+
+    prev = now;
+  }
+}
+
 // Test that two subsequent time reads are monotonically increasing.
 TEST_F(HybridClockTest, TestNow_ValuesIncreaseMonotonically) {
   const Timestamp now1 = clock_->Now();
@@ -107,7 +156,7 @@ TEST_F(HybridClockTest, TestUpdate_LogicalValueIncreasesByAmount) {
 // Test that the incoming event is in the past, i.e. less than now - max_error
 TEST_F(HybridClockTest, TestWaitUntilAfter_TestCase1) {
   MonoTime no_deadline;
-  MonoTime before = MonoTime::Now(MonoTime::FINE);
+  MonoTime before = MonoTime::Now();
 
   Timestamp past_ts;
   uint64_t max_error;
@@ -122,8 +171,8 @@ TEST_F(HybridClockTest, TestWaitUntilAfter_TestCase1) {
 
   ASSERT_OK(s);
 
-  MonoTime after = MonoTime::Now(MonoTime::FINE);
-  MonoDelta delta = after.GetDeltaSince(before);
+  MonoTime after = MonoTime::Now();
+  MonoDelta delta = after - before;
   // The delta should be close to 0, but it takes some time for the hybrid
   // logical clock to decide that it doesn't need to wait.
   ASSERT_LT(delta.ToMicroseconds(), 25000);
@@ -132,7 +181,7 @@ TEST_F(HybridClockTest, TestWaitUntilAfter_TestCase1) {
 // The normal case for transactions. Obtain a timestamp and then wait until
 // we're sure that tx_latest < now_earliest.
 TEST_F(HybridClockTest, TestWaitUntilAfter_TestCase2) {
-  MonoTime before = MonoTime::Now(MonoTime::FINE);
+  MonoTime before = MonoTime::Now();
 
   // we do no time adjustment, this event should fall right within the possible
   // error interval
@@ -159,13 +208,12 @@ TEST_F(HybridClockTest, TestWaitUntilAfter_TestCase2) {
 
   // Wait with a deadline well in the future. This should succeed.
   {
-    MonoTime deadline = before;
-    deadline.AddDelta(MonoDelta::FromSeconds(60));
+    MonoTime deadline = before + MonoDelta::FromSeconds(60);
     ASSERT_OK(clock_->WaitUntilAfter(wait_until, deadline));
   }
 
-  MonoTime after = MonoTime::Now(MonoTime::FINE);
-  MonoDelta delta = after.GetDeltaSince(before);
+  MonoTime after = MonoTime::Now();
+  MonoDelta delta = after - before;
 
   // In the common case current_max_error >= past_max_error and we should have waited
   // 2 * past_max_error, but if the clock's error is reset between the two reads we might
@@ -229,6 +277,16 @@ TEST_F(HybridClockTest, TestClockDoesntGoBackwardsWithUpdates) {
   for (const scoped_refptr<Thread> t : threads) {
     t->Join();
   }
+}
+
+TEST_F(HybridClockTest, TestGetPhysicalComponentDifference) {
+  Timestamp now1 = HybridClock::TimestampFromMicrosecondsAndLogicalValue(100, 100);
+  SleepFor(MonoDelta::FromMilliseconds(1));
+  Timestamp now2 = HybridClock::TimestampFromMicrosecondsAndLogicalValue(200, 0);
+  MonoDelta delta = clock_->GetPhysicalComponentDifference(now2, now1);
+  MonoDelta negative_delta = clock_->GetPhysicalComponentDifference(now1, now2);
+  ASSERT_EQ(100, delta.ToMicroseconds());
+  ASSERT_EQ(-100, negative_delta.ToMicroseconds());
 }
 
 }  // namespace server

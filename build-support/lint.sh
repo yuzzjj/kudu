@@ -19,7 +19,7 @@
 
 ROOT=$(cd $(dirname $BASH_SOURCE)/..; pwd)
 
-TMP=$(mktemp)
+TMP=$(mktemp -t kudu-lint.XXXXXXXXX)
 trap "rm $TMP" EXIT
 
 ONLY_CHANGED=false
@@ -38,24 +38,24 @@ done
 
 if $ONLY_CHANGED; then
   FILES=$(git diff --name-only $($ROOT/build-support/get-upstream-commit.sh)  \
-    | egrep  '\.(cc|h)$' | grep -v "gutil\|trace_event")
+    | egrep  '\.(cc|h)$' | grep -v "gutil\|trace_event\|x509_check_host")
   if [ -z "$FILES" ]; then
     echo No source files changed
     exit 0
   fi
 else
-  FILES=$(find $ROOT/src -name '*.cc' -or -name '*.h' | grep -v "\.pb\.\|\.service\.\|\.proxy\.\|\.krpc\.\|gutil\|trace_event\|kudu_export\.h")
+  FILES=$(find $ROOT/src -name '*.cc' -or -name '*.h' | grep -v "\.pb\.\|\.service\.\|\.proxy\.\|\.krpc\.\|gutil\|trace_event\|kudu_export\.h\|x509_check_host")
 fi
 
 cd $ROOT
 
-$ROOT/thirdparty/installed/bin/cpplint.py \
+$ROOT/thirdparty/installed/common/bin/cpplint.py \
   --verbose=4 \
-  --filter=-whitespace/comments,-readability/todo,-build/header_guard,-build/include_order,-legal/copyright,-build/c++11 \
+  --filter=-whitespace/comments,-readability/todo,-readability/inheritance,-build/header_guard,-build/include_order,-legal/copyright,-build/c++11 \
   $FILES 2>&1 | grep -v 'Done processing' | tee $TMP
 
 NUM_ERRORS=$(grep "Total errors found" $TMP | awk '{print $4}')
 
-if [ "$NUM_ERRORS" -ne 0 ]; then
+if [[ "$NUM_ERRORS" -ne 0 ]]; then
   exit 1
 fi

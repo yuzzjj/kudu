@@ -16,12 +16,13 @@
 // under the License.
 package kudu.consensus;
 
-option java_package = "org.kududb.consensus";
+option java_package = "org.apache.kudu.consensus";
 
 import "kudu/common/common.proto";
 import "kudu/common/wire_protocol.proto";
 import "kudu/consensus/metadata.proto";
 import "kudu/consensus/opid.proto";
+import "kudu/rpc/rpc_header.proto";
 import "kudu/tablet/metadata.proto";
 import "kudu/tablet/tablet.proto";
 import "kudu/tserver/tserver_admin.proto";
@@ -177,6 +178,9 @@ message ReplicateMsg {
   optional tserver.AlterSchemaRequestPB alter_schema_request = 6;
   optional ChangeConfigRecordPB change_config_record = 7;
 
+  // The client's request id for this message, if it is set.
+  optional rpc.RequestIdPB request_id = 8;
+
   optional NoOpRequestPB noop_request = 999;
 }
 
@@ -195,23 +199,10 @@ message CommitMsg {
 //  Internal Consensus Messages and State
 // ===========================================================================
 
-// NoOp requests, mostly used in tests.
+// NO_OP requests are replicated by a peer after being elected leader.
 message NoOpRequestPB {
  // Allows to set a dummy payload, for tests.
  optional bytes payload_for_tests = 1;
-}
-
-// NoOp responses, mostly used in tests.
-message NoOpResponsePB {
-   // Allows to set a dummy payload, for tests.
-   optional bytes payload_for_tests = 1;
-}
-
-message PerOpErrorPB {
-  // The id of the operation that failed in the other peer.
-  required OpId id = 1;
-  // The Status explaining why the operation failed.
-  required AppStatusPB status = 2;
 }
 
 // Status message received in the peer responses.
@@ -229,6 +220,12 @@ message ConsensusStatusPB {
   // (PRECEDING_ENTRY_DIDNT_MATCH), this field is important and may still be
   // set, since the leader queue uses this field in conjuction with
   // last_received to decide on the next id to send to the follower.
+  //
+  // NOTE: it might seem that the leader itself could track this based on knowing
+  // which batches were successfully sent. However, the follower is free to
+  // truncate the batch if an operation in the middle of the batch fails
+  // to prepare (eg due to memory limiting). In that case, the leader
+  // will get a success response but still need to re-send some operations.
   optional OpId last_received_current_leader = 4;
 
   // The last committed index that is known to the peer.
@@ -273,6 +270,10 @@ message VoteRequestPB {
   // for example to force a faster leader hand-off rather than waiting for
   // the election timer to expire.
   optional bool ignore_live_leader = 5 [ default = false ];
+
+  // In a "pre-election", voters should respond how they _would_ have voted
+  // but not actually record the vote.
+  optional bool is_pre_election = 7 [ default = false ];
 }
 
 // A response from a replica to a leader election request.
@@ -320,12 +321,17 @@ message ConsensusRequestPB {
   // This must be set if 'ops' is non-empty.
   optional OpId preceding_id = 4;
 
-  // The id of the last committed operation in the configuration. This is the
-  // id of the last operation the leader deemed committed from a consensus
+  // The index of the last committed operation in the configuration. This is the
+  // index of the last operation the leader deemed committed from a consensus
   // standpoint (not the last operation the leader applied).
   //
   // Raft calls this field 'leaderCommit'.
-  required OpId committed_index = 5;
+  optional int64 committed_index = 8;
+
+  // Deprecated field used in Kudu 0.10.0 and earlier. Remains here to prevent
+  // accidental reuse and provide a nicer error message if the user attempts
+  // a rolling upgrade.
+  optional OpId DEPRECATED_committed_index = 5;
 
   // Sequence of operations to be replicated by this peer.
   // These will be committed when committed_index advances above their
@@ -333,6 +339,25 @@ message ConsensusRequestPB {
   // these operations are already committed, in which case they will be
   // committed during the same request.
   repeated ReplicateMsg ops = 6;
+
+  // The highest index that is known to be replicated by all members of
+  // the configuration.
+  //
+  // NOTE: this is not necessarily monotonically increasing. For example, if a node is in
+  // the process of being added to the configuration but has not yet copied a snapshot,
+  // this value may drop to 0.
+  optional int64 all_replicated_index = 9;
+
+  // The safe timestamp on the leader.
+  // This is only set if the leader has no messages to send to the peer or if the last sent
+  // message is already (raft) committed. By setting this the leader allows followers to advance
+  // the "safe time" past the timestamp of the last committed message and answer snapshot scans
+  // in the present in the absense of writes.
+  optional fixed64 safe_timestamp = 10;
+
+  // The index of the most recent operation appended to the leader.
+  // Followers can use this to determine roughly how far behind they are from the leader.
+  optional int64 last_idx_appended_to_leader = 11;
 }
 
 message ConsensusResponsePB {
@@ -441,28 +466,53 @@ message GetConsensusStateResponsePB {
   optional tserver.TabletServerErrorPB error = 2;
 }
 
-message StartRemoteBootstrapRequestPB {
+message StartTabletCopyRequestPB {
   // UUID of server this request is addressed to.
   optional bytes dest_uuid = 5;
 
   required bytes tablet_id = 1;
 
-  // Identification for the host we are bootstrapping from.
-  // TODO: Consider renaming these to bootstrap_source_*.
-  required bytes bootstrap_peer_uuid = 2;
-  required HostPortPB bootstrap_peer_addr = 3;
+  // Identification for the host we are copying from.
+  // TODO: Consider renaming these to copy_source_*.
+  required bytes copy_peer_uuid = 2;
+  required HostPortPB copy_peer_addr = 3;
 
   // The caller's term. In the case that the target of this request has a
   // TOMBSTONED replica with a term higher than this one, the request will fail.
   optional int64 caller_term = 4 [ default = -1 ];
 }
 
-message StartRemoteBootstrapResponsePB {
+message StartTabletCopyResponsePB {
+  optional tserver.TabletServerErrorPB error = 1;
+}
+
+// An unsafe change configuration request for the tablet with 'tablet_id'.
+message UnsafeChangeConfigRequestPB {
+  // UUID of server this request is addressed to.
+  optional bytes dest_uuid = 1;
+  required bytes tablet_id = 2;
+
+  // Sender identification, it could be a static string as well.
+  required bytes caller_id = 3;
+
+  // The raft config sent to destination server.
+  // Only the 'permanent_uuid' of each peer in the config is
+  // required (address-related information is ignored by the server).
+  // The peers specified in the 'new_config' are required to be a
+  // subset of (or equal to) the peers in the committed config on the
+  // destination replica.
+  required RaftConfigPB new_config = 4;
+}
+
+// The unsafe change configuration response. 'error' field is set if operation failed.
+message UnsafeChangeConfigResponsePB {
   optional tserver.TabletServerErrorPB error = 1;
 }
 
 // A Raft implementation.
 service ConsensusService {
+  option (kudu.rpc.default_authz_method) = "AuthorizeServiceUser";
+
   // Analogous to AppendEntries in Raft, but only used for followers.
   rpc UpdateConsensus(ConsensusRequestPB) returns (ConsensusResponsePB);
 
@@ -474,6 +524,9 @@ service ConsensusService {
   // an operation to change the role of a server between VOTER and NON_VOTER.
   // An OK response means the operation was successful.
   rpc ChangeConfig(ChangeConfigRequestPB) returns (ChangeConfigResponsePB);
+
+  // Implements unsafe config change operation for manual recovery use cases.
+  rpc UnsafeChangeConfig(UnsafeChangeConfigRequestPB) returns (UnsafeChangeConfigResponsePB);
 
   rpc GetNodeInstance(GetNodeInstanceRequestPB) returns (GetNodeInstanceResponsePB);
 
@@ -488,6 +541,6 @@ service ConsensusService {
   // Returns the committed Consensus state.
   rpc GetConsensusState(GetConsensusStateRequestPB) returns (GetConsensusStateResponsePB);
 
-  // Instruct this server to remotely bootstrap a tablet from another host.
-  rpc StartRemoteBootstrap(StartRemoteBootstrapRequestPB) returns (StartRemoteBootstrapResponsePB);
+  // Instruct this server to copy a tablet from another host.
+  rpc StartTabletCopy(StartTabletCopyRequestPB) returns (StartTabletCopyResponsePB);
 }

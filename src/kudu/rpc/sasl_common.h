@@ -36,8 +36,19 @@ namespace rpc {
 using std::string;
 
 // Constants
-extern const char* const kSaslMechAnonymous;
 extern const char* const kSaslMechPlain;
+extern const char* const kSaslMechGSSAPI;
+extern const size_t kSaslMaxOutBufLen;
+
+struct SaslMechanism {
+  enum Type {
+    INVALID,
+    PLAIN,
+    GSSAPI
+  };
+  static Type value_of(const std::string& mech);
+  static const char* name_of(Type val);
+};
 
 // Initialize the SASL library.
 // appname: Name of the application for logging messages & sasl plugin configuration.
@@ -53,22 +64,49 @@ extern const char* const kSaslMechPlain;
 //
 // This function is thread safe and uses a static lock.
 // This function should NOT be called during static initialization.
-Status SaslInit(const char* const app_name);
+Status SaslInit() WARN_UNUSED_RESULT;
 
-// Return a string describing the SASL error response.
-string SaslErrDesc(int status, sasl_conn_t* conn);
+// Disable Kudu's initialization of SASL. See equivalent method in client.h.
+Status DisableSaslInitialization() WARN_UNUSED_RESULT;
+
+// Wrap a call into the SASL library. 'call' should be a lambda which
+// returns a SASL error code.
+//
+// The result is translated into a Status as follows:
+//
+//  SASL_OK:       Status::OK()
+//  SASL_CONTINUE: Status::Incomplete()
+//  otherwise:     Status::NotAuthorized()
+//
+// The Status message is beautified to be more user-friendly compared
+// to the underlying sasl_errdetails() call.
+Status WrapSaslCall(sasl_conn_t* conn, const std::function<int()>& call) WARN_UNUSED_RESULT;
 
 // Return <ip>;<port> string formatted for SASL library use.
 string SaslIpPortString(const Sockaddr& addr);
 
 // Return available plugin mechanisms for the given connection.
-std::set<string> SaslListAvailableMechs();
+std::set<SaslMechanism::Type> SaslListAvailableMechs();
 
 // Initialize and return a libsasl2 callback data structure based on the passed args.
 // id: A SASL callback identifier (e.g., SASL_CB_GETOPT).
 // proc: A C-style callback with appropriate signature based on the callback id, or NULL.
 // context: An object to pass to the callback as the context pointer, or NULL.
 sasl_callback_t SaslBuildCallback(int id, int (*proc)(void), void* context);
+
+// Require integrity protection on the SASL connection. Should be called before
+// initiating the SASL negotiation.
+Status EnableIntegrityProtection(sasl_conn_t* sasl_conn) WARN_UNUSED_RESULT;
+
+// Encode the provided data and append it to 'encoded'.
+Status SaslEncode(sasl_conn_t* conn,
+                  const std::string& plaintext,
+                  std::string* encoded) WARN_UNUSED_RESULT;
+
+// Decode the provided SASL-encoded data and append it to 'plaintext'.
+Status SaslDecode(sasl_conn_t* conn,
+                  const std::string& encoded,
+                  std::string* plaintext) WARN_UNUSED_RESULT;
 
 // Deleter for sasl_conn_t instances, for use with gscoped_ptr after calling sasl_*_new()
 struct SaslDeleter {
@@ -77,22 +115,10 @@ struct SaslDeleter {
   }
 };
 
-struct SaslNegotiationState {
-  enum Type {
-    NEW,
-    INITIALIZED,
-    NEGOTIATED
-  };
-};
-
-struct SaslMechanism {
-  enum Type {
-    INVALID,
-    ANONYMOUS,
-    PLAIN
-  };
-  static Type value_of(const std::string& mech);
-};
+// Internals exposed in the header for test purposes.
+namespace internal {
+void SaslSetMutex();
+} // namespace internal
 
 } // namespace rpc
 } // namespace kudu

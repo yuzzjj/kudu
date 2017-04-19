@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <glog/logging.h>
+#include <mutex>
 
 #include "kudu/gutil/atomicops.h"
 #include "kudu/gutil/dynamic_annotations.h"
@@ -26,7 +27,6 @@
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/spinlock.h"
 #include "kudu/gutil/sysinfo.h"
-#include "kudu/util/errno.h"
 #include "kudu/util/rw_semaphore.h"
 
 namespace kudu {
@@ -158,9 +158,7 @@ class rw_spinlock {
 class percpu_rwlock {
  public:
   percpu_rwlock() {
-    errno = 0;
     n_cpus_ = base::MaxCPUIndex() + 1;
-    CHECK_EQ(errno, 0) << ErrnoToString(errno);
     CHECK_GT(n_cpus_, 0);
     locks_ = new padded_lock[n_cpus_];
   }
@@ -231,84 +229,31 @@ class percpu_rwlock {
   padded_lock *locks_;
 };
 
-// Simpler version of boost::lock_guard. Only supports the basic object
-// lifecycle and defers any error checking to the underlying mutex.
-template <typename Mutex>
-class lock_guard {
- public:
-  explicit lock_guard(Mutex* m)
-    : m_(DCHECK_NOTNULL(m)) {
-    m_->lock();
-  }
+// Simple implementation of the std::shared_lock API, which is not available in
+// the standard library until C++14. Defers error checking to the underlying
+// mutex.
 
-  ~lock_guard() {
-    m_->unlock();
-  }
-
- private:
-  Mutex* m_;
-  DISALLOW_COPY_AND_ASSIGN(lock_guard<Mutex>);
-};
-
-// Simpler version of boost::unique_lock. Tracks lock acquisition and will
-// report attempts to double lock() or unlock().
-template <typename Mutex>
-class unique_lock {
- public:
-  unique_lock()
-    : locked_(false),
-      m_(NULL) {
-  }
-
-  explicit unique_lock(Mutex* m)
-    : locked_(true),
-      m_(m) {
-    m_->lock();
-  }
-
-  ~unique_lock() {
-    if (locked_) {
-      m_->unlock();
-      locked_ = false;
-    }
-  }
-
-  void lock() {
-    DCHECK(!locked_);
-    m_->lock();
-    locked_ = true;
-  }
-
-  void unlock() {
-    DCHECK(locked_);
-    m_->unlock();
-    locked_ = false;
-  }
-
-  void swap(unique_lock<Mutex>* other) {
-    DCHECK(other != NULL) << "The passed unique_lock is null";
-    std::swap(locked_, other->locked_);
-    std::swap(m_, other->m_);
-  }
-
- private:
-  bool locked_;
-  Mutex* m_;
-  DISALLOW_COPY_AND_ASSIGN(unique_lock<Mutex>);
-};
-
-// Simpler version of boost::shared_lock. Defers error checking to the
-// underlying mutex.
 template <typename Mutex>
 class shared_lock {
  public:
   shared_lock()
-    : m_(NULL) {
+      : m_(nullptr) {
   }
 
-  explicit shared_lock(Mutex* m)
-    : m_(DCHECK_NOTNULL(m)) {
+  explicit shared_lock(Mutex& m)
+      : m_(&m) {
     m_->lock_shared();
+  }
+
+  shared_lock(Mutex& m, std::try_to_lock_t t)
+      : m_(nullptr) {
+    if (m.try_lock_shared()) {
+      m_ = &m;
+    }
+  }
+
+  bool owns_lock() const {
+    return m_;
   }
 
   void swap(shared_lock& other) {
@@ -316,7 +261,7 @@ class shared_lock {
   }
 
   ~shared_lock() {
-    if (m_ != NULL) {
+    if (m_ != nullptr) {
       m_->unlock_shared();
     }
   }

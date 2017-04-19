@@ -26,6 +26,7 @@
 #include "kudu/tablet/tablet_peer.h"
 #include "kudu/tablet/tablet_metrics.h"
 #include "kudu/tserver/tserver.pb.h"
+#include "kudu/util/pb_util.h"
 #include "kudu/util/trace.h"
 
 namespace kudu {
@@ -36,6 +37,7 @@ using consensus::ReplicateMsg;
 using consensus::CommitMsg;
 using consensus::ALTER_SCHEMA_OP;
 using consensus::DriverType;
+using std::unique_ptr;
 using strings::Substitute;
 using tserver::TabletServerErrorPB;
 using tserver::AlterSchemaRequestPB;
@@ -44,9 +46,9 @@ using tserver::AlterSchemaResponsePB;
 string AlterSchemaTransactionState::ToString() const {
   return Substitute("AlterSchemaTransactionState "
                     "[timestamp=$0, schema=$1, request=$2]",
-                    timestamp().ToString(),
+                    has_timestamp() ? timestamp().ToString() : "<unassigned>",
                     schema_ == nullptr ? "(none)" : schema_->ToString(),
-                    request_ == nullptr ? "(none)" : request_->ShortDebugString());
+                    request_ == nullptr ? "(none)" : SecureShortDebugString(*request_));
 }
 
 void AlterSchemaTransactionState::AcquireSchemaLock(rw_semaphore* l) {
@@ -61,11 +63,10 @@ void AlterSchemaTransactionState::ReleaseSchemaLock() {
   TRACE("Released schema lock");
 }
 
-
-AlterSchemaTransaction::AlterSchemaTransaction(AlterSchemaTransactionState* state,
+AlterSchemaTransaction::AlterSchemaTransaction(unique_ptr<AlterSchemaTransactionState> state,
                                                DriverType type)
-    : Transaction(state, type, Transaction::ALTER_SCHEMA_TXN),
-      state_(state) {
+    : Transaction(state.get(), type, Transaction::ALTER_SCHEMA_TXN),
+      state_(std::move(state)) {
 }
 
 void AlterSchemaTransaction::NewReplicateMsg(gscoped_ptr<ReplicateMsg>* replicate_msg) {
@@ -95,9 +96,9 @@ Status AlterSchemaTransaction::Prepare() {
 }
 
 Status AlterSchemaTransaction::Start() {
-  if (!state_->has_timestamp()) {
-    state_->set_timestamp(state_->tablet_peer()->clock()->Now());
-  }
+  DCHECK(!state_->has_timestamp());
+  DCHECK(state_->consensus_round()->replicate_msg()->has_timestamp());
+  state_->set_timestamp(Timestamp(state_->consensus_round()->replicate_msg()->timestamp()));
   TRACE("START. Timestamp: $0", server::HybridClock::GetPhysicalValueMicros(state_->timestamp()));
   return Status::OK();
 }
@@ -110,6 +111,10 @@ Status AlterSchemaTransaction::Apply(gscoped_ptr<CommitMsg>* commit_msg) {
   state_->tablet_peer()->log()
     ->SetSchemaForNextLogSegment(*DCHECK_NOTNULL(state_->schema()),
                                                  state_->schema_version());
+
+  // Altered tablets should be included in the next tserver heartbeat so that
+  // clients waiting on IsAlterTableDone() are unblocked promptly.
+  state_->tablet_peer()->MarkTabletDirty("Alter schema finished");
 
   commit_msg->reset(new CommitMsg());
   (*commit_msg)->set_op_type(ALTER_SCHEMA_OP);

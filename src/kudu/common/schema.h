@@ -88,6 +88,12 @@ struct ColumnStorageAttributes {
       cfile_block_size(0) {
   }
 
+  ColumnStorageAttributes(EncodingType enc, CompressionType cmp)
+    : encoding(enc),
+      compression(cmp),
+      cfile_block_size(0) {
+  }
+
   string ToString() const;
 
   EncodingType encoding;
@@ -195,19 +201,37 @@ class ColumnSchema {
     return NULL;
   }
 
+  bool EqualsPhysicalType(const ColumnSchema& other) const {
+    return is_nullable_ == other.is_nullable_ &&
+           type_info()->physical_type() == other.type_info()->physical_type();
+  }
+
   bool EqualsType(const ColumnSchema &other) const {
     return is_nullable_ == other.is_nullable_ &&
            type_info()->type() == other.type_info()->type();
   }
 
-  bool Equals(const ColumnSchema &other, bool check_defaults) const {
-    if (!EqualsType(other) || this->name_ != other.name_)
+  // compare types in Equals function
+  enum {
+    COMPARE_NAME = 1 << 0,
+    COMPARE_TYPE = 1 << 1,
+    COMPARE_DEFAULTS = 1 << 2,
+
+    COMPARE_ALL = COMPARE_NAME | COMPARE_TYPE | COMPARE_DEFAULTS
+  };
+
+  bool Equals(const ColumnSchema &other,
+              int flags = COMPARE_ALL) const {
+    if ((flags & COMPARE_NAME) && this->name_ != other.name_)
       return false;
 
-    // For Key comparison checking the defauls doesn't make sense,
+    if ((flags & COMPARE_TYPE) && !EqualsType(other))
+      return false;
+
+    // For Key comparison checking the defaults doesn't make sense,
     // since we don't support them, for server vs user schema this comparison
     // will always fail, since the user does not specify the defaults.
-    if (check_defaults) {
+    if (flags & COMPARE_DEFAULTS) {
       if (read_default_ == NULL && other.read_default_ != NULL)
         return false;
 
@@ -367,9 +391,10 @@ class Schema {
                const vector<ColumnId>& ids,
                int key_columns);
 
-  // Return the number of bytes needed to represent a single row of this schema.
+  // Return the number of bytes needed to represent a single row of this schema, without
+  // accounting for the null bitmap if the Schema contains nullable values.
   //
-  // This size does not include any indirected (variable length) data (eg strings)
+  // This size does not include any indirected (variable length) data (eg strings).
   size_t byte_size() const {
     DCHECK(initialized());
     return col_offsets_.back();
@@ -616,9 +641,8 @@ class Schema {
     if (this->num_key_columns_ != other.num_key_columns_) return false;
     if (this->cols_.size() != other.cols_.size()) return false;
 
-    const bool have_column_ids = other.has_column_ids() && has_column_ids();
     for (size_t i = 0; i < other.cols_.size(); i++) {
-      if (!this->cols_[i].Equals(other.cols_[i], have_column_ids)) return false;
+      if (!this->cols_[i].Equals(other.cols_[i])) return false;
     }
 
     return true;
@@ -626,12 +650,20 @@ class Schema {
 
   // Return true if the key projection schemas have exactly the same set of
   // columns and respective types.
-  bool KeyEquals(const Schema& other) const {
+  bool KeyEquals(const Schema& other,
+                 int flags
+                    = ColumnSchema::COMPARE_NAME | ColumnSchema::COMPARE_TYPE) const {
     if (this->num_key_columns_ != other.num_key_columns_) return false;
     for (size_t i = 0; i < this->num_key_columns_; i++) {
-      if (!this->cols_[i].Equals(other.cols_[i], false)) return false;
+      if (!this->cols_[i].Equals(other.cols_[i], flags)) return false;
     }
     return true;
+  }
+
+  // Return true if the key projection schemas have exactly the same set of
+  // columns and respective types except name field.
+  bool KeyTypeEquals(const Schema& other) const {
+    return KeyEquals(other, ColumnSchema::COMPARE_TYPE);
   }
 
   // Return a non-OK status if the project is not compatible with the current schema

@@ -40,26 +40,25 @@
 #include "kudu/rpc/messenger.h"
 #include "kudu/server/server_base.proxy.h"
 #include "kudu/tablet/local_tablet_writer.h"
-#include "kudu/tablet/maintenance_manager.h"
 #include "kudu/tablet/tablet.h"
 #include "kudu/tablet/tablet_peer.h"
 #include "kudu/tserver/mini_tablet_server.h"
-#include "kudu/tserver/remote_bootstrap.proxy.h"
+#include "kudu/tserver/tablet_copy.proxy.h"
 #include "kudu/tserver/scanners.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/tserver/tablet_server_test_util.h"
 #include "kudu/tserver/tserver_admin.proxy.h"
 #include "kudu/tserver/tserver_service.proxy.h"
 #include "kudu/tserver/ts_tablet_manager.h"
+#include "kudu/util/maintenance_manager.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/pb_util.h"
 #include "kudu/util/test_graph.h"
 #include "kudu/util/test_util.h"
 
 DEFINE_int32(rpc_timeout, 1000, "Timeout for RPC calls, in seconds");
 DEFINE_int32(num_updater_threads, 1, "Number of updating threads to launch");
-DECLARE_bool(log_force_fsync_all);
 DECLARE_bool(enable_maintenance_manager);
-DECLARE_bool(enable_data_block_fsync);
 DECLARE_int32(heartbeat_rpc_timeout_ms);
 
 METRIC_DEFINE_entity(test);
@@ -85,11 +84,6 @@ class TabletServerTestBase : public KuduTest {
     // the hearbeat timeout to 1 second speeds up unit tests which
     // purposefully specify non-running Master servers.
     FLAGS_heartbeat_rpc_timeout_ms = 1000;
-
-    // Keep unit tests fast, but only if no one has set the flag explicitly.
-    if (google::GetCommandLineFlagInfoOrDie("enable_data_block_fsync").is_default) {
-      FLAGS_enable_data_block_fsync = false;
-    }
   }
 
   // Starts the tablet server, override to start it later.
@@ -109,14 +103,14 @@ class TabletServerTestBase : public KuduTest {
     mini_server_.reset(new MiniTabletServer(GetTestPath("TabletServerTest-fsroot"), 0));
     mini_server_->options()->master_addresses.clear();
     mini_server_->options()->master_addresses.push_back(HostPort("255.255.255.255", 1));
-    CHECK_OK(mini_server_->Start());
+    ASSERT_OK(mini_server_->Start());
 
     // Set up a tablet inside the server.
-    CHECK_OK(mini_server_->AddTestTablet(kTableId, kTabletId, schema_));
-    CHECK(mini_server_->server()->tablet_manager()->LookupTablet(kTabletId, &tablet_peer_));
+    ASSERT_OK(mini_server_->AddTestTablet(kTableId, kTabletId, schema_));
+    ASSERT_TRUE(mini_server_->server()->tablet_manager()->LookupTablet(kTabletId, &tablet_peer_));
 
     // Creating a tablet is async, we wait here instead of having to handle errors later.
-    CHECK_OK(WaitForTabletRunning(kTabletId));
+    ASSERT_OK(WaitForTabletRunning(kTabletId));
 
     // Connect to it.
     ResetClientProxies();
@@ -125,7 +119,9 @@ class TabletServerTestBase : public KuduTest {
   Status WaitForTabletRunning(const char *tablet_id) {
     scoped_refptr<tablet::TabletPeer> tablet_peer;
     RETURN_NOT_OK(mini_server_->server()->tablet_manager()->GetTabletPeer(tablet_id, &tablet_peer));
-    return tablet_peer->WaitUntilConsensusRunning(MonoDelta::FromSeconds(10));
+    RETURN_NOT_OK(tablet_peer->WaitUntilConsensusRunning(MonoDelta::FromSeconds(10)));
+    RETURN_NOT_OK(tablet_peer->consensus()->WaitUntilLeaderForTests(MonoDelta::FromSeconds(10)));
+    return Status::OK();
   }
 
   void UpdateTestRowRemote(int tid,
@@ -146,8 +142,8 @@ class TabletServerTestBase : public KuduTest {
                    req.mutable_row_operations());
     ASSERT_OK(proxy_->Write(req, &resp, &controller));
 
-    SCOPED_TRACE(resp.DebugString());
-    ASSERT_FALSE(resp.has_error())<< resp.ShortDebugString();
+    SCOPED_TRACE(SecureDebugString(resp));
+    ASSERT_FALSE(resp.has_error())<< SecureShortDebugString(resp);
     ASSERT_EQ(0, resp.per_row_errors_size());
     if (ts) {
       ts->AddValue(1);
@@ -229,7 +225,7 @@ class TabletServerTestBase : public KuduTest {
       if (resp.has_error() || resp.per_row_errors_size() > 0) {
         LOG(FATAL) << "Failed to insert batch "
                    << first_row_in_batch << "-" << last_row_in_batch
-                   << ": " << resp.DebugString();
+                   << ": " << SecureDebugString(resp);
       }
 
       inserted_since_last_report += count / num_batches;
@@ -265,10 +261,10 @@ class TabletServerTestBase : public KuduTest {
       AddTestKeyToPB(RowOperationsPB::DELETE, schema_, rowid, ops);
     }
 
-    SCOPED_TRACE(req.DebugString());
+    SCOPED_TRACE(SecureDebugString(req));
     ASSERT_OK(proxy_->Write(req, &resp, &controller));
-    SCOPED_TRACE(resp.DebugString());
-    ASSERT_FALSE(resp.has_error()) << resp.ShortDebugString();
+    SCOPED_TRACE(SecureDebugString(resp));
+    ASSERT_FALSE(resp.has_error()) << SecureShortDebugString(resp);
   }
 
   void BuildTestRow(int index, KuduPartialRow* row) {
@@ -300,9 +296,9 @@ class TabletServerTestBase : public KuduTest {
       rpc.Reset();
       req.set_batch_size_bytes(10000);
       req.set_call_seq_id(call_seq_id);
-      SCOPED_TRACE(req.DebugString());
+      SCOPED_TRACE(SecureDebugString(req));
       ASSERT_OK(DCHECK_NOTNULL(proxy)->Scan(req, &resp, &rpc));
-      SCOPED_TRACE(resp.DebugString());
+      SCOPED_TRACE(SecureDebugString(resp));
       ASSERT_FALSE(resp.has_error());
 
       StringifyRowsFromResponse(projection, rpc, resp, results);
@@ -316,10 +312,10 @@ class TabletServerTestBase : public KuduTest {
                                  vector<string>* results) {
     RowwiseRowBlockPB* rrpb = resp.mutable_data();
     Slice direct, indirect; // sidecar data buffers
-    ASSERT_OK(rpc.GetSidecar(rrpb->rows_sidecar(), &direct));
+    ASSERT_OK(rpc.GetInboundSidecar(rrpb->rows_sidecar(), &direct));
     if (rrpb->has_indirect_data_sidecar()) {
-      ASSERT_OK(rpc.GetSidecar(rrpb->indirect_data_sidecar(),
-                               &indirect));
+      ASSERT_OK(rpc.GetInboundSidecar(rrpb->indirect_data_sidecar(),
+              &indirect));
     }
     vector<const uint8_t*> rows;
     ASSERT_OK(ExtractRowsFromRowBlockPB(projection, *rrpb,
@@ -350,18 +346,23 @@ class TabletServerTestBase : public KuduTest {
     mini_server_->options()->master_addresses.push_back(HostPort("255.255.255.255", 1));
     // this should open the tablet created on StartTabletServer()
     RETURN_NOT_OK(mini_server_->Start());
-    RETURN_NOT_OK(mini_server_->WaitStarted());
 
-    if (!mini_server_->server()->tablet_manager()->LookupTablet(kTabletId, &tablet_peer_)) {
+    // Don't RETURN_NOT_OK immediately -- even if we fail, we may still get a TabletPeer object
+    // which has information about the failure.
+    Status wait_status = mini_server_->WaitStarted();
+    bool found_peer = mini_server_->server()->tablet_manager()->LookupTablet(
+        kTabletId, &tablet_peer_);
+    RETURN_NOT_OK(wait_status);
+    if (!found_peer) {
       return Status::NotFound("Tablet was not found");
     }
+
     // Connect to it.
     ResetClientProxies();
 
     // Opening a tablet is async, we wait here instead of having to handle errors later.
     RETURN_NOT_OK(WaitForTabletRunning(kTabletId));
     return Status::OK();
-
   }
 
   // Verifies that a set of expected rows (key, value) is present in the tablet.
@@ -410,9 +411,9 @@ class TabletServerTestBase : public KuduTest {
 
     // Send the call
     {
-      SCOPED_TRACE(req.DebugString());
+      SCOPED_TRACE(SecureDebugString(req));
       ASSERT_OK(proxy_->Scan(req, &resp, &rpc));
-      SCOPED_TRACE(resp.DebugString());
+      SCOPED_TRACE(SecureDebugString(resp));
       ASSERT_TRUE(resp.has_error());
       ASSERT_EQ(expected_code, resp.error().code());
       ASSERT_STR_CONTAINS(resp.error().status().message(), expected_message);
@@ -434,9 +435,9 @@ class TabletServerTestBase : public KuduTest {
 
     // Send the call
     {
-      SCOPED_TRACE(req.DebugString());
+      SCOPED_TRACE(SecureDebugString(req));
       ASSERT_OK(proxy_->Scan(req, resp, &rpc));
-      SCOPED_TRACE(resp->DebugString());
+      SCOPED_TRACE(SecureDebugString(*resp));
       ASSERT_FALSE(resp->has_error());
       ASSERT_TRUE(resp->has_more_results());
     }

@@ -19,39 +19,21 @@
 
 #include <utility>
 
-#include <glog/logging.h>
-
-#include "kudu/common/schema.h"
-#include "kudu/gutil/macros.h"
+#include "kudu/consensus/metadata.pb.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/server/metadata.h"
-#include "kudu/server/rpc_server.h"
-#include "kudu/server/webserver.h"
-#include "kudu/tablet/maintenance_manager.h"
-#include "kudu/tablet/tablet.h"
-#include "kudu/tablet/tablet_peer.h"
 #include "kudu/tablet/tablet-test-util.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/tserver/ts_tablet_manager.h"
-#include "kudu/consensus/log.h"
-#include "kudu/consensus/log.pb.h"
-#include "kudu/consensus/consensus.h"
-#include "kudu/consensus/consensus.pb.h"
-#include "kudu/consensus/local_consensus.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/status.h"
 
 using std::pair;
 
-using kudu::consensus::Consensus;
-using kudu::consensus::ConsensusOptions;
-using kudu::consensus::OpId;
 using kudu::consensus::RaftPeerPB;
 using kudu::consensus::RaftConfigPB;
-using kudu::log::Log;
-using kudu::log::LogOptions;
 using strings::Substitute;
 
+DECLARE_bool(enable_minidumps);
 DECLARE_bool(rpc_server_allow_ephemeral_ports);
 
 namespace kudu {
@@ -61,6 +43,8 @@ MiniTabletServer::MiniTabletServer(const string& fs_root,
                                    uint16_t rpc_port)
   : started_(false) {
 
+  // Disable minidump handler (we allow only one per process).
+  FLAGS_enable_minidumps = false;
   // Start RPC server on loopback.
   FLAGS_rpc_server_allow_ephemeral_ports = true;
   opts_.rpc_opts.rpc_bind_addresses = Substitute("127.0.0.1:$0", rpc_port);
@@ -90,6 +74,11 @@ Status MiniTabletServer::WaitStarted() {
 
 void MiniTabletServer::Shutdown() {
   if (started_) {
+    // Save the bound ports back into the options structure so that, if we restart the
+    // server, it will come back on the same address. This is necessary since we don't
+    // currently support tablet servers re-registering on different ports (KUDU-418).
+    opts_.webserver_opts.port = bound_http_addr().port();
+    opts_.rpc_opts.rpc_bind_addresses = Substitute("127.0.0.1:$0", bound_rpc_addr().port());
     server_->Shutdown();
     server_.reset();
   }
@@ -97,10 +86,7 @@ void MiniTabletServer::Shutdown() {
 }
 
 Status MiniTabletServer::Restart() {
-  CHECK(started_);
-  opts_.rpc_opts.rpc_bind_addresses = Substitute("127.0.0.1:$0", bound_rpc_addr().port());
-  opts_.webserver_opts.port = bound_http_addr().port();
-  Shutdown();
+  CHECK(!started_);
   RETURN_NOT_OK(Start());
   return Status::OK();
 }
@@ -108,7 +94,6 @@ Status MiniTabletServer::Restart() {
 RaftConfigPB MiniTabletServer::CreateLocalConfig() const {
   CHECK(started_) << "Must Start()";
   RaftConfigPB config;
-  config.set_local(true);
   RaftPeerPB* peer = config.add_peers();
   peer->set_permanent_uuid(server_->instance_pb().permanent_uuid());
   peer->set_member_type(RaftPeerPB::VOTER);
@@ -148,6 +133,11 @@ const Sockaddr MiniTabletServer::bound_rpc_addr() const {
 const Sockaddr MiniTabletServer::bound_http_addr() const {
   CHECK(started_);
   return server_->first_http_address();
+}
+
+const string& MiniTabletServer::uuid() const {
+  CHECK(started_);
+  return server_->fs_manager()->uuid();
 }
 
 } // namespace tserver

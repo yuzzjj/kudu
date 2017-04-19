@@ -38,9 +38,9 @@ class Trace;
 namespace rpc {
 
 class InboundCall;
+class RemoteUser;
+class ResultTracker;
 class RpcSidecar;
-class UserCredentials;
-
 
 #define PANIC_RPC(rpc_context, message) \
   do { \
@@ -64,7 +64,7 @@ class RpcContext {
   RpcContext(InboundCall *call,
              const google::protobuf::Message *request_pb,
              google::protobuf::Message *response_pb,
-             RpcMethodMetrics metrics);
+             const scoped_refptr<ResultTracker>& result_tracker);
 
   ~RpcContext();
 
@@ -81,6 +81,12 @@ class RpcContext {
   // After this method returns, this RpcContext object is destroyed. The request
   // and response protobufs are also destroyed.
   void RespondSuccess();
+
+  // Like the above, but doesn't store the results of the service call, if results
+  // are being tracked.
+  // Used in cases where a call specific error was set on the response protobuf,
+  // the call should be considered failed, thus results shouldn't be cached.
+  void RespondNoCache();
 
   // Respond with an error to the client. This sends back an error with the code
   // ERROR_APPLICATION. Because there is no more specific error code passed back
@@ -147,10 +153,22 @@ class RpcContext {
   // Upon success, writes the index of the sidecar (necessary to be retrieved
   // later) to 'idx'. Call may fail if all sidecars have already been used
   // by the RPC response.
-  Status AddRpcSidecar(gscoped_ptr<RpcSidecar> car, int* idx);
+  Status AddOutboundSidecar(std::unique_ptr<RpcSidecar> car, int* idx);
 
-  // Return the credentials of the remote user who made this call.
-  const UserCredentials& user_credentials() const;
+  // Fills 'sidecar' with a sidecar sent by the client. Returns an error if 'idx' is out
+  // of bounds.
+  Status GetInboundSidecar(int idx, Slice* slice);
+
+  // Return the identity of remote user who made this call.
+  const RemoteUser& remote_user() const;
+
+  // Discards the memory associated with the inbound call's payload. All previously
+  // obtained sidecar slices will be invalidated by this call. It is an error to call
+  // GetInboundSidecar() after this method. request_pb() remains valid.
+  // This is useful in the case where the server wishes to delay responding to an RPC
+  // (perhaps to control the rate of RPC requests), but knows that the RPC payload itself
+  // won't be processed any further.
+  void DiscardTransfer();
 
   // Return the remote IP address and port which sent the current RPC call.
   const Sockaddr& remote_address() const;
@@ -159,6 +177,12 @@ class RpcContext {
   // Suitable for use in log messages.
   std::string requestor_string() const;
 
+  // Return the name of the RPC service method being called.
+  std::string method_name() const;
+
+  // Return the name of the RPC service being called.
+  std::string service_name() const;
+
   const google::protobuf::Message *request_pb() const { return request_pb_.get(); }
   google::protobuf::Message *response_pb() const { return response_pb_.get(); }
 
@@ -166,6 +190,18 @@ class RpcContext {
   // account for transmission delays between the client and the server.
   // If the client did not specify a deadline, returns MonoTime::Max().
   MonoTime GetClientDeadline() const;
+
+  // Whether the results of this RPC are tracked with a ResultTracker.
+  // If this returns true, both result_tracker() and request_id() should return non-null results.
+  bool AreResultsTracked() const { return result_tracker_.get() != nullptr; }
+
+  // Returns this call's result tracker, if it is set.
+  const scoped_refptr<ResultTracker>& result_tracker() const {
+    return result_tracker_;
+  }
+
+  // Returns this call's request id, if it is set.
+  const rpc::RequestIdPB* request_id() const;
 
   // Panic the server. This logs a fatal error with the given message, and
   // also includes the current RPC request, requestor, trace information, etc,
@@ -176,10 +212,11 @@ class RpcContext {
     __attribute__((noreturn));
 
  private:
+  friend class ResultTracker;
   InboundCall* const call_;
   const gscoped_ptr<const google::protobuf::Message> request_pb_;
   const gscoped_ptr<google::protobuf::Message> response_pb_;
-  RpcMethodMetrics metrics_;
+  scoped_refptr<ResultTracker> result_tracker_;
 };
 
 } // namespace rpc

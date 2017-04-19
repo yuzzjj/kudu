@@ -17,8 +17,8 @@
 #ifndef KUDU_TABLET_ROWSET_H
 #define KUDU_TABLET_ROWSET_H
 
-#include <boost/thread/mutex.hpp>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -86,6 +86,7 @@ class RowSet {
   // The returned iterator is not Initted.
   virtual Status NewRowIterator(const Schema *projection,
                                 const MvccSnapshot &snap,
+                                OrderMode order,
                                 gscoped_ptr<RowwiseIterator>* out) const = 0;
 
   // Create the input to be used for a compaction.
@@ -99,14 +100,12 @@ class RowSet {
   virtual Status CountRows(rowid_t *count) const = 0;
 
   // Return the bounds for this RowSet. 'min_encoded_key' and 'max_encoded_key'
-  // are set to the first and last encoded keys for this RowSet. The storage
-  // for these slices is part of the RowSet and only guaranteed to stay valid
-  // until the RowSet is destroyed.
+  // are set to the first and last encoded keys for this RowSet.
   //
   // In the case that the rowset is still mutable (eg MemRowSet), this may
   // return Status::NotImplemented.
-  virtual Status GetBounds(Slice *min_encoded_key,
-                           Slice *max_encoded_key) const = 0;
+  virtual Status GetBounds(std::string* min_encoded_key,
+                           std::string* max_encoded_key) const = 0;
 
   // Return a displayable string for this rowset.
   virtual string ToString() const = 0;
@@ -121,7 +120,7 @@ class RowSet {
   // Return the lock used for including this DiskRowSet in a compaction.
   // This prevents multiple compactions and flushes from trying to include
   // the same rowset.
-  virtual boost::mutex *compact_flush_lock() = 0;
+  virtual std::mutex *compact_flush_lock() = 0;
 
   // Returns the metadata associated with this rowset.
   virtual std::shared_ptr<RowSetMetadata> metadata() = 0;
@@ -144,6 +143,56 @@ class RowSet {
   // Compact delta stores if more than one.
   virtual Status MinorCompactDeltaStores() = 0;
 
+  // Estimate the number of bytes in ancient undo delta stores. This may be an
+  // overestimate. The argument 'ancient_history_mark' must be valid (it may
+  // not be equal to Timestamp::kInvalidTimestamp).
+  virtual Status EstimateBytesInPotentiallyAncientUndoDeltas(Timestamp ancient_history_mark,
+                                                             int64_t* bytes) = 0;
+
+  // Initialize undo delta blocks until the given 'deadline' is passed, or
+  // until all undo delta blocks with a max timestamp older than
+  // 'ancient_history_mark' have been initialized.
+  //
+  // Invoking this method may also improve the estimate given by
+  // EstimateBytesInPotentiallyAncientUndoDeltas().
+  //
+  // If this method returns OK, it returns the number of blocks actually
+  // initialized in the out-param 'delta_blocks_initialized' and the number of
+  // bytes that can be freed from disk in 'bytes_in_ancient_undos'.
+  //
+  // If 'ancient_history_mark' is set to Timestamp::kInvalidTimestamp then the
+  // 'max_timestamp' of the blocks being initialized is ignored and no
+  // age-based short-circuiting takes place.
+  // If 'deadline' is not Initialized() then no deadline is enforced.
+  //
+  // The out-parameters, 'delta_blocks_initialized' and 'bytes_in_ancient_undos',
+  // may be passed in as nullptr.
+  virtual Status InitUndoDeltas(Timestamp ancient_history_mark,
+                                MonoTime deadline,
+                                int64_t* delta_blocks_initialized,
+                                int64_t* bytes_in_ancient_undos) = 0;
+
+  // Delete all initialized undo delta blocks with a max timestamp earlier than
+  // the specified 'ancient_history_mark'.
+  //
+  // Note: This method does not flush updates to the rowset metadata. If this
+  // method returns OK, the caller is responsible for persisting changes to the
+  // rowset metadata by explicity flushing it.
+  //
+  // Note also: Blocks are not actually deleted until the rowset metadata is
+  // flushed, because that invokes tablet metadata flush, which iterates over
+  // and deletes the blocks present in the metadata orphans list.
+  //
+  // If this method returns OK, it also returns the number of delta blocks
+  // deleted and the number of bytes deleted in the out-params 'blocks_deleted'
+  // and 'bytes_deleted', respectively.
+  //
+  // The out-parameters, 'blocks_deleted' and 'bytes_deleted', may be passed in
+  // as nullptr.
+  virtual Status DeleteAncientUndoDeltas(Timestamp ancient_history_mark,
+                                         int64_t* blocks_deleted,
+                                         int64_t* bytes_deleted) = 0;
+
   virtual ~RowSet() {}
 
   // Return true if this RowSet is available for compaction, based on
@@ -159,7 +208,7 @@ class RowSet {
     // the compaction selection has finished because only one thread
     // makes compaction selection at a time on a given Tablet due to
     // Tablet::compact_select_lock_.
-    boost::mutex::scoped_try_lock try_lock(*compact_flush_lock());
+    std::unique_lock<std::mutex> try_lock(*compact_flush_lock(), std::try_to_lock);
     return try_lock.owns_lock();
   }
 
@@ -265,6 +314,7 @@ class DuplicatingRowSet : public RowSet {
 
   virtual Status NewRowIterator(const Schema *projection,
                                 const MvccSnapshot &snap,
+                                OrderMode order,
                                 gscoped_ptr<RowwiseIterator>* out) const OVERRIDE;
 
   virtual Status NewCompactionInput(const Schema* projection,
@@ -273,8 +323,8 @@ class DuplicatingRowSet : public RowSet {
 
   Status CountRows(rowid_t *count) const OVERRIDE;
 
-  virtual Status GetBounds(Slice *min_encoded_key,
-                           Slice *max_encoded_key) const OVERRIDE;
+  virtual Status GetBounds(std::string* min_encoded_key,
+                           std::string* max_encoded_key) const OVERRIDE;
 
   uint64_t EstimateOnDiskSize() const OVERRIDE;
 
@@ -285,7 +335,7 @@ class DuplicatingRowSet : public RowSet {
   std::shared_ptr<RowSetMetadata> metadata() OVERRIDE;
 
   // A flush-in-progress rowset should never be selected for compaction.
-  boost::mutex *compact_flush_lock() OVERRIDE {
+  std::mutex *compact_flush_lock() OVERRIDE {
     LOG(FATAL) << "Cannot be compacted";
     return NULL;
   }
@@ -310,6 +360,29 @@ class DuplicatingRowSet : public RowSet {
     // It's important that DuplicatingRowSet does not FlushDeltas. This prevents
     // a bug where we might end up with out-of-order deltas. See the long
     // comment in Tablet::Flush(...)
+    return Status::OK();
+  }
+
+  Status EstimateBytesInPotentiallyAncientUndoDeltas(Timestamp /*ancient_history_mark*/,
+                                                     int64_t* bytes) OVERRIDE {
+    DCHECK(bytes);
+    *bytes = 0;
+    return Status::OK();
+  }
+
+  Status InitUndoDeltas(Timestamp /*ancient_history_mark*/,
+                        MonoTime /*deadline*/,
+                        int64_t* delta_blocks_initialized,
+                        int64_t* bytes_in_ancient_undos) OVERRIDE {
+    if (delta_blocks_initialized) *delta_blocks_initialized = 0;
+    if (bytes_in_ancient_undos) *bytes_in_ancient_undos = 0;
+    return Status::OK();
+  }
+
+  Status DeleteAncientUndoDeltas(Timestamp /*ancient_history_mark*/,
+                                 int64_t* blocks_deleted, int64_t* bytes_deleted) OVERRIDE {
+    if (blocks_deleted) *blocks_deleted = 0;
+    if (bytes_deleted) *bytes_deleted = 0;
     return Status::OK();
   }
 

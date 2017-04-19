@@ -17,10 +17,11 @@
 #ifndef KUDU_SERVER_WEBUI_UTIL_H
 #define KUDU_SERVER_WEBUI_UTIL_H
 
+#include <iosfwd>
 #include <string>
-#include <sstream>
 #include <vector>
 
+#include "kudu/common/schema.h"
 #include "kudu/gutil/ref_counted.h"
 
 namespace kudu {
@@ -29,13 +30,13 @@ class Schema;
 class MonitoredTask;
 
 void HtmlOutputSchemaTable(const Schema& schema,
-                           std::stringstream* output);
+                           std::ostringstream* output);
 void HtmlOutputImpalaSchema(const std::string& table_name,
                             const Schema& schema,
                             const std::string& master_address,
-                            std::stringstream* output);
+                            std::ostringstream* output);
 void HtmlOutputTaskList(const std::vector<scoped_refptr<MonitoredTask> >& tasks,
-                        std::stringstream* output);
+                        std::ostringstream* output);
 } // namespace kudu
 
 #endif // KUDU_SERVER_WEBUI_UTIL_H

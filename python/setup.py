@@ -28,12 +28,17 @@ from distutils.command.clean import clean as _clean
 from distutils.extension import Extension
 import os
 
-if Cython.__version__ < '0.19.1':
-    raise Exception('Please upgrade to Cython 0.19.1 or newer')
+# Workaround a Python bug in which multiprocessing's atexit handler doesn't
+# play well with pytest. See http://bugs.python.org/issue15881 for details
+# and this suggested workaround (comment msg170215 in the thread).
+import multiprocessing
 
-MAJOR = 0
-MINOR = 1
-MICRO = 1
+if Cython.__version__ < '0.21.0':
+    raise Exception('Please upgrade to Cython 0.21.0 or newer')
+
+MAJOR = 1
+MINOR = 4
+MICRO = 0
 VERSION = '%d.%d.%d' % (MAJOR, MINOR, MICRO)
 ISRELEASED = True
 
@@ -114,9 +119,6 @@ for submodule_name in ext_submodules:
     ext = Extension('kudu.{0}'.format(submodule_name),
                     ['kudu/{0}.pyx'.format(submodule_name)],
                     libraries=['kudu_client'],
-                    # Disable the 'new' gcc5 ABI; see the top-level
-                    # CMakeLists.txt for details.
-                    define_macros=[('_GLIBCXX_USE_CXX11_ABI', '0')],
                     include_dirs=INCLUDE_PATHS,
                     library_dirs=LIBRARY_DIRS,
                     runtime_library_dirs=RT_LIBRARY_DIRS)
@@ -127,10 +129,14 @@ extensions = cythonize(extensions)
 write_version_py()
 
 LONG_DESCRIPTION = open(os.path.join(setup_dir, "README.md")).read()
-DESCRIPTION = "Python interface to the Apache Kudu (incubating) C++ Client API"
+DESCRIPTION = "Python interface to the Apache Kudu C++ Client API"
 
 CLASSIFIERS = [
-    'Development Status :: 3 - Alpha',
+    'Development Status :: 5 - Production/Stable',
+    'Intended Audience :: Developers',
+    'License :: OSI Approved :: Apache Software License',
+    'Topic :: Database :: Front-Ends',
+    'Topic :: Scientific/Engineering :: Interface Engine/Protocol Translator',
     'Environment :: Console',
     'Programming Language :: Python',
     'Programming Language :: Python :: 2',
@@ -141,7 +147,7 @@ CLASSIFIERS = [
     'Programming Language :: Cython'
 ]
 
-URL = 'http://getkudu.io'
+URL = 'http://kudu.apache.org/'
 
 setup(
     name="kudu-python",
@@ -154,14 +160,14 @@ setup(
         'build_ext': build_ext
     },
     setup_requires=['pytest-runner'],
-    tests_require=['pytest'],
-    install_requires=['cython >= 0.21'],
+    tests_require=['pytest >= 2.8', 'pytest-timeout >= 1.1.0'],
+    install_requires=['cython >= 0.21', 'pytz', 'six'],
     description=DESCRIPTION,
     long_description=LONG_DESCRIPTION,
     license='Apache License, Version 2.0',
     classifiers=CLASSIFIERS,
-    maintainer="Apache Kudu (incubating) team",
-    maintainer_email="dev@kudu.incubator.apache.org",
+    maintainer="Apache Kudu team",
+    maintainer_email="dev@kudu.apache.org",
     url=URL,
     test_suite="kudu.tests"
 )

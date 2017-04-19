@@ -19,15 +19,17 @@
 
 #include "kudu/util/thread.h"
 
-#include <algorithm>
-#include <map>
-#include <memory>
-#include <set>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+#include <algorithm>
+#include <map>
+#include <memory>
+#include <set>
+#include <sstream>
 #include <vector>
 
 #if defined(__linux__)
@@ -42,19 +44,21 @@
 #include "kudu/util/debug-util.h"
 #include "kudu/util/errno.h"
 #include "kudu/util/logging.h"
+#include "kudu/util/kernel_stack_watchdog.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/mutex.h"
 #include "kudu/util/os-util.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/url-coding.h"
+#include "kudu/util/trace.h"
 #include "kudu/util/web_callback_registry.h"
 
 using boost::bind;
 using boost::mem_fn;
 using std::endl;
 using std::map;
+using std::ostringstream;
 using std::shared_ptr;
-using std::stringstream;
 using strings::Substitute;
 
 METRIC_DEFINE_gauge_uint64(server, threads_started,
@@ -209,8 +213,8 @@ class ThreadMgr {
   uint64_t ReadThreadsRunning();
 
   // Webpage callback; prints all threads by category
-  void ThreadPathHandler(const WebCallbackRegistry::WebRequest& args, stringstream* output);
-  void PrintThreadCategoryRows(const ThreadCategory& category, stringstream* output);
+  void ThreadPathHandler(const WebCallbackRegistry::WebRequest& args, ostringstream* output);
+  void PrintThreadCategoryRows(const ThreadCategory& category, ostringstream* output);
 };
 
 void ThreadMgr::SetThreadName(const string& name, int64 tid) {
@@ -264,9 +268,11 @@ Status ThreadMgr::StartInstrumentation(const scoped_refptr<MetricEntity>& metric
       METRIC_involuntary_context_switches.InstantiateFunctionGauge(metrics,
         Bind(&GetInVoluntaryContextSwitches)));
 
-  WebCallbackRegistry::PathHandlerCallback thread_callback =
-      bind<void>(mem_fn(&ThreadMgr::ThreadPathHandler), this, _1, _2);
-  DCHECK_NOTNULL(web)->RegisterPathHandler("/threadz", "Threads", thread_callback);
+  if (web) {
+    WebCallbackRegistry::PathHandlerCallback thread_callback =
+        bind<void>(mem_fn(&ThreadMgr::ThreadPathHandler), this, _1, _2);
+    DCHECK_NOTNULL(web)->RegisterPathHandler("/threadz", "Threads", thread_callback);
+  }
   return Status::OK();
 }
 
@@ -325,7 +331,7 @@ void ThreadMgr::RemoveThread(const pthread_t& pthread_id, const string& category
 }
 
 void ThreadMgr::PrintThreadCategoryRows(const ThreadCategory& category,
-    stringstream* output) {
+    ostringstream* output) {
   for (const ThreadCategory::value_type& thread : category) {
     ThreadStats stats;
     Status status = GetThreadStats(thread.second.thread_id(), &stats);
@@ -341,7 +347,7 @@ void ThreadMgr::PrintThreadCategoryRows(const ThreadCategory& category,
 }
 
 void ThreadMgr::ThreadPathHandler(const WebCallbackRegistry::WebRequest& req,
-    stringstream* output) {
+    ostringstream* output) {
   MutexLock l(lock_);
   vector<const ThreadCategory*> categories_to_print;
   auto category_name = req.parsed_args.find("group");
@@ -491,7 +497,10 @@ std::string Thread::ToString() const {
 }
 
 Status Thread::StartThread(const std::string& category, const std::string& name,
-                           const ThreadFunctor& functor, scoped_refptr<Thread> *holder) {
+                           const ThreadFunctor& functor, uint64_t flags,
+                           scoped_refptr<Thread> *holder) {
+  TRACE_COUNTER_INCREMENT("threads_started", 1);
+  TRACE_COUNTER_SCOPE_LATENCY_US("thread_start_us");
   const string log_prefix = Substitute("$0 ($1) ", name, category);
   SCOPED_LOG_SLOW_EXECUTION_PREFIX(WARNING, 500 /* ms */, log_prefix, "starting thread");
 
@@ -500,6 +509,7 @@ Status Thread::StartThread(const std::string& category, const std::string& name,
 
   {
     SCOPED_LOG_SLOW_EXECUTION_PREFIX(WARNING, 500 /* ms */, log_prefix, "creating pthread");
+    SCOPED_WATCH_STACK((flags & NO_STACK_WATCHDOG) ? 0 : 250);
     int ret = pthread_create(&t->thread_, NULL, &Thread::SuperviseThread, t.get());
     if (ret) {
       return Status::RuntimeError("Could not create thread", strerror(ret), ret);

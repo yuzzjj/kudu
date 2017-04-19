@@ -23,7 +23,6 @@
 #include <glog/logging.h>
 
 #include "kudu/cfile/bshuf_block.h"
-#include "kudu/cfile/gvint_block.h"
 #include "kudu/cfile/plain_bitmap_block.h"
 #include "kudu/cfile/plain_block.h"
 #include "kudu/cfile/rle_block.h"
@@ -107,7 +106,7 @@ template<>
 struct DataTypeEncodingTraits<BOOL, PLAIN_ENCODING> {
 
   static Status CreateBlockBuilder(BlockBuilder **bb, const WriterOptions *options) {
-    *bb = new PlainBitMapBlockBuilder();
+    *bb = new PlainBitMapBlockBuilder(options);
     return Status::OK();
   }
 
@@ -124,7 +123,7 @@ template<>
 struct DataTypeEncodingTraits<BOOL, RLE> {
 
   static Status CreateBlockBuilder(BlockBuilder** bb, const WriterOptions *options) {
-    *bb = new RleBitMapBlockBuilder();
+    *bb = new RleBitMapBlockBuilder(options);
     return Status::OK();
   }
 
@@ -168,28 +167,11 @@ struct DataTypeEncodingTraits<BINARY, DICT_ENCODING> {
   }
 };
 
-
-// Optimized grouping variable encoding for 32bit unsigned integers
-template<>
-struct DataTypeEncodingTraits<UINT32, GROUP_VARINT> {
-
-  static Status CreateBlockBuilder(BlockBuilder **bb, const WriterOptions *options) {
-    *bb = new GVIntBlockBuilder(options);
-    return Status::OK();
-  }
-
-  static Status CreateBlockDecoder(BlockDecoder **bd, const Slice &slice,
-                                   CFileIterator *iter) {
-    *bd = new GVIntBlockDecoder(slice);
-    return Status::OK();
-  }
-};
-
 template<DataType IntType>
 struct DataTypeEncodingTraits<IntType, RLE> {
 
   static Status CreateBlockBuilder(BlockBuilder** bb, const WriterOptions *options) {
-    *bb = new RleIntBlockBuilder<IntType>();
+    *bb = new RleIntBlockBuilder<IntType>(options);
     return Status::OK();
   }
 
@@ -238,7 +220,7 @@ class TypeEncodingResolver {
     const TypeEncodingInfo *type_info = mapping_[make_pair(t, e)].get();
     if (PREDICT_FALSE(type_info == nullptr)) {
       return Status::NotSupported(
-          strings::Substitute("Unsupported type/encoding pair: $0, $1",
+          strings::Substitute("encoding $1 not supported for type $0",
                               DataType_Name(t),
                               EncodingType_Name(e)));
     }
@@ -253,42 +235,39 @@ class TypeEncodingResolver {
   // Add the encoding mappings
   // the first encoder/decoder to be
   // added to the mapping becomes the default
-  //
-  // TODO: Fix/work around the issue with RLE/BitWriter which
-  //       (currently) makes it impossible to use RLE with
-  //       64-bit int types.
  private:
   TypeEncodingResolver() {
+    AddMapping<UINT8, BIT_SHUFFLE>();
     AddMapping<UINT8, PLAIN_ENCODING>();
     AddMapping<UINT8, RLE>();
-    AddMapping<UINT8, BIT_SHUFFLE>();
+    AddMapping<INT8, BIT_SHUFFLE>();
     AddMapping<INT8, PLAIN_ENCODING>();
     AddMapping<INT8, RLE>();
-    AddMapping<INT8, BIT_SHUFFLE>();
+    AddMapping<UINT16, BIT_SHUFFLE>();
     AddMapping<UINT16, PLAIN_ENCODING>();
     AddMapping<UINT16, RLE>();
-    AddMapping<UINT16, BIT_SHUFFLE>();
+    AddMapping<INT16, BIT_SHUFFLE>();
     AddMapping<INT16, PLAIN_ENCODING>();
     AddMapping<INT16, RLE>();
-    AddMapping<INT16, BIT_SHUFFLE>();
-    AddMapping<UINT32, GROUP_VARINT>();
+    AddMapping<UINT32, BIT_SHUFFLE>();
     AddMapping<UINT32, RLE>();
     AddMapping<UINT32, PLAIN_ENCODING>();
-    AddMapping<UINT32, BIT_SHUFFLE>();
+    AddMapping<INT32, BIT_SHUFFLE>();
     AddMapping<INT32, PLAIN_ENCODING>();
     AddMapping<INT32, RLE>();
-    AddMapping<INT32, BIT_SHUFFLE>();
-    AddMapping<UINT64, PLAIN_ENCODING>();
     AddMapping<UINT64, BIT_SHUFFLE>();
-    AddMapping<INT64, PLAIN_ENCODING>();
+    AddMapping<UINT64, PLAIN_ENCODING>();
+    AddMapping<UINT64, RLE>();
     AddMapping<INT64, BIT_SHUFFLE>();
-    AddMapping<FLOAT, PLAIN_ENCODING>();
+    AddMapping<INT64, PLAIN_ENCODING>();
+    AddMapping<INT64, RLE>();
     AddMapping<FLOAT, BIT_SHUFFLE>();
-    AddMapping<DOUBLE, PLAIN_ENCODING>();
+    AddMapping<FLOAT, PLAIN_ENCODING>();
     AddMapping<DOUBLE, BIT_SHUFFLE>();
+    AddMapping<DOUBLE, PLAIN_ENCODING>();
+    AddMapping<BINARY, DICT_ENCODING>();
     AddMapping<BINARY, PLAIN_ENCODING>();
     AddMapping<BINARY, PREFIX_ENCODING>();
-    AddMapping<BINARY, DICT_ENCODING>();
     AddMapping<BOOL, RLE>();
     AddMapping<BOOL, PLAIN_ENCODING>();
   }

@@ -25,11 +25,11 @@
 #include "kudu/util/test_util.h"
 #include "kudu/util/thread.h"
 
-namespace kudu {
-
 // These flags are used by the multi-threaded tests, can be used for microbenchmarking.
 DEFINE_int32(num_operations, 10*1000, "Number of operations to perform");
 DEFINE_int32(num_threads, 2, "Number of worker threads");
+
+namespace kudu {
 
 // Test some basic operations
 TEST(Striped64Test, TestBasic) {
@@ -117,15 +117,15 @@ class BasicAdder {
 };
 
 void RunMultiTest(int64_t num_operations, int64_t num_threads) {
-  MonoTime start = MonoTime::Now(MonoTime::FINE);
+  MonoTime start = MonoTime::Now();
   MultiThreadTest<BasicAdder> basicTest(num_operations, num_threads);
   basicTest.Run();
-  MonoTime end1 = MonoTime::Now(MonoTime::FINE);
+  MonoTime end1 = MonoTime::Now();
   MultiThreadTest<LongAdder> test(num_operations, num_threads);
   test.Run();
-  MonoTime end2 = MonoTime::Now(MonoTime::FINE);
-  MonoDelta basic = end1.GetDeltaSince(start);
-  MonoDelta striped = end2.GetDeltaSince(end1);
+  MonoTime end2 = MonoTime::Now();
+  MonoDelta basic = end1 - start;
+  MonoDelta striped = end2 - end1;
   LOG(INFO) << "Basic counter took   " << basic.ToMilliseconds() << "ms.";
   LOG(INFO) << "Striped counter took " << striped.ToMilliseconds() << "ms.";
 }

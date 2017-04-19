@@ -25,6 +25,7 @@
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/promise.h"
+#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/threadpool.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/trace.h"
@@ -102,7 +103,7 @@ TEST(TestThreadPool, TestTracePropagation) {
     ASSERT_OK(thread_pool->SubmitFunc(&IssueTraceStatement));
   }
   thread_pool->Wait();
-  ASSERT_STR_CONTAINS(t->DumpToString(true), "hello from task");
+  ASSERT_STR_CONTAINS(t->DumpToString(), "hello from task");
 }
 
 TEST(TestThreadPool, TestSubmitAfterShutdown) {
@@ -161,7 +162,10 @@ TEST(TestThreadPool, TestThreadPoolWithNoMinimum) {
 // Regression test for a bug where a task is submitted exactly
 // as a thread is about to exit. Previously this could hang forever.
 TEST(TestThreadPool, TestRace) {
-  alarm(10);
+  alarm(60);
+  auto cleanup = MakeScopedCleanup([]() {
+    alarm(0); // Disable alarm on test exit.
+  });
   MonoDelta idle_timeout = MonoDelta::FromMicroseconds(1);
   gscoped_ptr<ThreadPool> thread_pool;
   ASSERT_OK(ThreadPoolBuilder("test")
@@ -219,15 +223,34 @@ TEST(TestThreadPool, TestMaxQueueSize) {
       .set_max_queue_size(1).Build(&thread_pool));
 
   CountDownLatch latch(1);
+  // We will be able to submit two tasks: one for max_threads == 1 and one for
+  // max_queue_size == 1.
+  ASSERT_OK(thread_pool->Submit(shared_ptr<Runnable>(new SlowTask(&latch))));
   ASSERT_OK(thread_pool->Submit(shared_ptr<Runnable>(new SlowTask(&latch))));
   Status s = thread_pool->Submit(shared_ptr<Runnable>(new SlowTask(&latch)));
-  // We race against the worker thread to re-enqueue.
-  // If we get there first, we fail on the 2nd Submit().
-  // If the worker dequeues first, we fail on the 3rd.
-  if (s.ok()) {
-    s = thread_pool->Submit(shared_ptr<Runnable>(new SlowTask(&latch)));
-  }
   CHECK(s.IsServiceUnavailable()) << "Expected failure due to queue blowout:" << s.ToString();
+  latch.CountDown();
+  thread_pool->Wait();
+  thread_pool->Shutdown();
+}
+
+// Test that when we specify a zero-sized queue, the maximum number of threads
+// running is used for enforcement.
+TEST(TestThreadPool, TestZeroQueueSize) {
+  gscoped_ptr<ThreadPool> thread_pool;
+  const int kMaxThreads = 4;
+  ASSERT_OK(ThreadPoolBuilder("test")
+      .set_max_queue_size(0)
+      .set_max_threads(kMaxThreads)
+      .Build(&thread_pool));
+
+  CountDownLatch latch(1);
+  for (int i = 0; i < kMaxThreads; i++) {
+    ASSERT_OK(thread_pool->Submit(shared_ptr<Runnable>(new SlowTask(&latch))));
+  }
+  Status s = thread_pool->Submit(shared_ptr<Runnable>(new SlowTask(&latch)));
+  ASSERT_TRUE(s.IsServiceUnavailable()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "Thread pool is at capacity");
   latch.CountDown();
   thread_pool->Wait();
   thread_pool->Shutdown();
@@ -247,7 +270,6 @@ TEST(TestThreadPool, TestPromises) {
   ASSERT_EQ(5, my_promise.Get());
   thread_pool->Shutdown();
 }
-
 
 METRIC_DEFINE_entity(test_entity);
 METRIC_DEFINE_histogram(test_entity, queue_length, "queue length",
@@ -289,5 +311,66 @@ TEST(TestThreadPool, TestMetrics) {
   ASSERT_EQ(kNumItems, queue_time->TotalCount());
   ASSERT_EQ(kNumItems, run_time->TotalCount());
 }
+
+// Test that a thread pool will crash if asked to run its own blocking
+// functions in a pool thread.
+//
+// In a multi-threaded application, TSAN is unsafe to use following a fork().
+// After a fork(), TSAN will:
+// 1. Disable verification, expecting an exec() soon anyway, and
+// 2. Die on future thread creation.
+// For some reason, this test triggers behavior #2. We could disable it with
+// the TSAN option die_after_fork=0, but this can (supposedly) lead to
+// deadlocks, so we'll disable the entire test instead.
+#ifndef THREAD_SANITIZER
+TEST(TestThreadPool, TestDeadlocks) {
+  const char* death_msg = "called pool function that would result in deadlock";
+  ASSERT_DEATH({
+    gscoped_ptr<ThreadPool> thread_pool;
+    ASSERT_OK(ThreadPoolBuilder("test")
+              .set_min_threads(1)
+              .set_max_threads(1)
+              .Build(&thread_pool));
+    ASSERT_OK(thread_pool->SubmitClosure(
+        Bind(&ThreadPool::Shutdown, Unretained(thread_pool.get()))));
+    thread_pool->Wait();
+  }, death_msg);
+
+  ASSERT_DEATH({
+    gscoped_ptr<ThreadPool> thread_pool;
+    ASSERT_OK(ThreadPoolBuilder("test")
+              .set_min_threads(1)
+              .set_max_threads(1)
+              .Build(&thread_pool));
+    ASSERT_OK(thread_pool->SubmitClosure(
+        Bind(&ThreadPool::Wait, Unretained(thread_pool.get()))));
+    thread_pool->Wait();
+  }, death_msg);
+}
+#endif
+
+class SlowDestructorRunnable : public Runnable {
+ public:
+  void Run() override {}
+
+  virtual ~SlowDestructorRunnable() {
+    SleepFor(MonoDelta::FromMilliseconds(100));
+  }
+};
+
+// Test that if a tasks's destructor is slow, it doesn't cause serialization of the tasks
+// in the queue.
+TEST(TestThreadPool, TestSlowDestructor) {
+  gscoped_ptr<ThreadPool> thread_pool;
+  ASSERT_OK(BuildMinMaxTestPool(1, 20, &thread_pool));
+  MonoTime start = MonoTime::Now();
+  for (int i = 0; i < 100; i++) {
+    shared_ptr<Runnable> task(new SlowDestructorRunnable());
+    ASSERT_OK(thread_pool->Submit(std::move(task)));
+  }
+  thread_pool->Wait();
+  ASSERT_LT((MonoTime::Now() - start).ToSeconds(), 5);
+}
+
 
 } // namespace kudu

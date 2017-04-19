@@ -43,7 +43,7 @@ static const size_t kPlainBlockHeaderSize = sizeof(uint32_t) * 2;
 // A plain encoder for generic fixed size data types.
 //
 template<DataType Type>
-class PlainBlockBuilder : public BlockBuilder {
+class PlainBlockBuilder final : public BlockBuilder {
  public:
   explicit PlainBlockBuilder(const WriterOptions *options)
       : options_(options) {
@@ -61,8 +61,8 @@ class PlainBlockBuilder : public BlockBuilder {
     return count;
   }
 
-  virtual bool IsBlockFull(size_t limit) const OVERRIDE {
-    return buffer_.size() > limit;
+  virtual bool IsBlockFull() const override {
+    return buffer_.size() > options_->storage_attributes.cfile_block_size;
   }
 
   virtual Slice Finish(rowid_t ordinal_pos) OVERRIDE {
@@ -87,6 +87,13 @@ class PlainBlockBuilder : public BlockBuilder {
     return Status::OK();
   }
 
+  virtual Status GetLastKey(void *key) const OVERRIDE {
+    DCHECK_GT(count_, 0);
+    size_t idx = kPlainBlockHeaderSize + (count_ - 1) * kCppTypeSize;
+    *reinterpret_cast<CppType *>(key) = Decode<CppType>(&buffer_[idx]);
+    return Status::OK();
+  }
+
  private:
   faststring buffer_;
   const WriterOptions *options_;
@@ -102,7 +109,7 @@ class PlainBlockBuilder : public BlockBuilder {
 // A plain decoder for generic fixed size data types.
 //
 template<DataType Type>
-class PlainBlockDecoder : public BlockDecoder {
+class PlainBlockDecoder final : public BlockDecoder {
  public:
   explicit PlainBlockDecoder(Slice slice)
       : data_(std::move(slice)),

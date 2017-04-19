@@ -18,10 +18,12 @@
 #define KUDU_MASTER_TS_DESCRIPTOR_H
 
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/util/locks.h"
+#include "kudu/util/make_shared.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
 
@@ -29,6 +31,7 @@ namespace kudu {
 
 class NodeInstancePB;
 class Sockaddr;
+class ServerRegistrationPB;
 
 namespace consensus {
 class ConsensusServiceProxy;
@@ -44,8 +47,6 @@ class TabletServerAdminServiceProxy;
 
 namespace master {
 
-class TSRegistrationPB;
-
 // Master-side view of a single tablet server.
 //
 // Tracks the last heartbeat, status, instance identifier, etc.
@@ -53,8 +54,8 @@ class TSRegistrationPB;
 class TSDescriptor {
  public:
   static Status RegisterNew(const NodeInstancePB& instance,
-                            const TSRegistrationPB& registration,
-                            gscoped_ptr<TSDescriptor>* desc);
+                            const ServerRegistrationPB& registration,
+                            std::shared_ptr<TSDescriptor>* desc);
 
   virtual ~TSDescriptor();
 
@@ -65,20 +66,20 @@ class TSDescriptor {
   // from this TS.
   MonoDelta TimeSinceHeartbeat() const;
 
+  // Return whether this server is presumed dead based on last heartbeat time.
+  bool PresumedDead() const;
+
   // Register this tablet server.
   Status Register(const NodeInstancePB& instance,
-                  const TSRegistrationPB& registration);
+                  const ServerRegistrationPB& registration);
 
   const std::string &permanent_uuid() const { return permanent_uuid_; }
   int64_t latest_seqno() const;
 
-  bool has_tablet_report() const;
-  void set_has_tablet_report(bool has_report);
-
   // Copy the current registration info into the given PB object.
   // A safe copy is returned because the internal Registration object
   // may be mutated at any point if the tablet server re-registers.
-  void GetRegistration(TSRegistrationPB* reg) const;
+  void GetRegistration(ServerRegistrationPB* reg) const;
 
   void GetNodeInstancePB(NodeInstancePB* instance_pb) const;
 
@@ -103,15 +104,19 @@ class TSDescriptor {
   // Set the number of live replicas (i.e. running or bootstrapping).
   void set_num_live_replicas(int n) {
     DCHECK_GE(n, 0);
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     num_live_replicas_ = n;
   }
 
   // Return the number of live replicas (i.e running or bootstrapping).
   int num_live_replicas() const {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     return num_live_replicas_;
   }
+
+  // Return a string form of this TS, suitable for printing.
+  // Includes the UUID as well as last known host/port.
+  std::string ToString() const;
 
  private:
   FRIEND_TEST(TestTSDescriptor, TestReplicaCreationsDecay);
@@ -131,9 +136,6 @@ class TSDescriptor {
   // The last time a heartbeat was received for this node.
   MonoTime last_heartbeat_;
 
-  // Set to true once this instance has reported all of its tablets.
-  bool has_tablet_report_;
-
   // The number of times this tablet server has recently been selected to create a
   // tablet replica. This value decays back to 0 over time.
   double recent_replica_creations_;
@@ -142,11 +144,12 @@ class TSDescriptor {
   // The number of live replicas on this host, from the last heartbeat.
   int num_live_replicas_;
 
-  gscoped_ptr<TSRegistrationPB> registration_;
+  gscoped_ptr<ServerRegistrationPB> registration_;
 
   std::shared_ptr<tserver::TabletServerAdminServiceProxy> ts_admin_proxy_;
   std::shared_ptr<consensus::ConsensusServiceProxy> consensus_proxy_;
 
+  ALLOW_MAKE_SHARED(TSDescriptor);
   DISALLOW_COPY_AND_ASSIGN(TSDescriptor);
 };
 

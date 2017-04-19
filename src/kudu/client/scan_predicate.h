@@ -30,27 +30,38 @@
 namespace kudu {
 namespace client {
 
+/// @brief A representation of comparison predicate for Kudu queries.
+///
+/// Call KuduTable::NewComparisonPredicate() to create a predicate object.
 class KUDU_EXPORT KuduPredicate {
  public:
+  /// @brief Supported comparison operators.
   enum ComparisonOp {
     LESS_EQUAL,
     GREATER_EQUAL,
-    EQUAL
+    EQUAL,
+    LESS,
+    GREATER,
   };
 
   ~KuduPredicate();
 
-  // Returns a new, identical, KuduPredicate.
+  /// @return A new, identical, KuduPredicate object.
   KuduPredicate* Clone() const;
 
-  // The PIMPL class has to be public since it's actually just an interface,
-  // and gcc gives an error trying to derive from a private nested class.
+  /// @brief Forward declaration for the embedded PIMPL class.
+  ///
+  /// The PIMPL class has to be public since it's actually just an interface,
+  /// and gcc gives an error trying to derive from a private nested class.
   class KUDU_NO_EXPORT Data;
  private:
-  friend class KuduScanner;
-  friend class KuduTable;
   friend class ComparisonPredicateData;
   friend class ErrorPredicateData;
+  friend class InListPredicateData;
+  friend class IsNotNullPredicateData;
+  friend class IsNullPredicateData;
+  friend class KuduTable;
+  friend class ScanConfiguration;
 
   explicit KuduPredicate(Data* d);
 

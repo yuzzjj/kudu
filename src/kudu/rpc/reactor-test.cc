@@ -64,13 +64,13 @@ TEST_F(ReactorTest, TestFunctionIsCalled) {
 }
 
 TEST_F(ReactorTest, TestFunctionIsCalledAtTheRightTime) {
-  MonoTime before = MonoTime::Now(MonoTime::FINE);
+  MonoTime before = MonoTime::Now();
   messenger_->ScheduleOnReactor(
       boost::bind(&ReactorTest::ScheduledTask, this, _1, Status::OK()),
       MonoDelta::FromMilliseconds(100));
   latch_.Wait();
-  MonoTime after = MonoTime::Now(MonoTime::FINE);
-  MonoDelta delta = after.GetDeltaSince(before);
+  MonoTime after = MonoTime::Now();
+  MonoDelta delta = after - before;
   CHECK_GE(delta.ToMilliseconds(), 100);
 }
 

@@ -38,6 +38,7 @@ cdef class ColumnSchema:
 cdef class ColumnSpec:
     cdef:
         KuduColumnSpec* spec
+        KuduType _type
 
 
 cdef class SchemaBuilder:
@@ -58,5 +59,8 @@ cdef class Schema:
     cdef inline DataType loc_type(self, int i):
         return self.schema.Column(i).type()
 
-    cdef inline KuduPartialRow* new_row(self):
-        return self.schema.NewRow()
+
+cdef class KuduValue:
+    cdef:
+        C_KuduValue* _value
+

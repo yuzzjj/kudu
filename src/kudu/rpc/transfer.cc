@@ -25,24 +25,37 @@
 #include <glog/logging.h>
 
 #include "kudu/gutil/endian.h"
-#include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/constants.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/logging.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/net/socket.h"
 
-DEFINE_int32(rpc_max_message_size, (8 * 1024 * 1024),
-             "The maximum size of a message that any RPC that the server will accept.");
+DEFINE_int32(rpc_max_message_size, (50 * 1024 * 1024),
+             "The maximum size of a message that any RPC that the server will accept. "
+             "Must be at least 1MB.");
 TAG_FLAG(rpc_max_message_size, advanced);
 TAG_FLAG(rpc_max_message_size, runtime);
+
+static bool ValidateMaxMessageSize(const char* flagname, int32_t value) {
+  if (value < 1 * 1024 * 1024) {
+    LOG(ERROR) << flagname << " must be at least 1MB.";
+    return false;
+  }
+  return true;
+}
+static bool dummy = google::RegisterFlagValidator(
+    &FLAGS_rpc_max_message_size, &ValidateMaxMessageSize);
 
 namespace kudu {
 namespace rpc {
 
 using std::ostringstream;
+using std::set;
 using std::string;
+using strings::Substitute;
 
 #define RETURN_ON_ERROR_OR_SOCKET_NOT_READY(status) \
   if (PREDICT_FALSE(!status.ok())) {                            \
@@ -86,13 +99,13 @@ Status InboundTransfer::ReceiveBuffer(Socket &socket) {
     // add that back in.
     total_length_ = NetworkByteOrder::Load32(&buf_[0]) + kMsgLengthPrefixLength;
     if (total_length_ > FLAGS_rpc_max_message_size) {
-      return Status::NetworkError(StringPrintf("the frame had a "
-               "length of %d, but we only support messages up to %d bytes "
-               "long.", total_length_, FLAGS_rpc_max_message_size));
+      return Status::NetworkError(Substitute(
+          "RPC frame had a length of $0, but we only support messages up to $1 bytes "
+          "long.", total_length_, FLAGS_rpc_max_message_size));
     }
     if (total_length_ <= kMsgLengthPrefixLength) {
-      return Status::NetworkError(StringPrintf("the frame had a "
-               "length of %d, which is invalid", total_length_));
+      return Status::NetworkError(Substitute("RPC frame had invalid length of $0",
+                                             total_length_));
     }
     buf_.resize(total_length_);
 
@@ -119,14 +132,29 @@ bool InboundTransfer::TransferFinished() const {
 }
 
 string InboundTransfer::StatusAsString() const {
-  return strings::Substitute("$0/$1 bytes received", cur_offset_, total_length_);
+  return Substitute("$0/$1 bytes received", cur_offset_, total_length_);
 }
 
-OutboundTransfer::OutboundTransfer(const std::vector<Slice> &payload,
+OutboundTransfer* OutboundTransfer::CreateForCallRequest(
+    int32_t call_id,
+    const std::vector<Slice> &payload,
+    TransferCallbacks *callbacks) {
+  return new OutboundTransfer(call_id, payload, callbacks);
+}
+
+OutboundTransfer* OutboundTransfer::CreateForCallResponse(const std::vector<Slice> &payload,
+                                                          TransferCallbacks *callbacks) {
+  return new OutboundTransfer(kInvalidCallId, payload, callbacks);
+}
+
+
+OutboundTransfer::OutboundTransfer(int32_t call_id,
+                                   const std::vector<Slice> &payload,
                                    TransferCallbacks *callbacks)
   : cur_slice_idx_(0),
     cur_offset_in_slice_(0),
     callbacks_(callbacks),
+    call_id_(call_id),
     aborted_(false) {
   CHECK(!payload.empty());
 
@@ -213,6 +241,10 @@ bool OutboundTransfer::TransferFinished() const {
 }
 
 string OutboundTransfer::HexDump() const {
+  if (KUDU_SHOULD_REDACT()) {
+    return kRedactionMessage;
+  }
+
   string ret;
   for (int i = 0; i < n_payload_slices_; i++) {
     ret.append(payload_slices_[i].ToDebugString());

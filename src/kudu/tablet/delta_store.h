@@ -108,7 +108,12 @@ struct DeltaKeyAndUpdate {
   DeltaKey key;
   Slice cell;
 
-  std::string Stringify(DeltaType type, const Schema& schema) const;
+  // Stringifies this DeltaKeyAndUpdate, according to 'schema'.
+  //
+  // If 'pad' is true, pads the delta row ids and txn ids in the output so that we can
+  // compare two stringified representations and obtain the same result as comparing the DeltaKey
+  // itself. That is, if 'pad' is true, then DeltaKey a < DeltaKey b => Stringify(a) < Stringify(b).
+  std::string Stringify(DeltaType type, const Schema& schema, bool pad_key = false) const;
 };
 
 class DeltaIterator {
@@ -153,8 +158,8 @@ class DeltaIterator {
   //
   // Each entry in the vector will be treated as a singly linked list of Mutation
   // objects. If there are no mutations for that row, the entry will be unmodified.
-  // If there are mutations, they will be appended at the tail of the linked list
-  // (i.e in ascending timestamp order)
+  // If there are mutations, they will be prepended at the head of the linked list
+  // (i.e the resulting list will be in descending timestamp order)
   //
   // The Mutation objects will be allocated out of the provided Arena, which must be non-NULL.
   // Must have called PrepareBatch() with flag = PREPARE_FOR_COLLECT.
@@ -172,6 +177,12 @@ class DeltaIterator {
 
   // Returns true if there are any more rows left in this iterator.
   virtual bool HasNext() = 0;
+
+  // Returns true if there might exist deltas to be applied. It is safe to
+  // conservatively return true, but this would force a skip over decoder-level
+  // evaluation.
+  // Must have called PrepareBatch() with flag = PREPARE_FOR_APPLY.
+  virtual bool MayHaveDeltas() = 0;
 
   // Return a string representation suitable for debug printouts.
   virtual std::string ToString() const = 0;

@@ -28,6 +28,7 @@
 #include "kudu/util/hexdump.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/test_macros.h"
+#include "kudu/util/test_util.h"
 
 namespace kudu {
 namespace tablet {
@@ -53,10 +54,10 @@ static Status CopyRowToArena(const Slice &row,
   return Status::OK();
 }
 
-
+class TestSchema : public KuduTest {};
 
 // Test basic functionality of Schema definition
-TEST(TestSchema, TestSchema) {
+TEST_F(TestSchema, TestSchema) {
   Schema empty_schema;
   ASSERT_GT(empty_schema.memory_footprint_excluding_this(), 0);
 
@@ -85,7 +86,7 @@ TEST(TestSchema, TestSchema) {
   EXPECT_EQ("uint32 NULLABLE", schema.column(1).TypeToString());
 }
 
-TEST(TestSchema, TestSwap) {
+TEST_F(TestSchema, TestSwap) {
   Schema schema1({ ColumnSchema("col1", STRING),
                    ColumnSchema("col2", STRING),
                    ColumnSchema("col3", UINT32) },
@@ -100,7 +101,53 @@ TEST(TestSchema, TestSwap) {
   ASSERT_EQ(2, schema2.num_key_columns());
 }
 
-TEST(TestSchema, TestReset) {
+TEST_F(TestSchema, TestColumnSchemaEquals) {
+  Slice default_str("read-write default");
+  ColumnSchema col1("key", STRING);
+  ColumnSchema col2("key1", STRING);
+  ColumnSchema col3("key", STRING, true);
+  ColumnSchema col4("key", STRING, true, &default_str, &default_str);
+
+  ASSERT_TRUE(col1.Equals(col1));
+  ASSERT_FALSE(col1.Equals(col2, ColumnSchema::COMPARE_NAME));
+  ASSERT_TRUE(col1.Equals(col2, ColumnSchema::COMPARE_TYPE));
+  ASSERT_TRUE(col1.Equals(col3, ColumnSchema::COMPARE_NAME));
+  ASSERT_FALSE(col1.Equals(col3, ColumnSchema::COMPARE_TYPE));
+  ASSERT_TRUE(col1.Equals(col3, ColumnSchema::COMPARE_DEFAULTS));
+  ASSERT_FALSE(col3.Equals(col4, ColumnSchema::COMPARE_DEFAULTS));
+  ASSERT_TRUE(col4.Equals(col4, ColumnSchema::COMPARE_DEFAULTS));
+}
+
+TEST_F(TestSchema, TestSchemaEquals) {
+  Schema schema1({ ColumnSchema("col1", STRING),
+                   ColumnSchema("col2", STRING),
+                   ColumnSchema("col3", UINT32) },
+                 2);
+  Schema schema2({ ColumnSchema("newCol1", STRING),
+                   ColumnSchema("newCol2", STRING),
+                   ColumnSchema("newCol3", UINT32) },
+                 2);
+  Schema schema3({ ColumnSchema("col1", STRING),
+                   ColumnSchema("col2", UINT32),
+                   ColumnSchema("col3", UINT32, true) },
+                 2);
+  Schema schema4({ ColumnSchema("col1", STRING),
+                   ColumnSchema("col2", UINT32),
+                   ColumnSchema("col3", UINT32, false) },
+                 2);
+  ASSERT_FALSE(schema1.Equals(schema2));
+  ASSERT_TRUE(schema1.KeyEquals(schema1));
+  ASSERT_TRUE(schema1.KeyEquals(schema2, ColumnSchema::COMPARE_TYPE));
+  ASSERT_FALSE(schema1.KeyEquals(schema2, ColumnSchema::COMPARE_NAME));
+  ASSERT_TRUE(schema1.KeyTypeEquals(schema2));
+  ASSERT_FALSE(schema2.KeyTypeEquals(schema3));
+  ASSERT_FALSE(schema3.Equals(schema4));
+  ASSERT_TRUE(schema4.Equals(schema4));
+  ASSERT_TRUE(schema3.KeyEquals(schema4,
+              ColumnSchema::COMPARE_NAME | ColumnSchema::COMPARE_TYPE));
+}
+
+TEST_F(TestSchema, TestReset) {
   Schema schema;
   ASSERT_FALSE(schema.initialized());
 
@@ -118,7 +165,7 @@ TEST(TestSchema, TestReset) {
 
 // Test for KUDU-943, a bug where we suspected that Variant didn't behave
 // correctly with empty strings.
-TEST(TestSchema, TestEmptyVariant) {
+TEST_F(TestSchema, TestEmptyVariant) {
   Slice empty_val("");
   Slice nonempty_val("test");
 
@@ -130,7 +177,7 @@ TEST(TestSchema, TestEmptyVariant) {
   ASSERT_EQ("test", (static_cast<const Slice*>(v.value()))->ToString());
 }
 
-TEST(TestSchema, TestProjectSubset) {
+TEST_F(TestSchema, TestProjectSubset) {
   Schema schema1({ ColumnSchema("col1", STRING),
                    ColumnSchema("col2", STRING),
                    ColumnSchema("col3", UINT32) },
@@ -145,7 +192,6 @@ TEST(TestSchema, TestProjectSubset) {
 
   // Verify the mapping
   ASSERT_EQ(2, row_projector.base_cols_mapping().size());
-  ASSERT_EQ(0, row_projector.adapter_cols_mapping().size());
   ASSERT_EQ(0, row_projector.projection_defaults().size());
 
   const vector<RowProjector::ProjectionIdxMapping>& mapping = row_projector.base_cols_mapping();
@@ -157,7 +203,7 @@ TEST(TestSchema, TestProjectSubset) {
 
 // Test projection when the type of the projected column
 // doesn't match the original type.
-TEST(TestSchema, TestProjectTypeMismatch) {
+TEST_F(TestSchema, TestProjectTypeMismatch) {
   Schema schema1({ ColumnSchema("key", STRING),
                    ColumnSchema("val", UINT32) },
                  1);
@@ -171,7 +217,7 @@ TEST(TestSchema, TestProjectTypeMismatch) {
 
 // Test projection when the some columns in the projection
 // are not present in the base schema
-TEST(TestSchema, TestProjectMissingColumn) {
+TEST_F(TestSchema, TestProjectMissingColumn) {
   Schema schema1({ ColumnSchema("key", STRING), ColumnSchema("val", UINT32) }, 1);
   Schema schema2({ ColumnSchema("val", UINT32), ColumnSchema("non_present", STRING) }, 0);
   Schema schema3({ ColumnSchema("val", UINT32), ColumnSchema("non_present", UINT32, true) }, 0);
@@ -190,7 +236,6 @@ TEST(TestSchema, TestProjectMissingColumn) {
   ASSERT_OK(row_projector.Reset(&schema1, &schema3));
 
   ASSERT_EQ(1, row_projector.base_cols_mapping().size());
-  ASSERT_EQ(0, row_projector.adapter_cols_mapping().size());
   ASSERT_EQ(1, row_projector.projection_defaults().size());
 
   ASSERT_EQ(row_projector.base_cols_mapping()[0].first, 0);  // val schema2
@@ -201,7 +246,6 @@ TEST(TestSchema, TestProjectMissingColumn) {
   ASSERT_OK(row_projector.Reset(&schema1, &schema4));
 
   ASSERT_EQ(1, row_projector.base_cols_mapping().size());
-  ASSERT_EQ(0, row_projector.adapter_cols_mapping().size());
   ASSERT_EQ(1, row_projector.projection_defaults().size());
 
   ASSERT_EQ(row_projector.base_cols_mapping()[0].first, 0);  // val schema4
@@ -212,7 +256,7 @@ TEST(TestSchema, TestProjectMissingColumn) {
 // Test projection mapping using IDs.
 // This simulate a column rename ('val' -> 'val_renamed')
 // and a new column added ('non_present')
-TEST(TestSchema, TestProjectRename) {
+TEST_F(TestSchema, TestProjectRename) {
   SchemaBuilder builder;
   ASSERT_OK(builder.AddKeyColumn("key", STRING));
   ASSERT_OK(builder.AddColumn("val", UINT32));
@@ -227,7 +271,6 @@ TEST(TestSchema, TestProjectRename) {
   ASSERT_OK(row_projector.Init());
 
   ASSERT_EQ(2, row_projector.base_cols_mapping().size());
-  ASSERT_EQ(0, row_projector.adapter_cols_mapping().size());
   ASSERT_EQ(1, row_projector.projection_defaults().size());
 
   ASSERT_EQ(row_projector.base_cols_mapping()[0].first, 0);  // key schema2
@@ -241,7 +284,7 @@ TEST(TestSchema, TestProjectRename) {
 
 
 // Test that the schema can be used to compare and stringify rows.
-TEST(TestSchema, TestRowOperations) {
+TEST_F(TestSchema, TestRowOperations) {
   Schema schema({ ColumnSchema("col1", STRING),
                   ColumnSchema("col2", STRING),
                   ColumnSchema("col3", UINT32),
@@ -269,7 +312,7 @@ TEST(TestSchema, TestRowOperations) {
   ASSERT_GT(schema.Compare(row_b, row_a), 0);
   ASSERT_LT(schema.Compare(row_a, row_b), 0);
 
-  ASSERT_EQ(string("(string col1=row_a_1, string col2=row_a_2, uint32 col3=3, int32 col4=-3)"),
+  ASSERT_EQ(R"((string col1="row_a_1", string col2="row_a_2", uint32 col3=3, int32 col4=-3))",
             schema.DebugRow(row_a));
 }
 
@@ -310,17 +353,17 @@ TEST(TestKeyEncoder, TestKeyEncoder) {
   }
 }
 
-TEST(TestSchema, TestDecodeKeys_CompoundStringKey) {
+TEST_F(TestSchema, TestDecodeKeys_CompoundStringKey) {
   Schema schema({ ColumnSchema("col1", STRING),
                   ColumnSchema("col2", STRING),
                   ColumnSchema("col3", STRING) },
                 2);
 
-  EXPECT_EQ("(string col1=foo, string col2=bar)",
+  EXPECT_EQ(R"((string col1="foo", string col2="bar"))",
             schema.DebugEncodedRowKey(Slice("foo\0\0bar", 8), Schema::START_KEY));
-  EXPECT_EQ("(string col1=fo\\000o, string col2=bar)",
+  EXPECT_EQ(R"((string col1="fo\000o", string col2="bar"))",
             schema.DebugEncodedRowKey(Slice("fo\x00\x01o\0\0""bar", 10), Schema::START_KEY));
-  EXPECT_EQ("(string col1=fo\\000o, string col2=bar\\000xy)",
+  EXPECT_EQ(R"((string col1="fo\000o", string col2="bar\000xy"))",
             schema.DebugEncodedRowKey(Slice("fo\x00\x01o\0\0""bar\0xy", 13), Schema::START_KEY));
 
   EXPECT_EQ("<start of table>",
@@ -331,7 +374,7 @@ TEST(TestSchema, TestDecodeKeys_CompoundStringKey) {
 
 // Test that appropriate statuses are returned when trying to decode an invalid
 // encoded key.
-TEST(TestSchema, TestDecodeKeys_InvalidKeys) {
+TEST_F(TestSchema, TestDecodeKeys_InvalidKeys) {
   Schema schema({ ColumnSchema("col1", STRING),
                   ColumnSchema("col2", UINT32),
                   ColumnSchema("col3", STRING) },
@@ -348,7 +391,7 @@ TEST(TestSchema, TestDecodeKeys_InvalidKeys) {
             schema.DebugEncodedRowKey(Slice("foo\x00\x00\xff\xff", 7), Schema::START_KEY));
 }
 
-TEST(TestSchema, TestCreateProjection) {
+TEST_F(TestSchema, TestCreateProjection) {
   Schema schema({ ColumnSchema("col1", STRING),
                   ColumnSchema("col2", STRING),
                   ColumnSchema("col3", STRING),

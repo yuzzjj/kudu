@@ -24,6 +24,7 @@
 
 #include "kudu/client/shared_ptr.h"
 #include "kudu/gutil/macros.h"
+#include "kudu/integration-tests/mini_cluster_base.h"
 #include "kudu/util/env.h"
 
 namespace kudu {
@@ -70,24 +71,21 @@ struct MiniClusterOptions {
 
 // An in-process cluster with a MiniMaster and a configurable
 // number of MiniTabletServers for use in tests.
-class MiniCluster {
+class MiniCluster : public MiniClusterBase {
  public:
   MiniCluster(Env* env, const MiniClusterOptions& options);
-  ~MiniCluster();
+  virtual ~MiniCluster();
 
   // Start a cluster with a Master and 'num_tablet_servers' TabletServers.
   // All servers run on the loopback interface with ephemeral ports.
-  Status Start();
+  Status Start() override;
 
   // Like the previous method but performs initialization synchronously, i.e.
   // this will wait for all TS's to be started and initialized. Tests should
   // use this if they interact with tablets immediately after Start();
   Status StartSync();
 
-  void Shutdown();
-
-  // Shuts down masters only.
-  void ShutdownMasters();
+  void ShutdownNodes(ClusterNodes nodes) override;
 
   // Setup a consensus configuration of distributed masters, with count specified in
   // 'options'. Requires that a reserve RPC port is specified in
@@ -104,68 +102,74 @@ class MiniCluster {
   // If this cluster is configured for a single non-distributed
   // master, return the single master. Exits with a CHECK failure if
   // there are multiple masters.
-  master::MiniMaster* mini_master() {
+  master::MiniMaster* mini_master() const {
     CHECK_EQ(mini_masters_.size(), 1);
     return mini_master(0);
   }
 
-  // Returns the leader Master for this MiniCluster or NULL if none can be
-  // found. May block until a leader Master is ready.
-  master::MiniMaster* leader_mini_master();
-
   // Returns the Master at index 'idx' for this MiniCluster.
-  master::MiniMaster* mini_master(int idx);
+  master::MiniMaster* mini_master(int idx) const;
 
   // Return number of mini masters.
-  int num_masters() const { return mini_masters_.size(); }
+  int num_masters() const override {
+    return mini_masters_.size();
+  }
 
   // Returns the TabletServer at index 'idx' of this MiniCluster.
   // 'idx' must be between 0 and 'num_tablet_servers' -1.
-  tserver::MiniTabletServer* mini_tablet_server(int idx);
+  tserver::MiniTabletServer* mini_tablet_server(int idx) const;
 
-  int num_tablet_servers() const { return mini_tablet_servers_.size(); }
+  int num_tablet_servers() const override {
+    return mini_tablet_servers_.size();
+  }
 
-  std::string GetMasterFsRoot(int indx);
+  std::string GetMasterFsRoot(int indx) const;
 
-  std::string GetTabletServerFsRoot(int idx);
-
-  // Wait for the given tablet to have 'expected_count' replicas
-  // reported on the master.
-  // Requires that the master has started.
-  // Returns a bad Status if the tablet does not reach the required count
-  // within kTabletReportWaitTimeSeconds.
-  Status WaitForReplicaCount(const std::string& tablet_id, int expected_count);
-
-  // Wait for the given tablet to have 'expected_count' replicas
-  // reported on the master. Returns the locations in '*locations'.
-  // Requires that the master has started;
-  // Returns a bad Status if the tablet does not reach the required count
-  // within kTabletReportWaitTimeSeconds.
-  Status WaitForReplicaCount(const std::string& tablet_id,
-                             int expected_count,
-                             master::TabletLocationsPB* locations);
+  std::string GetTabletServerFsRoot(int idx) const;
 
   // Wait until the number of registered tablet servers reaches the given
-  // count. Returns Status::TimedOut if the desired count is not achieved
-  // within kRegistrationWaitTimeSeconds.
-  Status WaitForTabletServerCount(int count);
-  Status WaitForTabletServerCount(int count,
-                                  std::vector<std::shared_ptr<master::TSDescriptor> >* descs);
+  // count on all masters. Returns Status::TimedOut if the desired count is not
+  // achieved within kRegistrationWaitTimeSeconds.
+  enum class MatchMode {
+    // Ensure that the tservers retrieved from each master match up against the
+    // tservers defined in this cluster. The matching is done via
+    // NodeInstancePBs comparisons. If even one match fails, the retrieved
+    // response is considered to be malformed and is retried.
+    //
+    // Note: tservers participate in matching even if they are shut down.
+    MATCH_TSERVERS,
 
-  // Create a client configured to talk to this cluster. Builder may contain
-  // override options for the client. The master address will be overridden to
-  // talk to the running master. If 'builder' is NULL, default options will be
-  // used.
-  //
-  // REQUIRES: the cluster must have already been Start()ed.
+    // Do not perform any matching on the retrieved tservers.
+    DO_NOT_MATCH_TSERVERS,
+  };
+  Status WaitForTabletServerCount(int count) const;
+  Status WaitForTabletServerCount(int count, MatchMode mode,
+                                  std::vector<std::shared_ptr<master::TSDescriptor>>* descs) const;
+
   Status CreateClient(client::KuduClientBuilder* builder,
-                      client::sp::shared_ptr<client::KuduClient>* client);
+                      client::sp::shared_ptr<client::KuduClient>* client) const override;
+
+  // Determine the leader master of the cluster. Upon successful completion,
+  // sets 'idx' to the leader master's index. The result index index can be used
+  // as an argument for calls to mini_master().
+  //
+  // It's possible to use 'nullptr' instead of providing a valid placeholder
+  // for the result master index. That's for use cases when it's enough
+  // to determine if the cluster has established leader master
+  // without intent to get the actual index.
+  //
+  // Note: if a leader election occurs after this method is executed, the
+  // last result may not be valid.
+  Status GetLeaderMasterIndex(int* idx) const;
+
+  std::shared_ptr<rpc::Messenger> messenger() const override;
+  std::shared_ptr<master::MasterServiceProxy> master_proxy() const override;
+  std::shared_ptr<master::MasterServiceProxy> master_proxy(int idx) const override;
 
  private:
   enum {
-    kTabletReportWaitTimeSeconds = 5,
-    kRegistrationWaitTimeSeconds = 5,
-    kMasterLeaderElectionWaitTimeSeconds = 10
+    kRegistrationWaitTimeSeconds = 15,
+    kMasterStartupWaitTimeSeconds = 30,
   };
 
   bool running_;
@@ -180,6 +184,10 @@ class MiniCluster {
 
   std::vector<std::shared_ptr<master::MiniMaster> > mini_masters_;
   std::vector<std::shared_ptr<tserver::MiniTabletServer> > mini_tablet_servers_;
+
+  std::shared_ptr<rpc::Messenger> messenger_;
+
+  DISALLOW_COPY_AND_ASSIGN(MiniCluster);
 };
 
 } // namespace kudu

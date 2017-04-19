@@ -21,6 +21,7 @@
 
 #include "kudu/common/partition.h"
 #include "kudu/client/client.h"
+#include "kudu/client/scan_predicate-internal.h"
 
 namespace kudu {
 
@@ -30,17 +31,33 @@ class KuduTable::Data {
  public:
   Data(sp::shared_ptr<KuduClient> client,
        std::string name,
-       std::string table_id,
+       std::string id,
+       int num_replicas,
        const KuduSchema& schema,
        PartitionSchema partition_schema);
   ~Data();
 
-  Status Open();
+  template<class PredicateMakerFunc>
+  KuduPredicate* MakePredicate(const Slice& col_name,
+                               const PredicateMakerFunc& f) {
+    StringPiece name_sp(reinterpret_cast<const char*>(col_name.data()), col_name.size());
+    int col_idx = schema_.schema_->find_column(name_sp);
+    if (col_idx == Schema::kColumnNotFound) {
+      // Since the new predicate functions don't return errors, instead we create a special
+      // predicate that just returns the errors when we add it to the scanner.
+      //
+      // This allows the predicate API to be more "fluent".
+      return new KuduPredicate(new ErrorPredicateData(
+          Status::NotFound("column not found", col_name)));
+    }
+    return f(schema_.schema_->column(col_idx));
+  }
 
   sp::shared_ptr<KuduClient> client_;
 
-  std::string name_;
+  const std::string name_;
   const std::string id_;
+  const int num_replicas_;
 
   // TODO: figure out how we deal with a schema change from the client perspective.
   // Do we make them call a RefreshSchema() method? Or maybe reopen the table and get

@@ -28,7 +28,7 @@
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
 #include <llvm/MC/MCContext.h>
-#include <llvm/MC/MCDisassembler.h>
+#include <llvm/MC/MCDisassembler/MCDisassembler.h>
 #include <llvm/MC/MCInst.h>
 #include <llvm/MC/MCInstPrinter.h>
 #include <llvm/Support/raw_os_ostream.h>
@@ -219,7 +219,7 @@ Status CodeGenerator::CompileRowProjector(const Schema& base, const Schema& proj
 
   if (FLAGS_codegen_dump_mc) {
     static const int kInstrMax = 500;
-    std::stringstream sstr;
+    std::ostringstream sstr;
     sstr << "Printing read projection function:\n";
     int instrs = DumpAsm((*out)->read(), *tm, &sstr, kInstrMax);
     sstr << "Printed " << instrs << " instructions.";

@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
 #include "kudu/cfile/cfile_writer.h"
 #include "kudu/cfile/index_block.h"
+#include "kudu/gutil/strings/substitute.h"
+#include "kudu/util/pb_util.h"
 #include "kudu/util/protobuf_util.h"
 
 namespace kudu {
@@ -145,8 +146,7 @@ Status IndexBlockReader::Parse(const Slice &data) {
   size_t max_size = trailer_size_ptr - data_.data();
   if (trailer_size <= 0 ||
       trailer_size > max_size) {
-    string err = "invalid index block trailer size: " +
-      boost::lexical_cast<string>(trailer_size);
+    string err = strings::Substitute("invalid index block trailer size: $0", trailer_size);
     return Status::Corruption(err);
   }
 
@@ -162,7 +162,7 @@ Status IndexBlockReader::Parse(const Slice &data) {
   key_offsets_ = trailer_ptr - sizeof(uint32_t) * trailer_.num_entries();
   CHECK(trailer_ptr >= data_.data());
 
-  VLOG(2) << "Parsed index trailer: " << trailer_.DebugString();
+  VLOG(2) << "Parsed index trailer: " << SecureDebugString(trailer_);
 
   parsed_ = true;
   return Status::OK();
@@ -235,10 +235,6 @@ void IndexBlockReader::GetKeyPointer(int idx_in_block, const uint8_t **ptr,
   }
 }
 
-size_t IndexBlockBuilder::Count() const {
-  return entry_offsets_.size();
-}
-
 void IndexBlockBuilder::Reset() {
   buffer_.clear();
   entry_offsets_.clear();
@@ -276,7 +272,7 @@ Status IndexBlockIterator::SeekAtOrBefore(const Slice &search_key) {
   // closest is now 'left'
   int compare = reader_->CompareKey(left, search_key);
   if (compare > 0) {
-    // The last midpoint was still greather then the
+    // The last midpoint was still greater than the
     // provided key, which implies that the key is
     // lower than the lowest in the block.
     return Status::NotFound("key not present");

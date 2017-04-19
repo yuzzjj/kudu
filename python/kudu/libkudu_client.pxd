@@ -21,6 +21,7 @@ from libc.stdint cimport *
 from libcpp cimport bool as c_bool
 from libcpp.string cimport string
 from libcpp.vector cimport vector
+from libcpp.map cimport map
 
 # This must be included for cerr and other things to work
 cdef extern from "<iostream>":
@@ -117,14 +118,15 @@ cdef extern from "kudu/client/schema.h" namespace "kudu::client" nogil:
         KUDU_FLOAT " kudu::client::KuduColumnSchema::FLOAT"
         KUDU_DOUBLE " kudu::client::KuduColumnSchema::DOUBLE"
         KUDU_BINARY " kudu::client::KuduColumnSchema::BINARY"
-        KUDU_TIMESTAMP " kudu::client::KuduColumnSchema::TIMESTAMP"
+        KUDU_UNIXTIME_MICROS " kudu::client::KuduColumnSchema::UNIXTIME_MICROS"
 
     enum EncodingType" kudu::client::KuduColumnStorageAttributes::EncodingType":
         EncodingType_AUTO " kudu::client::KuduColumnStorageAttributes::AUTO_ENCODING"
         EncodingType_PLAIN " kudu::client::KuduColumnStorageAttributes::PLAIN_ENCODING"
         EncodingType_PREFIX " kudu::client::KuduColumnStorageAttributes::PREFIX_ENCODING"
-        EncodingType_GROUP_VARINT " kudu::client::KuduColumnStorageAttributes::GROUP_VARINT"
+        EncodingType_BIT_SHUFFLE " kudu::client::KuduColumnStorageAttributes::BIT_SHUFFLE"
         EncodingType_RLE " kudu::client::KuduColumnStorageAttributes::RLE"
+        EncodingType_DICT " kudu::client::KuduColumnStorageAttributes::DICT_ENCODING"
 
     enum CompressionType" kudu::client::KuduColumnStorageAttributes::CompressionType":
         CompressionType_DEFAULT " kudu::client::KuduColumnStorageAttributes::DEFAULT_COMPRESSION"
@@ -156,6 +158,7 @@ cdef extern from "kudu/client/schema.h" namespace "kudu::client" nogil:
 
     cdef cppclass KuduSchema:
         KuduSchema()
+        KuduSchema(const KuduSchema& schema)
         KuduSchema(vector[KuduColumnSchema]& columns, int key_columns)
 
         c_bool Equals(const KuduSchema& other)
@@ -168,7 +171,7 @@ cdef extern from "kudu/client/schema.h" namespace "kudu::client" nogil:
 
     cdef cppclass KuduColumnSpec:
 
-         KuduColumnSpec* Default(KuduValue* value)
+         KuduColumnSpec* Default(C_KuduValue* value)
          KuduColumnSpec* RemoveDefault()
 
          KuduColumnSpec* Compression(CompressionType compression)
@@ -180,7 +183,7 @@ cdef extern from "kudu/client/schema.h" namespace "kudu::client" nogil:
          KuduColumnSpec* Nullable()
          KuduColumnSpec* Type(DataType type_)
 
-         KuduColumnSpec* RenameTo(string& new_name)
+         KuduColumnSpec* RenameTo(const string& new_name)
 
 
     cdef cppclass KuduSchemaBuilder:
@@ -205,21 +208,24 @@ cdef extern from "kudu/client/scan_batch.h" namespace "kudu::client" nogil:
         # the value is unset, or the value is NULL. Otherwise they return
         # the current set value in *val.
         Status GetBool(Slice& col_name, c_bool* val)
-
-        Status GetInt8(Slice& col_name, int8_t* val)
-        Status GetInt16(Slice& col_name, int16_t* val)
-        Status GetInt32(Slice& col_name, int32_t* val)
-        Status GetInt64(Slice& col_name, int64_t* val)
-
-        Status GetTimestamp(const Slice& col_name,
-                            int64_t* micros_since_utc_epoch)
-
         Status GetBool(int col_idx, c_bool* val)
 
+        Status GetInt8(Slice& col_name, int8_t* val)
         Status GetInt8(int col_idx, int8_t* val)
+
+        Status GetInt16(Slice& col_name, int16_t* val)
         Status GetInt16(int col_idx, int16_t* val)
+
+        Status GetInt32(Slice& col_name, int32_t* val)
         Status GetInt32(int col_idx, int32_t* val)
+
+        Status GetInt64(Slice& col_name, int64_t* val)
         Status GetInt64(int col_idx, int64_t* val)
+
+        Status GetUnixTimeMicros(const Slice& col_name,
+                            int64_t* micros_since_utc_epoch)
+        Status GetUnixTimeMicros(int col_idx,
+                            int64_t* micros_since_utc_epoch)
 
         Status GetString(Slice& col_name, Slice* val)
         Status GetString(int col_idx, Slice* val)
@@ -293,9 +299,9 @@ cdef extern from "kudu/common/partial_row.h" namespace "kudu" nogil:
         Status SetInt32(Slice& col_name, int32_t val)
         Status SetInt64(Slice& col_name, int64_t val)
 
-        Status SetTimestamp(const Slice& col_name,
-                            int64_t micros_since_utc_epoch)
-        Status SetTimestamp(int col_idx, int64_t micros_since_utc_epoch)
+        Status SetUnixTimeMicros(const Slice& col_name,
+                                 int64_t micros_since_utc_epoch)
+        Status SetUnixTimeMicros(int col_idx, int64_t micros_since_utc_epoch)
 
         Status SetDouble(Slice& col_name, double val)
         Status SetFloat(Slice& col_name, float val)
@@ -317,6 +323,9 @@ cdef extern from "kudu/common/partial_row.h" namespace "kudu" nogil:
 
         Status SetStringCopy(Slice& col_name, Slice& val)
         Status SetStringCopy(int col_idx, Slice& val)
+
+        Status SetBinary(Slice& col_name, Slice& val)
+        Status SetBinary(int col_idx, Slice&val)
 
         Status SetBinaryCopy(const Slice& col_name, const Slice& val)
         Status SetBinaryCopy(int col_idx, const Slice& val)
@@ -351,9 +360,9 @@ cdef extern from "kudu/common/partial_row.h" namespace "kudu" nogil:
         Status GetInt64(Slice& col_name, int64_t* val)
         Status GetInt64(int col_idx, int64_t* val)
 
-        Status GetTimestamp(const Slice& col_name,
+        Status GetUnixTimeMicros(const Slice& col_name,
                             int64_t* micros_since_utc_epoch)
-        Status GetTimestamp(int col_idx, int64_t* micros_since_utc_epoch)
+        Status GetUnixTimeMicros(int col_idx, int64_t* micros_since_utc_epoch)
 
         Status GetDouble(Slice& col_name, double* val)
         Status GetDouble(int col_idx, double* val)
@@ -404,6 +413,9 @@ cdef extern from "kudu/client/write_op.h" namespace "kudu::client" nogil:
     cdef cppclass KuduInsert(KuduWriteOperation):
         pass
 
+    cdef cppclass KuduUpsert(KuduWriteOperation):
+        pass
+
     cdef cppclass KuduDelete(KuduWriteOperation):
         pass
 
@@ -416,6 +428,8 @@ cdef extern from "kudu/client/scan_predicate.h" namespace "kudu::client" nogil:
         KUDU_LESS_EQUAL    " kudu::client::KuduPredicate::LESS_EQUAL"
         KUDU_GREATER_EQUAL " kudu::client::KuduPredicate::GREATER_EQUAL"
         KUDU_EQUAL         " kudu::client::KuduPredicate::EQUAL"
+        KUDU_LESS          " kudu::client::KuduPredicate::LESS"
+        KUDU_GREATER       " kudu::client::KuduPredicate::GREATER"
 
     cdef cppclass KuduPredicate:
         KuduPredicate* Clone()
@@ -423,26 +437,39 @@ cdef extern from "kudu/client/scan_predicate.h" namespace "kudu::client" nogil:
 
 cdef extern from "kudu/client/value.h" namespace "kudu::client" nogil:
 
-    cdef cppclass KuduValue:
+    cdef cppclass C_KuduValue "kudu::client::KuduValue":
         @staticmethod
-        KuduValue* FromInt(int64_t val);
+        C_KuduValue* FromInt(int64_t val);
 
         @staticmethod
-        KuduValue* FromFloat(float val);
+        C_KuduValue* FromFloat(float val);
 
         @staticmethod
-        KuduValue* FromDouble(double val);
+        C_KuduValue* FromDouble(double val);
 
         @staticmethod
-        KuduValue* FromBool(c_bool val);
+        C_KuduValue* FromBool(c_bool val);
 
         @staticmethod
-        KuduValue* CopyString(const Slice& s);
+        C_KuduValue* CopyString(const Slice& s);
 
 
 cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
 
-    # Omitted KuduClient::ReplicaSelection enum
+    enum ReplicaSelection" kudu::client::KuduClient::ReplicaSelection":
+        ReplicaSelection_Leader " kudu::client::KuduClient::LEADER_ONLY"
+        ReplicaSelection_Closest " kudu::client::KuduClient::CLOSEST_REPLICA"
+        ReplicaSelection_First " kudu::client::KuduClient::FIRST_REPLICA"
+
+    enum ReadMode" kudu::client::KuduScanner::ReadMode":
+        ReadMode_Latest " kudu::client::KuduScanner::READ_LATEST"
+        ReadMode_Snapshot " kudu::client::KuduScanner::READ_AT_SNAPSHOT"
+
+    enum RangePartitionBound" kudu::client::KuduTableCreator::RangePartitionBound":
+        PartitionType_Exclusive " kudu::client::KuduTableCreator::EXCLUSIVE_BOUND"
+        PartitionType_Inclusive " kudu::client::KuduTableCreator::INCLUSIVE_BOUND"
+
+    Status DisableOpenSSLInitialization()
 
     cdef cppclass KuduClient:
 
@@ -460,11 +487,14 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
         Status ListTables(vector[string]* tables)
         Status ListTables(vector[string]* tables, const string& filter)
 
+        Status ListTabletServers(vector[KuduTabletServer*]* tablet_servers)
+
         Status TableExists(const string& table_name, c_bool* exists)
 
-        KuduTableAlterer* NewTableAlterer()
+        KuduTableAlterer* NewTableAlterer(const string& table_name)
         Status IsAlterTableInProgress(const string& table_name,
                                       c_bool* alter_in_progress)
+        uint64_t GetLatestObservedTimestamp()
 
         shared_ptr[KuduSession] NewSession()
 
@@ -480,32 +510,45 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
 
         Status Build(shared_ptr[KuduClient]* client)
 
+    cdef cppclass KuduTabletServer:
+        KuduTabletServer()
+        string& uuid()
+        string& hostname()
+        uint16_t port()
+
     cdef cppclass KuduTableCreator:
         KuduTableCreator& table_name(string& name)
         KuduTableCreator& schema(KuduSchema* schema)
-        KuduTableCreator& split_keys(vector[string]& keys)
+        KuduTableCreator& add_hash_partitions(vector[string]& columns,
+                                              int num_buckets)
+        KuduTableCreator& add_hash_partitions(vector[string]& columns,
+                                              int num_buckets,
+                                              int seed)
+        KuduTableCreator& set_range_partition_columns(vector[string]& columns)
+        KuduTableCreator& add_range_partition(KuduPartialRow* lower_bound,
+                                              KuduPartialRow* upper_bound,
+                                              RangePartitionBound lower_bound_type,
+                                              RangePartitionBound upper_bound_type)
+        KuduTableCreator& add_range_partition_split(KuduPartialRow* split_row)
+        KuduTableCreator& split_rows(vector[const KuduPartialRow*]& split_rows)
         KuduTableCreator& num_replicas(int n_replicas)
         KuduTableCreator& wait(c_bool wait)
 
         Status Create()
 
     cdef cppclass KuduTableAlterer:
-        # The name of the existing table to alter
-        KuduTableAlterer& table_name(string& name)
-
-        KuduTableAlterer& rename_table(string& name)
-
-        KuduTableAlterer& add_column(string& name, DataType type,
-                                     const void *default_value)
-        KuduTableAlterer& add_column(string& name, DataType type,
-                                     const void *default_value,
-                                     KuduColumnStorageAttributes attr)
-
-        KuduTableAlterer& add_nullable_column(string& name, DataType type)
-
-        KuduTableAlterer& drop_column(string& name)
-
-        KuduTableAlterer& rename_column(string& old_name, string& new_name)
+        KuduTableAlterer& RenameTo(const string& new_name)
+        KuduColumnSpec* AddColumn(const string& name)
+        KuduColumnSpec* AlterColumn(const string& name)
+        KuduTableAlterer& DropColumn(const string& name)
+        KuduTableAlterer& AddRangePartition(KuduPartialRow* lower_bound,
+                                            KuduPartialRow* upper_bound,
+                                            RangePartitionBound lower_bound_type,
+                                            RangePartitionBound upper_bound_type)
+        KuduTableAlterer& DropRangePartition(KuduPartialRow* lower_bound,
+                                             KuduPartialRow* upper_bound,
+                                             RangePartitionBound lower_bound_type,
+                                             RangePartitionBound upper_bound_type)
 
         KuduTableAlterer& wait(c_bool wait)
 
@@ -516,15 +559,20 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
     cdef cppclass KuduTable:
 
         string& name()
+        string& id()
         KuduSchema& schema()
+        int num_replicas()
 
         KuduInsert* NewInsert()
+        KuduUpsert* NewUpsert()
         KuduUpdate* NewUpdate()
         KuduDelete* NewDelete()
 
         KuduPredicate* NewComparisonPredicate(const Slice& col_name,
                                               ComparisonOp op,
-                                              KuduValue* value);
+                                              C_KuduValue* value);
+        KuduPredicate* NewInListPredicate(const Slice& col_name,
+                                          vector[C_KuduValue*]* values)
 
         KuduClient* client()
         # const PartitionSchema& partition_schema()
@@ -545,6 +593,7 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
 
         Status Apply(KuduWriteOperation* write_op)
         Status Apply(KuduInsert* write_op)
+        Status Apply(KuduUpsert* write_op)
         Status Apply(KuduUpdate* write_op)
         Status Apply(KuduDelete* write_op)
 
@@ -574,9 +623,6 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
 
         KuduClient* client()
 
-    enum ReadMode" kudu::client::KuduScanner::ReadMode":
-        READ_LATEST " kudu::client::KuduScanner::READ_LATEST"
-        READ_AT_SNAPSHOT " kudu::client::KuduScanner::READ_AT_SNAPSHOT"
 
     cdef cppclass KuduScanner:
         KuduScanner(KuduTable* table)
@@ -589,19 +635,62 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
         c_bool HasMoreRows()
         Status NextBatch(KuduScanBatch* batch)
         Status SetBatchSizeBytes(uint32_t batch_size)
-
-        # Pending definition of ReplicaSelection enum
-        # Status SetSelection(ReplicaSelection selection)
-
+        Status SetSelection(ReplicaSelection selection)
+        Status SetCacheBlocks(c_bool cache_blocks)
         Status SetReadMode(ReadMode read_mode)
-        Status SetSnapshot(uint64_t snapshot_timestamp_micros)
+        Status SetSnapshotMicros(uint64_t snapshot_timestamp_micros)
         Status SetTimeoutMillis(int millis)
         Status SetProjectedColumnNames(const vector[string]& col_names)
+        Status SetProjectedColumnIndexes(const vector[int]& col_indexes)
         Status SetFaultTolerant()
         Status AddLowerBound(const KuduPartialRow& key)
         Status AddExclusiveUpperBound(const KuduPartialRow& key)
+        Status KeepAlive()
+        Status GetCurrentServer(KuduTabletServer** server)
 
+        KuduSchema GetProjectionSchema()
+        const ResourceMetrics& GetResourceMetrics()
         string ToString()
+
+    cdef cppclass KuduScanToken:
+        KuduScanToken()
+
+        const KuduTablet& tablet()
+
+        Status IntoKuduScanner(KuduScanner** scanner)
+        Status Serialize(string* buf)
+        Status DeserializeIntoScanner(KuduClient* client,
+                                      const string& serialized_token,
+                                      KuduScanner** scanner)
+
+    cdef cppclass KuduScanTokenBuilder:
+        KuduScanTokenBuilder(KuduTable* table)
+
+        Status SetProjectedColumnNames(const vector[string]& col_names)
+        Status SetProjectedColumnIndexes(const vector[int]& col_indexes)
+        Status SetBatchSizeBytes(uint32_t batch_size)
+        Status SetReadMode(ReadMode read_mode)
+        Status SetFaultTolerant()
+        Status SetSnapshotMicros(uint64_t snapshot_timestamp_micros)
+        Status SetSelection(ReplicaSelection selection)
+        Status SetTimeoutMillis(int millis)
+        Status AddConjunctPredicate(KuduPredicate* pred)
+        Status AddLowerBound(const KuduPartialRow& key)
+        Status AddUpperBound(const KuduPartialRow& key)
+        Status SetCacheBlocks(c_bool cache_blocks)
+        Status Build(vector[KuduScanToken*]* tokens)
+
+    cdef cppclass KuduTablet:
+        KuduTablet()
+
+        const string& id()
+        const vector[const KuduReplica*]& replicas()
+
+    cdef cppclass KuduReplica:
+        KuduReplica()
+
+        c_bool is_leader()
+        const KuduTabletServer& ts()
 
     cdef cppclass C_KuduError " kudu::client::KuduError":
 
@@ -611,3 +700,11 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
         KuduWriteOperation* release_failed_op()
 
         c_bool was_possibly_successful()
+
+cdef extern from "kudu/client/resource_metrics.h" namespace "kudu::client" nogil:
+
+    cdef cppclass ResourceMetrics:
+        ResourceMetrics()
+
+        map[string, int64_t] Get()
+        int64_t GetMetric(const string& name)

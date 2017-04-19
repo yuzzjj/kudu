@@ -21,54 +21,112 @@
 #include <string>
 #include <vector>
 
-#include "kudu/gutil/macros.h"
 #include "kudu/client/client.h"
+#include "kudu/client/resource_metrics.h"
 #include "kudu/client/row_result.h"
+#include "kudu/client/scan_configuration.h"
+#include "kudu/common/partition_pruner.h"
 #include "kudu/common/scan_spec.h"
-#include "kudu/common/predicate_encoder.h"
+#include "kudu/gutil/macros.h"
 #include "kudu/tserver/tserver_service.proxy.h"
+#include "kudu/util/auto_release_pool.h"
 
 namespace kudu {
 
 namespace client {
 
+// The result of KuduScanner::Data::AnalyzeResponse.
+//
+// This provides a more specific enum for handling the possible error conditions in a Scan
+// RPC.
+struct ScanRpcStatus {
+  enum Result {
+    OK,
+
+    // The request was malformed (e.g. bad schema, etc).
+    INVALID_REQUEST,
+
+    // The server was busy (e.g. RPC queue overflow).
+    SERVER_BUSY,
+
+    // The deadline for the whole batch was exceeded.
+    OVERALL_DEADLINE_EXCEEDED,
+
+    // The deadline for an individual RPC was exceeded, but we have more time left to try
+    // on other hosts.
+    RPC_DEADLINE_EXCEEDED,
+
+    // Another RPC-system error (e.g. NetworkError because the TS was down).
+    RPC_ERROR,
+
+    // The scanner on the server side expired.
+    SCANNER_EXPIRED,
+
+    // The destination tablet was not running (e.g. in the process of bootstrapping).
+    TABLET_NOT_RUNNING,
+
+    // The destination tablet does not exist (e.g. because the replica was deleted).
+    TABLET_NOT_FOUND,
+
+    // Some other unknown tablet server error. This indicates that the TS was running
+    // but some problem occurred other than the ones enumerated above.
+    OTHER_TS_ERROR
+  };
+
+  Result result;
+  Status status;
+};
+
 class KuduScanner::Data {
  public:
+
   explicit Data(KuduTable* table);
   ~Data();
 
-  Status CheckForErrors();
-
-  // Copies a predicate lower or upper bound from 'bound_src' into
-  // 'bound_dst'.
-  void CopyPredicateBound(const ColumnSchema& col,
-                          const void* bound_src, std::string* bound_dst);
+  // Calculates a deadline and sends the next RPC for this scanner. The deadline for the
+  // RPC is calculated based on whether 'allow_time_for_failover' is true. If true,
+  // the deadline used for the RPC will be shortened so that, on timeout, there will
+  // be enough time for another attempt to a different server. If false, then the RPC
+  // will use 'overall_deadline' as its deadline.
+  //
+  // The RPC and TS proxy should already have been prepared in next_req_, proxy_, etc.
+  ScanRpcStatus SendScanRpc(const MonoTime& overall_deadline, bool allow_time_for_failover);
 
   // Called when KuduScanner::NextBatch or KuduScanner::Data::OpenTablet result in an RPC or
-  // server error. Returns the error status if the call cannot be retried.
+  // server error.
   //
-  // The number of parameters reflects the complexity of handling retries.
-  // We must respect the overall scan 'deadline', as well as the 'blacklist' of servers
-  // experiencing transient failures. See the implementation for more details.
-  Status CanBeRetried(const bool isNewScan,
-                      const Status& rpc_status,
-                      const Status& server_status,
-                      const MonoTime& actual_deadline,
-                      const MonoTime& deadline,
-                      const std::vector<internal::RemoteTabletServer*>& candidates,
-                      std::set<std::string>* blacklist);
+  // If the provided 'status' indicates the error was retryable, then returns Status::OK()
+  // and potentially inserts the current server into 'blacklist' if the retry should be
+  // made on a different replica.
+  //
+  // This function may also sleep in case the error suggests that backoff is necessary.
+  Status HandleError(const ScanRpcStatus& status,
+                     const MonoTime& deadline,
+                     std::set<std::string>* blacklist);
 
-  // Open a tablet.
+  // Opens the next tablet in the scan, or returns Status::NotFound if there are
+  // no more tablets to scan.
+  //
   // The deadline is the time budget for this operation.
   // The blacklist is used to temporarily filter out nodes that are experiencing transient errors.
   // This blacklist may be modified by the callee.
+  Status OpenNextTablet(const MonoTime& deadline, std::set<std::string>* blacklist);
+
+  // Open the current tablet in the scan again.
+  // See OpenNextTablet for options.
+  Status ReopenCurrentTablet(const MonoTime& deadline, std::set<std::string>* blacklist);
+
+  // Open the tablet to scan.
   Status OpenTablet(const std::string& partition_key,
                     const MonoTime& deadline,
                     std::set<std::string>* blacklist);
 
   Status KeepAlive();
 
-  // Returns whether there exist more tablets we should scan.
+  // Returns whether there may exist more tablets to scan.
+  //
+  // This method does not take into account any non-covered range partitions
+  // that may exist in the table, so it should only be used as a hint.
   //
   // Note: there may not be any actual matching rows in subsequent tablets,
   // but we won't know until we scan them.
@@ -94,23 +152,28 @@ class KuduScanner::Data {
   // non-fatal (i.e. retriable) scan error is encountered.
   void UpdateLastError(const Status& error);
 
-  // Sets the projection schema.
-  void SetProjectionSchema(const Schema* schema);
+  const ScanConfiguration& configuration() const {
+    return configuration_;
+  }
+
+  ScanConfiguration* mutable_configuration() {
+    return &configuration_;
+  }
+
+  ScanConfiguration configuration_;
 
   bool open_;
   bool data_in_open_;
-  bool has_batch_size_bytes_;
-  uint32 batch_size_bytes_;
-  KuduClient::ReplicaSelection selection_;
 
-  ReadMode read_mode_;
-  bool is_fault_tolerant_;
-  int64_t snapshot_timestamp_;
+  // Set to true if the scan is known to be empty based on predicates and
+  // primary key bounds.
+  bool short_circuit_;
 
   // The encoded last primary key from the most recent tablet scan response.
   std::string last_primary_key_;
 
   internal::RemoteTabletServer* ts_;
+
   // The proxy can be derived from the RemoteTabletServer, but this involves retaking the
   // meta cache lock. Keeping our own shared_ptr avoids this overhead.
   std::shared_ptr<tserver::TabletServerServiceProxy> proxy_;
@@ -127,28 +190,12 @@ class KuduScanner::Data {
   rpc::RpcController controller_;
 
   // The table we're scanning.
-  KuduTable* table_;
+  sp::shared_ptr<KuduTable> table_;
 
-  // The projection schema used in the scan.
-  const Schema* projection_;
-
-  // 'projection_' after it is converted to KuduSchema, so that users can obtain
-  // the projection without having to include common/schema.h.
-  KuduSchema client_projection_;
-
-  Arena arena_;
-  AutoReleasePool pool_;
-
-  // Machinery to store and encode raw column range predicates into
-  // encoded keys.
-  ScanSpec spec_;
-  RangePredicateEncoder spec_encoder_;
+  PartitionPruner partition_pruner_;
 
   // The tablet we're scanning.
   scoped_refptr<internal::RemoteTablet> remote_;
-
-  // Timeout for scanner RPCs.
-  MonoDelta timeout_;
 
   // Number of attempts since the last successful scan.
   int scan_attempts_;
@@ -164,6 +211,39 @@ class KuduScanner::Data {
   //
   // TODO: This and the overall scan retry logic duplicates much of RpcRetrier.
   Status last_error_;
+
+  // The scanner's cumulative resource metrics since the scan was started.
+  ResourceMetrics resource_metrics_;
+
+  // Returns a text description of the scan suitable for debug printing.
+  //
+  // This method will not return sensitive predicate information, so it's
+  // suitable for use in client-side logging (as opposed to Scanner::ToString).
+  std::string DebugString() const {
+    return strings::Substitute("Scanner { table: $0, projection: $1, scan_spec: $2 }",
+                               table_->name(),
+                               configuration_.projection()->ToString(),
+                               configuration_.spec().ToString(*table_->schema().schema_));
+  }
+
+ private:
+  // Analyze the response of the last Scan RPC made by this scanner.
+  //
+  // The error handling of a scan RPC is fairly complex, since we have to handle
+  // some errors which happen at the network layer, some which happen generically
+  // at the RPC layer, and some which are scanner-specific. This function consolidates
+  // the various different error situations into a single enum code and Status.
+  //
+  // 'rpc_status':       the Status directly returned by the RPC Scan() method.
+  // 'overall_deadline': the user-provided deadline for the scanner batch
+  // 'rpc_deadline':     the deadline that was used for this specific RPC, which
+  //                     might be earlier than the overall deadline, in order to
+  //                     leave more time for further retries on other hosts.
+  ScanRpcStatus AnalyzeResponse(const Status& rpc_status,
+                                const MonoTime& overall_deadline,
+                                const MonoTime& rpc_deadline);
+
+  void UpdateResourceMetrics();
 
   DISALLOW_COPY_AND_ASSIGN(Data);
 };

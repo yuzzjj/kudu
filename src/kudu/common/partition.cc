@@ -19,24 +19,30 @@
 
 #include <algorithm>
 #include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "kudu/common/partial_row.h"
-#include "kudu/common/row_key-util.h"
-#include "kudu/common/scan_predicate.h"
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/hash_util.h"
+#include "kudu/util/logging.h"
+#include "kudu/util/pb_util.h"
+#include "kudu/util/url-coding.h"
 
-namespace kudu {
-
+using std::pair;
 using std::set;
 using std::string;
 using std::vector;
 
+namespace kudu {
+
 using google::protobuf::RepeatedPtrField;
 using strings::Substitute;
+using strings::SubstituteAndAppend;
 
 // The encoded size of a hash bucket in a partition key.
 static const size_t kEncodedBucketSize = sizeof(uint32_t);
@@ -58,6 +64,14 @@ Slice Partition::range_key(const string& partition_key) const {
   } else {
     return Slice();
   }
+}
+
+bool Partition::Equals(const Partition& other) const {
+  if (this == &other) return true;
+  if (partition_key_start().compare(other.partition_key_start()) != 0) return false;
+  if (partition_key_end().compare(other.partition_key_end()) != 0) return false;
+  if (hash_buckets_ != other.hash_buckets_) return false;
+  return true;
 }
 
 void Partition::ToPB(PartitionPB* pb) const {
@@ -92,7 +106,7 @@ Status ExtractColumnIds(const RepeatedPtrField<PartitionSchemaPB_ColumnIdentifie
         case PartitionSchemaPB_ColumnIdentifierPB::kId: {
           ColumnId column_id(identifier.id());
           if (schema.find_column_by_id(column_id) == Schema::kColumnNotFound) {
-            return Status::InvalidArgument("unknown column id", identifier.DebugString());
+            return Status::InvalidArgument("unknown column id", SecureDebugString(identifier));
           }
           column_ids->push_back(column_id);
           continue;
@@ -100,12 +114,12 @@ Status ExtractColumnIds(const RepeatedPtrField<PartitionSchemaPB_ColumnIdentifie
         case PartitionSchemaPB_ColumnIdentifierPB::kName: {
           int32_t column_idx = schema.find_column(identifier.name());
           if (column_idx == Schema::kColumnNotFound) {
-            return Status::InvalidArgument("unknown column", identifier.DebugString());
+            return Status::InvalidArgument("unknown column", SecureDebugString(identifier));
           }
           column_ids->push_back(schema.column_id(column_idx));
           continue;
         }
-        default: return Status::InvalidArgument("unknown column", identifier.DebugString());
+        default: return Status::InvalidArgument("unknown column", SecureDebugString(identifier));
       }
     }
     return Status::OK();
@@ -114,7 +128,7 @@ Status ExtractColumnIds(const RepeatedPtrField<PartitionSchemaPB_ColumnIdentifie
 void SetColumnIdentifiers(const vector<ColumnId>& column_ids,
                           RepeatedPtrField<PartitionSchemaPB_ColumnIdentifierPB>* identifiers) {
     identifiers->Reserve(column_ids.size());
-    for (ColumnId column_id : column_ids) {
+    for (const ColumnId& column_id : column_ids) {
       identifiers->Add()->set_id(column_id);
     }
 }
@@ -193,7 +207,144 @@ Status PartitionSchema::EncodeKey(const ConstContiguousRow& row, string* buf) co
   return EncodeColumns(row, range_schema_.column_ids, buf);
 }
 
+Status PartitionSchema::EncodeRangeKey(const KuduPartialRow& row,
+                                       const Schema& schema,
+                                       string* key) const {
+  DCHECK(key->empty());
+  bool contains_no_columns = true;
+  for (int column_idx = 0; column_idx < schema.num_columns(); column_idx++) {
+    const ColumnSchema& column = schema.column(column_idx);
+    if (row.IsColumnSet(column_idx)) {
+      if (std::find(range_schema_.column_ids.begin(),
+                    range_schema_.column_ids.end(),
+                    schema.column_id(column_idx)) != range_schema_.column_ids.end()) {
+        contains_no_columns = false;
+      } else {
+        return Status::InvalidArgument(
+            "split rows may only contain values for range partitioned columns", column.name());
+      }
+    }
+  }
+
+  if (contains_no_columns) {
+    return Status::OK();
+  }
+  return EncodeColumns(row, range_schema_.column_ids, key);
+}
+
+Status PartitionSchema::EncodeRangeSplits(const vector<KuduPartialRow>& split_rows,
+                                          const Schema& schema,
+                                          vector<string>* splits) const {
+  DCHECK(splits->empty());
+  for (const KuduPartialRow& row : split_rows) {
+    string split;
+    RETURN_NOT_OK(EncodeRangeKey(row, schema, &split));
+    if (split.empty()) {
+        return Status::InvalidArgument(
+            "split rows must contain a value for at least one range partition column");
+    }
+    splits->emplace_back(std::move(split));
+  }
+
+  std::sort(splits->begin(), splits->end());
+  auto unique_end = std::unique(splits->begin(), splits->end());
+  if (unique_end != splits->end()) {
+    return Status::InvalidArgument("duplicate split row", RangeKeyDebugString(*unique_end, schema));
+  }
+  return Status::OK();
+}
+
+Status PartitionSchema::EncodeRangeBounds(const vector<pair<KuduPartialRow,
+                                                            KuduPartialRow>>& range_bounds,
+                                          const Schema& schema,
+                                          vector<pair<string, string>>* range_partitions) const {
+  DCHECK(range_partitions->empty());
+  if (range_bounds.empty()) {
+    range_partitions->emplace_back("", "");
+    return Status::OK();
+  }
+
+  for (const auto& bound : range_bounds) {
+    string lower;
+    string upper;
+    RETURN_NOT_OK(EncodeRangeKey(bound.first, schema, &lower));
+    RETURN_NOT_OK(EncodeRangeKey(bound.second, schema, &upper));
+
+    if (!lower.empty() && !upper.empty() && lower >= upper) {
+      return Status::InvalidArgument(
+          "range partition lower bound must be less than or equal to the upper bound",
+          RangePartitionDebugString(bound.first, bound.second));
+    }
+    range_partitions->emplace_back(std::move(lower), std::move(upper));
+  }
+
+  // Check that the range bounds are non-overlapping
+  std::sort(range_partitions->begin(), range_partitions->end());
+  for (int i = 0; i < range_partitions->size() - 1; i++) {
+    const string& first_upper = range_partitions->at(i).second;
+    const string& second_lower = range_partitions->at(i + 1).first;
+
+    if (first_upper.empty() || second_lower.empty() || first_upper > second_lower) {
+      return Status::InvalidArgument(
+          "overlapping range partitions",
+          strings::Substitute("first range partition: $0, second range partition: $1",
+                              RangePartitionDebugString(range_partitions->at(i).first,
+                                                        range_partitions->at(i).second,
+                                                        schema),
+                              RangePartitionDebugString(range_partitions->at(i + 1).first,
+                                                        range_partitions->at(i + 1).second,
+                                                        schema)));
+    }
+  }
+
+  return Status::OK();
+}
+
+Status PartitionSchema::SplitRangeBounds(const Schema& schema,
+                                         vector<string> splits,
+                                         vector<pair<string, string>>* bounds) const {
+  int expected_bounds = std::max(1UL, bounds->size()) + splits.size();
+
+  vector<pair<string, string>> new_bounds;
+  new_bounds.reserve(expected_bounds);
+
+  // Iterate through the sorted bounds and sorted splits, splitting the bounds
+  // as appropriate and adding them to the result list ('new_bounds').
+
+  auto split = splits.begin();
+  for (auto& bound : *bounds) {
+    string& lower = bound.first;
+    const string& upper = bound.second;
+
+    for (; split != splits.end() && (upper.empty() || *split <= upper); split++) {
+      if (!lower.empty() && *split < lower) {
+        return Status::InvalidArgument("split out of bounds", RangeKeyDebugString(*split, schema));
+      }
+      if (lower == *split || upper == *split) {
+        return Status::InvalidArgument("split matches lower or upper bound",
+                                       RangeKeyDebugString(*split, schema));
+      }
+      // Split the current bound. Add the lower section to the result list,
+      // and continue iterating on the upper section.
+      new_bounds.emplace_back(std::move(lower), *split);
+      lower = std::move(*split);
+    }
+
+    new_bounds.emplace_back(std::move(lower), std::move(upper));
+  }
+
+  if (split != splits.end()) {
+    return Status::InvalidArgument("split out of bounds", RangeKeyDebugString(*split, schema));
+  }
+
+  bounds->swap(new_bounds);
+  CHECK_EQ(expected_bounds, bounds->size());
+  return Status::OK();
+}
+
 Status PartitionSchema::CreatePartitions(const vector<KuduPartialRow>& split_rows,
+                                         const vector<pair<KuduPartialRow,
+                                                           KuduPartialRow>>& range_bounds,
                                          const Schema& schema,
                                          vector<Partition>* partitions) const {
   const KeyEncoder<string>& hash_encoder = GetKeyEncoder<string>(GetTypeInfo(UINT32));
@@ -217,72 +368,39 @@ Status PartitionSchema::CreatePartitions(const vector<KuduPartialRow>& split_row
   }
 
   unordered_set<int> range_column_idxs;
-  for (ColumnId column_id : range_schema_.column_ids) {
+  for (const ColumnId& column_id : range_schema_.column_ids) {
     int column_idx = schema.find_column_by_id(column_id);
     if (column_idx == Schema::kColumnNotFound) {
-      return Status::InvalidArgument(Substitute("Range partition column ID $0 "
+      return Status::InvalidArgument(Substitute("range partition column ID $0 "
                                                 "not found in table schema.", column_id));
     }
     if (!InsertIfNotPresent(&range_column_idxs, column_idx)) {
-      return Status::InvalidArgument("Duplicate column in range partition",
+      return Status::InvalidArgument("duplicate column in range partition",
                                      schema.column(column_idx).name());
     }
   }
 
-  // Create the start range keys.
-  set<string> start_keys;
-  string start_key;
-  for (const KuduPartialRow& row : split_rows) {
-    int column_count = 0;
-    for (int column_idx = 0; column_idx < schema.num_columns(); column_idx++) {
-      const ColumnSchema& column = schema.column(column_idx);
-      if (row.IsColumnSet(column_idx)) {
-        if (ContainsKey(range_column_idxs, column_idx)) {
-          column_count++;
-        } else {
-          return Status::InvalidArgument("Split rows may only contain values for "
-                                         "range partitioned columns", column.name());
-        }
-      }
-    }
+  vector<pair<string, string>> bounds;
+  vector<string> splits;
+  RETURN_NOT_OK(EncodeRangeBounds(range_bounds, schema, &bounds));
+  RETURN_NOT_OK(EncodeRangeSplits(split_rows, schema, &splits));
+  RETURN_NOT_OK(SplitRangeBounds(schema, std::move(splits), &bounds));
 
-    // Check for an empty split row.
-    if (column_count == 0) {
-    return Status::InvalidArgument("Split rows must contain a value for at "
-                                   "least one range partition column");
-    }
-
-    start_key.clear();
-    RETURN_NOT_OK(EncodeColumns(row, range_schema_.column_ids, &start_key));
-
-    // Check for a duplicate split row.
-    if (!InsertIfNotPresent(&start_keys, start_key)) {
-      return Status::InvalidArgument("Duplicate split row", row.ToString());
-    }
-  }
-
-  // Create a partition per range and hash bucket combination.
+  // Create a partition per range bound and hash bucket combination.
   vector<Partition> new_partitions;
   for (const Partition& base_partition : *partitions) {
-    start_key.clear();
-
-    for (const string& end_key : start_keys) {
+    for (const auto& bound : bounds) {
       Partition partition = base_partition;
-      partition.partition_key_start_.append(start_key);
-      partition.partition_key_end_.append(end_key);
+      partition.partition_key_start_.append(bound.first);
+      partition.partition_key_end_.append(bound.second);
       new_partitions.push_back(partition);
-      start_key = end_key;
     }
-
-    // Add the final range.
-    Partition partition = base_partition;
-    partition.partition_key_start_.append(start_key);
-    new_partitions.push_back(partition);
   }
   partitions->swap(new_partitions);
 
   // Note: the following discussion and logic only takes effect when the table's
-  // partition schema includes at least one hash bucket component.
+  // partition schema includes at least one hash bucket component, and the
+  // absolute upper and/or absolute lower range bound is unbounded.
   //
   // At this point, we have the full set of partitions built up, but each
   // partition only covers a finite slice of the partition key-space. Some
@@ -392,7 +510,8 @@ Status PartitionSchema::DecodeRangeKey(Slice* encoded_key,
     BitmapSet(row->isset_bitmap_, column_idx);
   }
   if (!encoded_key->empty()) {
-    return Status::InvalidArgument("unable to fully decode partition key range components");
+    return Status::InvalidArgument("unable to fully decode range key",
+                                   KUDU_REDACT(encoded_key->ToDebugString()));
   }
   return Status::OK();
 }
@@ -418,92 +537,22 @@ Status PartitionSchema::DecodeHashBuckets(Slice* encoded_key,
   return Status::OK();
 }
 
-string PartitionSchema::PartitionDebugString(const Partition& partition,
-                                             const Schema& schema) const {
-  string s;
-
-  if (!partition.hash_buckets().empty()) {
-    vector<string> components;
-    for (int32_t bucket : partition.hash_buckets()) {
-      components.push_back(Substitute("$0", bucket));
-    }
-    s.append("hash buckets: (");
-    s.append(JoinStrings(components, ", "));
-    if (!range_schema_.column_ids.empty()) {
-      s.append("), ");
-    } else {
-      s.append(")");
-    }
-  }
-
-  if (!range_schema_.column_ids.empty()) {
-    Arena arena(1024, 128 * 1024);
-    KuduPartialRow start_row(&schema);
-    KuduPartialRow end_row(&schema);
-
-    s.append("range: [(");
-
-    vector<string> start_components;
-    Slice encoded_range_key_start = partition.range_key_start();
-    Status status;
-    status = DecodeRangeKey(&encoded_range_key_start, &start_row, &arena);
-    if (status.ok()) {
-      AppendRangeDebugStringComponentsOrString(start_row, "<start>", &start_components);
-      s.append(JoinStrings(start_components, ", "));
-    } else {
-      s.append(Substitute("<decode-error: $0>", status.ToString()));
-    }
-    s.append("), (");
-
-    vector<string> end_components;
-    Slice encoded_range_key_end = partition.range_key_end();
-    status = DecodeRangeKey(&encoded_range_key_end, &end_row, &arena);
-    if (status.ok()) {
-      AppendRangeDebugStringComponentsOrString(end_row, "<end>", &end_components);
-      s.append(JoinStrings(end_components, ", "));
-    } else {
-      s.append(Substitute("<decode-error: $0>", status.ToString()));
-    }
-    s.append("))");
-  }
-
-  return s;
-}
-
-void PartitionSchema::AppendRangeDebugStringComponentsOrString(const KuduPartialRow& row,
-                                                               const StringPiece default_string,
-                                                               vector<string>* components) const {
+bool PartitionSchema::IsRangePartitionKeyEmpty(const KuduPartialRow& row) const {
   ConstContiguousRow const_row(row.schema(), row.row_data_);
-
-  for (ColumnId column_id : range_schema_.column_ids) {
-    string column;
-    int32_t column_idx = row.schema()->find_column_by_id(column_id);
-    if (column_idx == Schema::kColumnNotFound) {
-      components->push_back("<unknown-column>");
-      continue;
-    }
-    const ColumnSchema& column_schema = row.schema()->column(column_idx);
-
-    if (!row.IsColumnSet(column_idx)) {
-      components->push_back(default_string.as_string());
-      break;
-    } else {
-      column_schema.DebugCellAppend(const_row.cell(column_idx), &column);
-    }
-
-    components->push_back(column);
+  for (const ColumnId& column_id : range_schema_.column_ids) {
+    if (row.IsColumnSet(row.schema()->find_column_by_id(column_id))) return false;
   }
+  return true;
 }
 
 void PartitionSchema::AppendRangeDebugStringComponentsOrMin(const KuduPartialRow& row,
                                                             vector<string>* components) const {
   ConstContiguousRow const_row(row.schema(), row.row_data_);
 
-  for (ColumnId column_id : range_schema_.column_ids) {
-    string column;
+  for (const ColumnId& column_id : range_schema_.column_ids) {
     int32_t column_idx = row.schema()->find_column_by_id(column_id);
     if (column_idx == Schema::kColumnNotFound) {
-      components->push_back("<unknown-column>");
+      components->emplace_back("<unknown-column>");
       continue;
     }
     const ColumnSchema& column_schema = row.schema()->column(column_idx);
@@ -512,98 +561,20 @@ void PartitionSchema::AppendRangeDebugStringComponentsOrMin(const KuduPartialRow
       uint8_t min_value[kLargestTypeSize];
       column_schema.type_info()->CopyMinValue(&min_value);
       SimpleConstCell cell(&column_schema, &min_value);
-      column_schema.DebugCellAppend(cell, &column);
+      components->emplace_back(column_schema.Stringify(cell.ptr()));
     } else {
-      column_schema.DebugCellAppend(const_row.cell(column_idx), &column);
-    }
-
-    components->push_back(column);
-  }
-}
-
-string PartitionSchema::RowDebugString(const ConstContiguousRow& row) const {
-  vector<string> components;
-
-  for (const HashBucketSchema& hash_bucket_schema : hash_bucket_schemas_) {
-    int32_t bucket;
-    Status s = BucketForRow(row, hash_bucket_schema, &bucket);
-    if (s.ok()) {
-      components.push_back(Substitute("bucket=$0", bucket));
-    } else {
-      components.push_back(Substitute("<bucket-error: $0>", s.ToString()));
+      components->emplace_back(column_schema.Stringify(const_row.cell_ptr(column_idx)));
     }
   }
-
-  for (ColumnId column_id : range_schema_.column_ids) {
-    string column;
-    int32_t column_idx = row.schema()->find_column_by_id(column_id);
-    if (column_idx == Schema::kColumnNotFound) {
-      components.push_back("<unknown-column>");
-      break;
-    }
-    row.schema()->column(column_idx).DebugCellAppend(row.cell(column_idx), &column);
-    components.push_back(column);
-  }
-
-  return JoinStrings(components, ", ");
-}
-
-string PartitionSchema::RowDebugString(const KuduPartialRow& row) const {
-  vector<string> components;
-
-  for (const HashBucketSchema& hash_bucket_schema : hash_bucket_schemas_) {
-    int32_t bucket;
-    Status s = BucketForRow(row, hash_bucket_schema, &bucket);
-    if (s.ok()) {
-      components.push_back(Substitute("bucket=$0", bucket));
-    } else {
-      components.push_back(Substitute("<bucket-error: $0>", s.ToString()));
-    }
-  }
-
-  AppendRangeDebugStringComponentsOrMin(row, &components);
-
-  return JoinStrings(components, ", ");
-}
-
-string PartitionSchema::PartitionKeyDebugString(const string& key, const Schema& schema) const {
-  Slice encoded_key = key;
-
-  vector<string> components;
-
-  if (!hash_bucket_schemas_.empty()) {
-    vector<int32_t> buckets;
-    Status s = DecodeHashBuckets(&encoded_key, &buckets);
-    if (!s.ok()) {
-      return Substitute("<hash-decode-error: $0>", s.ToString());
-    }
-    for (int32_t bucket : buckets) {
-      components.push_back(Substitute("bucket=$0", bucket));
-    }
-  }
-
-  if (!range_schema_.column_ids.empty()) {
-    Arena arena(1024, 128 * 1024);
-    KuduPartialRow row(&schema);
-
-    Status s = DecodeRangeKey(&encoded_key, &row, &arena);
-    if (!s.ok()) {
-      return Substitute("<range-decode-error: $0>", s.ToString());
-    }
-
-    AppendRangeDebugStringComponentsOrMin(row, &components);
-  }
-
-  return JoinStrings(components, ", ");
 }
 
 namespace {
 // Converts a list of column IDs to a string with the column names seperated by
 // a comma character.
 string ColumnIdsToColumnNames(const Schema& schema,
-                              const vector<ColumnId> column_ids) {
+                              const vector<ColumnId>& column_ids) {
   vector<string> names;
-  for (ColumnId column_id : column_ids) {
+  for (const ColumnId& column_id : column_ids) {
     names.push_back(schema.column(schema.find_column_by_id(column_id)).name());
   }
 
@@ -611,30 +582,270 @@ string ColumnIdsToColumnNames(const Schema& schema,
 }
 } // namespace
 
-string PartitionSchema::DebugString(const Schema& schema) const {
-  vector<string> component_types;
+string PartitionSchema::PartitionDebugString(const Partition& partition,
+                                             const Schema& schema) const {
+  // Partitions are considered metadata, so don't redact them.
+  ScopedDisableRedaction no_redaction;
 
-  if (!hash_bucket_schemas_.empty()) {
-    vector<string> hash_components;
-    for (const HashBucketSchema& hash_bucket_schema : hash_bucket_schemas_) {
-      string component;
-      component.append(Substitute("(bucket count: $0", hash_bucket_schema.num_buckets));
-      if (hash_bucket_schema.seed != 0) {
-        component.append(Substitute(", seed: $0", hash_bucket_schema.seed));
-      }
-      component.append(Substitute(", columns: [$0])",
-                                  ColumnIdsToColumnNames(schema, hash_bucket_schema.column_ids)));
-      hash_components.push_back(component);
-    }
-    component_types.push_back(Substitute("hash bucket components: [$0]",
-                                         JoinStrings(hash_components, ", ")));
+  vector<string> components;
+  if (partition.hash_buckets_.size() != hash_bucket_schemas_.size()) {
+    return "<hash-partition-error>";
+  }
+
+  for (int i = 0; i < hash_bucket_schemas_.size(); i++) {
+    string s = Substitute("HASH ($0) PARTITION $1",
+                          ColumnIdsToColumnNames(schema, hash_bucket_schemas_[i].column_ids),
+                          partition.hash_buckets_[i]);
+    components.emplace_back(std::move(s));
   }
 
   if (!range_schema_.column_ids.empty()) {
-    component_types.push_back(Substitute("range columns: [$0]",
-                                         ColumnIdsToColumnNames(schema, range_schema_.column_ids)));
+    string s = Substitute("RANGE ($0) PARTITION $1",
+                          ColumnIdsToColumnNames(schema, range_schema_.column_ids),
+                          RangePartitionDebugString(partition.range_key_start(),
+                                                    partition.range_key_end(),
+                                                    schema));
+    components.emplace_back(std::move(s));
   }
-  return JoinStrings(component_types, ", ");
+
+  return JoinStrings(components, ", ");
+}
+
+template<typename Row>
+string PartitionSchema::PartitionKeyDebugStringImpl(const Row& row) const {
+  vector<string> components;
+
+  for (const HashBucketSchema& hash_bucket_schema : hash_bucket_schemas_) {
+    int32_t bucket;
+    Status s = BucketForRow(row, hash_bucket_schema, &bucket);
+    if (s.ok()) {
+      components.emplace_back(
+          Substitute("HASH ($0): $1",
+                     ColumnIdsToColumnNames(*row.schema(), hash_bucket_schema.column_ids),
+                     bucket));
+    } else {
+      components.emplace_back(Substitute("<hash-error: $0>", s.ToString()));
+    }
+  }
+
+  if (!range_schema_.column_ids.empty()) {
+      components.emplace_back(
+          Substitute("RANGE ($0): $1",
+                     ColumnIdsToColumnNames(*row.schema(), range_schema_.column_ids),
+                     RangeKeyDebugString(row)));
+  }
+
+  return JoinStrings(components, ", ");
+}
+template
+string PartitionSchema::PartitionKeyDebugStringImpl(const KuduPartialRow& row) const;
+template
+string PartitionSchema::PartitionKeyDebugStringImpl(const ConstContiguousRow& row) const;
+
+string PartitionSchema::PartitionKeyDebugString(const ConstContiguousRow& row) const {
+  return PartitionKeyDebugStringImpl(row);
+}
+
+string PartitionSchema::PartitionKeyDebugString(const KuduPartialRow& row) const {
+  return PartitionKeyDebugStringImpl(row);
+}
+
+string PartitionSchema::PartitionKeyDebugString(Slice key, const Schema& schema) const {
+  vector<string> components;
+
+  size_t hash_components_size = kEncodedBucketSize * hash_bucket_schemas_.size();
+  if (key.size() < hash_components_size) {
+    return "<hash-decode-error>";
+  }
+
+  for (const auto& hash_schema : hash_bucket_schemas_) {
+    uint32_t big_endian;
+    memcpy(&big_endian, key.data(), sizeof(uint32_t));
+    key.remove_prefix(sizeof(uint32_t));
+    components.emplace_back(
+        Substitute("HASH ($0): $1",
+                    ColumnIdsToColumnNames(schema, hash_schema.column_ids),
+                    BigEndian::ToHost32(big_endian)));
+  }
+
+  if (!range_schema_.column_ids.empty()) {
+      components.emplace_back(
+          Substitute("RANGE ($0): $1",
+                     ColumnIdsToColumnNames(schema, range_schema_.column_ids),
+                     RangeKeyDebugString(key, schema)));
+  }
+
+  return JoinStrings(components, ", ");
+}
+
+string PartitionSchema::RangePartitionDebugString(const KuduPartialRow& lower_bound,
+                                                  const KuduPartialRow& upper_bound) const {
+  // Partitions are considered metadata, so don't redact them.
+  ScopedDisableRedaction no_redaction;
+
+  bool lower_unbounded = IsRangePartitionKeyEmpty(lower_bound);
+  bool upper_unbounded = IsRangePartitionKeyEmpty(upper_bound);
+  if (lower_unbounded && upper_unbounded) {
+    return "UNBOUNDED";
+  }
+  if (lower_unbounded) {
+    return Substitute("VALUES < $0", RangeKeyDebugString(upper_bound));
+  }
+  if (upper_unbounded) {
+    return Substitute("VALUES >= $0", RangeKeyDebugString(lower_bound));
+  }
+  // TODO(dan): recognize when a simplified 'VALUE =' form can be used (see
+  // org.apache.kudu.client.Partition#formatRangePartition).
+  return Substitute("$0 <= VALUES < $1",
+                    RangeKeyDebugString(lower_bound),
+                    RangeKeyDebugString(upper_bound));
+}
+
+string PartitionSchema::RangePartitionDebugString(Slice lower_bound,
+                                                  Slice upper_bound,
+                                                  const Schema& schema) const {
+  // Partitions are considered metadata, so don't redact them.
+  ScopedDisableRedaction no_redaction;
+
+  Arena arena(1024, 128 * 1024);
+  KuduPartialRow lower(&schema);
+  KuduPartialRow upper(&schema);
+
+  Status s = DecodeRangeKey(&lower_bound, &lower, &arena);
+  if (!s.ok()) {
+    return Substitute("<range-key-decode-error: $0>", s.ToString());
+  }
+  s = DecodeRangeKey(&upper_bound, &upper, &arena);
+  if (!s.ok()) {
+    return Substitute("<range-key-decode-error: $0>", s.ToString());
+  }
+
+  return RangePartitionDebugString(lower, upper);
+}
+
+string PartitionSchema::RangeKeyDebugString(Slice range_key, const Schema& schema) const {
+  Arena arena(1024, 128 * 1024);
+  KuduPartialRow row(&schema);
+
+  Status s = DecodeRangeKey(&range_key, &row, &arena);
+  if (!s.ok()) {
+    return Substitute("<range-key-decode-error: $0>", s.ToString());
+  }
+  return RangeKeyDebugString(row);
+}
+
+string PartitionSchema::RangeKeyDebugString(const KuduPartialRow& key) const {
+  vector<string> components;
+  AppendRangeDebugStringComponentsOrMin(key, &components);
+  if (components.size() == 1) {
+    // Omit the parentheses if the range partition has a single column.
+    return components.back();
+  }
+  return Substitute("($0)", JoinStrings(components, ", "));
+}
+
+string PartitionSchema::RangeKeyDebugString(const ConstContiguousRow& key) const {
+  vector<string> components;
+
+  for (const ColumnId& column_id : range_schema_.column_ids) {
+    string column;
+    int32_t column_idx = key.schema()->find_column_by_id(column_id);
+    if (column_idx == Schema::kColumnNotFound) {
+      components.push_back("<unknown-column>");
+      break;
+    }
+    key.schema()->column(column_idx).DebugCellAppend(key.cell(column_idx), &column);
+    components.push_back(column);
+  }
+
+  if (components.size() == 1) {
+    // Omit the parentheses if the range partition has a single column.
+    return components.back();
+  }
+  return Substitute("($0)", JoinStrings(components, ", "));
+}
+
+vector<string> PartitionSchema::DebugStringComponents(const Schema& schema) const {
+  vector<string> components;
+
+  for (const auto& hash_bucket_schema : hash_bucket_schemas_) {
+    string s;
+    SubstituteAndAppend(&s, "HASH ($0) PARTITIONS $1",
+                        ColumnIdsToColumnNames(schema, hash_bucket_schema.column_ids),
+                        hash_bucket_schema.num_buckets);
+    if (hash_bucket_schema.seed != 0) {
+      SubstituteAndAppend(&s, " SEED $0", hash_bucket_schema.seed);
+    }
+    components.emplace_back(std::move(s));
+  }
+
+  if (!range_schema_.column_ids.empty()) {
+    string s = Substitute("RANGE ($0)", ColumnIdsToColumnNames(schema, range_schema_.column_ids));
+    components.emplace_back(std::move(s));
+  }
+
+  return components;
+}
+
+string PartitionSchema::DebugString(const Schema& schema) const {
+  return JoinStrings(DebugStringComponents(schema), ", ");
+}
+
+string PartitionSchema::DisplayString(const Schema& schema,
+                                      const vector<string>& range_partitions) const {
+  string display_string = JoinStrings(DebugStringComponents(schema), ",\n");
+
+  if (!range_schema_.column_ids.empty()) {
+    display_string.append(" (");
+    if (range_partitions.empty()) {
+      display_string.append(")");
+    } else {
+      bool is_first = true;
+      for (const string& range_partition : range_partitions) {
+        if (is_first) {
+          is_first = false;
+        } else {
+          display_string.push_back(',');
+        }
+        display_string.append("\n    PARTITION ");
+        display_string.append(range_partition);
+      }
+      display_string.append("\n)");
+    }
+  }
+  return display_string;
+}
+
+string PartitionSchema::PartitionTableHeader(const Schema& schema) const {
+  string header;
+  for (const auto& hash_bucket_schema : hash_bucket_schemas_) {
+    SubstituteAndAppend(&header, "<th>HASH ($0) PARTITION</th>",
+                        EscapeForHtmlToString(
+                          ColumnIdsToColumnNames(schema, hash_bucket_schema.column_ids)));
+  }
+  if (!range_schema_.column_ids.empty()) {
+    SubstituteAndAppend(&header, "<th>RANGE ($0) PARTITION</th>",
+                        EscapeForHtmlToString(
+                          ColumnIdsToColumnNames(schema, range_schema_.column_ids)));
+  }
+  return header;
+}
+
+string PartitionSchema::PartitionTableEntry(const Schema& schema,
+                                            const Partition& partition) const {
+  string entry;
+  for (int32_t bucket : partition.hash_buckets_) {
+    SubstituteAndAppend(&entry, "<td>$0</td>", bucket);
+  }
+
+  if (!range_schema_.column_ids.empty()) {
+    SubstituteAndAppend(&entry, "<td>$0</td>",
+                        EscapeForHtmlToString(
+                          RangePartitionDebugString(partition.range_key_start(),
+                                                    partition.range_key_end(),
+                                                    schema)));
+  }
+  return entry;
 }
 
 bool PartitionSchema::Equals(const PartitionSchema& other) const {
@@ -653,16 +864,6 @@ bool PartitionSchema::Equals(const PartitionSchema& other) const {
         != other.hash_bucket_schemas_[i].column_ids) return false;
   }
 
-  return true;
-}
-
-bool PartitionSchema::IsSimplePKRangePartitioning(const Schema& schema) const {
-  if (!hash_bucket_schemas_.empty()) return false;
-  if (range_schema_.column_ids.size() != schema.num_key_columns()) return false;
-
-  for (int i = 0; i < schema.num_key_columns(); i++) {
-    if (range_schema_.column_ids[i] != schema.column_id(i)) return false;
-  }
   return true;
 }
 
@@ -751,7 +952,7 @@ Status PartitionSchema::Validate(const Schema& schema) const {
       return Status::InvalidArgument("must have at least one hash column");
     }
 
-    for (ColumnId hash_column : hash_schema.column_ids) {
+    for (const ColumnId& hash_column : hash_schema.column_ids) {
       if (!hash_columns.insert(hash_column).second) {
         return Status::InvalidArgument("hash bucket schema components must not "
                                        "contain columns in common");
@@ -767,7 +968,7 @@ Status PartitionSchema::Validate(const Schema& schema) const {
     }
   }
 
-  for (ColumnId column_id : range_schema_.column_ids) {
+  for (const ColumnId& column_id : range_schema_.column_ids) {
     int32_t column_idx = schema.find_column_by_id(column_id);
     if (column_idx == Schema::kColumnNotFound) {
       return Status::InvalidArgument("must specify existing columns for range "
@@ -775,6 +976,228 @@ Status PartitionSchema::Validate(const Schema& schema) const {
     } else if (column_idx >= schema.num_key_columns()) {
       return Status::InvalidArgument("must specify only primary key columns for "
                                      "range partition component");
+    }
+  }
+
+  return Status::OK();
+}
+
+namespace {
+
+  // Increments an unset column in the row.
+  Status IncrementUnsetColumn(KuduPartialRow* row, int32_t idx) {
+    DCHECK(!row->IsColumnSet(idx));
+    switch (row->schema()->column(idx).type_info()->type()) {
+      case INT8:
+        RETURN_NOT_OK(row->SetInt8(idx, INT8_MIN + 1));
+        break;
+      case INT16:
+        RETURN_NOT_OK(row->SetInt16(idx, INT16_MIN + 1));
+        break;
+      case INT32:
+        RETURN_NOT_OK(row->SetInt32(idx, INT32_MIN + 1));
+        break;
+      case INT64:
+      case UNIXTIME_MICROS:
+        RETURN_NOT_OK(row->SetInt64(idx, INT64_MIN + 1));
+        break;
+      case STRING:
+        RETURN_NOT_OK(row->SetStringCopy(idx, Slice("\0", 1)));
+        break;
+      case BINARY:
+        RETURN_NOT_OK(row->SetBinaryCopy(idx, Slice("\0", 1)));
+        break;
+      default:
+        return Status::InvalidArgument("Invalid column type in range partition",
+                                       row->schema()->column(idx).ToString());
+    }
+    return Status::OK();
+  }
+
+  // Increments a column in the row, setting 'success' to true if the increment
+  // succeeds, or false if the column is already the maximum value.
+  Status IncrementColumn(KuduPartialRow* row, int32_t idx, bool* success) {
+    DCHECK(row->IsColumnSet(idx));
+    *success = true;
+    switch (row->schema()->column(idx).type_info()->type()) {
+      case INT8: {
+        int8_t value;
+        RETURN_NOT_OK(row->GetInt8(idx, &value));
+        if (value < INT8_MAX) {
+          RETURN_NOT_OK(row->SetInt8(idx, value + 1));
+        } else {
+          *success = false;
+        }
+        break;
+      }
+      case INT16: {
+        int16_t value;
+        RETURN_NOT_OK(row->GetInt16(idx, &value));
+        if (value < INT16_MAX) {
+          RETURN_NOT_OK(row->SetInt16(idx, value + 1));
+        } else {
+          *success = false;
+        }
+        break;
+      }
+      case INT32: {
+        int32_t value;
+        RETURN_NOT_OK(row->GetInt32(idx, &value));
+        if (value < INT32_MAX) {
+          RETURN_NOT_OK(row->SetInt32(idx, value + 1));
+        } else {
+          *success = false;
+        }
+        break;
+      }
+      case INT64: {
+         int64_t value;
+         RETURN_NOT_OK(row->GetInt64(idx, &value));
+         if (value < INT64_MAX) {
+           RETURN_NOT_OK(row->SetInt64(idx, value + 1));
+         } else {
+           *success = false;
+         }
+         break;
+       }
+      case UNIXTIME_MICROS: {
+        int64_t value;
+        RETURN_NOT_OK(row->GetUnixTimeMicros(idx, &value));
+        if (value < INT64_MAX) {
+          RETURN_NOT_OK(row->SetUnixTimeMicros(idx, value + 1));
+        } else {
+          *success = false;
+        }
+        break;
+      }
+      case BINARY: {
+        Slice value;
+        RETURN_NOT_OK(row->GetBinary(idx, &value));
+        string incremented = value.ToString();
+        incremented.push_back('\0');
+        RETURN_NOT_OK(row->SetBinaryCopy(idx, incremented));
+        break;
+      }
+      case STRING: {
+        Slice value;
+        RETURN_NOT_OK(row->GetString(idx, &value));
+        string incremented = value.ToString();
+        incremented.push_back('\0');
+        RETURN_NOT_OK(row->SetStringCopy(idx, incremented));
+        break;
+      }
+      default:
+        return Status::InvalidArgument("Invalid column type in range partition",
+                                       row->schema()->column(idx).ToString());
+    }
+    return Status::OK();
+  }
+} // anonymous namespace
+
+Status PartitionSchema::IncrementRangePartitionKey(KuduPartialRow* row, bool* increment) const {
+  vector<int32_t> unset_idxs;
+  *increment = false;
+  for (auto itr = range_schema_.column_ids.rbegin();
+       itr != range_schema_.column_ids.rend(); ++itr) {
+    int32_t idx = row->schema()->find_column_by_id(*itr);
+    if (idx == Schema::kColumnNotFound) {
+      return Status::InvalidArgument(Substitute("range partition column ID $0 "
+                                                "not found in range partition key schema.",
+                                                *itr));
+    }
+
+    if (row->IsColumnSet(idx)) {
+      RETURN_NOT_OK(IncrementColumn(row, idx, increment));
+      if (*increment) break;
+    } else {
+      RETURN_NOT_OK(IncrementUnsetColumn(row, idx));
+      *increment = true;
+      break;
+    }
+    unset_idxs.push_back(idx);
+  }
+
+  if (*increment) {
+    for (int32_t idx : unset_idxs) {
+      RETURN_NOT_OK(row->Unset(idx));
+    }
+  }
+
+  return Status::OK();
+}
+
+Status PartitionSchema::MakeLowerBoundRangePartitionKeyInclusive(KuduPartialRow* row) const {
+  // To transform a lower bound range partition key from exclusive to inclusive,
+  // the key must be incremented. To increment the key, start with the least
+  // significant column in the key (furthest right), and increment it.  If the
+  // increment fails because the value is already the maximum, move on to the
+  // next least significant column and attempt to increment it (and so on). When
+  // incrementing, an unset cell is equivalent to a cell set to the minimum
+  // value for its column (e.g. an unset Int8 column is incremented to -127
+  // (-2^7 + 1)). Finally, all columns less significant than the incremented
+  // column are unset (which means they are treated as the minimum value for
+  // that column). If all columns in the key are the maximum and can not be
+  // incremented, then the operation fails.
+  //
+  // A few examples, given a range partition of three Int8 columns. Underscore
+  // signifies unset:
+  //
+  // (1, 2, 3)       -> (1, 2, 4)
+  // (1, 2, 127)     -> (1, 3, _)
+  // (1, 127, 3)     -> (1, 127, 4)
+  // (1, _, 3)       -> (1, _, 4)
+  // (_, _, _)       -> (_, _, 1)
+  // (1, 127, 127)   -> (2, _, _)
+  // (127, 127, 127) -> fail!
+
+  bool increment;
+  RETURN_NOT_OK(IncrementRangePartitionKey(row, &increment));
+
+  if (!increment) {
+    vector<string> components;
+    AppendRangeDebugStringComponentsOrMin(*row, &components);
+    return Status::InvalidArgument("Exclusive lower bound range partition key must not "
+                                   "have maximum values for all components",
+                                   RangeKeyDebugString(*row));
+  }
+
+  return Status::OK();
+}
+
+Status PartitionSchema::MakeUpperBoundRangePartitionKeyExclusive(KuduPartialRow* row) const {
+  // To transform an upper bound range partition key from inclusive to exclusive,
+  // the key must be incremented. Incrementing the key follows the same steps as
+  // turning an exclusive lower bound key into exclusive. Upper bound keys have
+  // two additional special cases:
+  //
+  // * For upper bound range partition keys with all columns unset, no
+  //   transformation is needed (all unset columns signifies unbounded,
+  //   so there is no difference between inclusive and exclusive).
+  //
+  // * For an upper bound key that can't be incremented because all components
+  //   are the maximum value, all columns are unset in order to transform it to
+  //   an unbounded upper bound (this is a special case increment).
+
+  bool all_unset = true;
+  for (const ColumnId& column_id : range_schema_.column_ids) {
+    int32_t idx = row->schema()->find_column_by_id(column_id);
+    if (idx == Schema::kColumnNotFound) {
+      return Status::InvalidArgument(Substitute("range partition column ID $0 "
+                                                "not found in range partition key schema.",
+                                                column_id));
+    }
+    all_unset = !row->IsColumnSet(idx);
+    if (!all_unset) break;
+  }
+
+  if (all_unset) return Status::OK();
+
+  bool increment;
+  RETURN_NOT_OK(IncrementRangePartitionKey(row, &increment));
+  if (!increment) {
+    for (const ColumnId& column_id : range_schema_.column_ids) {
+      int32_t idx = row->schema()->find_column_by_id(column_id);
+      RETURN_NOT_OK(row->Unset(idx));
     }
   }
 

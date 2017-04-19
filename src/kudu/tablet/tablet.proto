@@ -16,7 +16,7 @@
 // under the License.
 package kudu.tablet;
 
-option java_package = "org.kududb.tablet";
+option java_package = "org.apache.kudu.tablet";
 
 import "kudu/common/common.proto";
 import "kudu/common/wire_protocol.proto";
@@ -64,6 +64,10 @@ message DeltaStatsPB {
   // Number of deletes (deletes result in deletion of an entire row)
   required int64 delete_count = 1;
 
+  // Number of reinserts.
+  // Optional for data format compatibility.
+  optional int64 reinsert_count = 6 [ default = 0];
+
   // REMOVED: replaced by column_stats, which maps by column ID,
   // whereas this older version mapped by index.
   // repeated int64 per_column_update_count = 2;
@@ -95,33 +99,4 @@ message TabletStatusPB {
   optional bytes end_key = 6;
   optional PartitionPB partition = 9;
   optional int64 estimated_on_disk_size = 7;
-}
-
-// Used to present the maintenance manager's internal state.
-message MaintenanceManagerStatusPB {
-  message MaintenanceOpPB {
-    required string name = 1;
-    // Number of times this operation is currently running.
-    required uint32 running = 2;
-    required bool runnable = 3;
-    required uint64 ram_anchored_bytes = 4;
-    required int64 logs_retained_bytes = 5;
-    required double perf_improvement = 6;
-  }
-
-  message CompletedOpPB {
-    required string name = 1;
-    required int32 duration_millis = 2;
-    // Number of seconds since this operation started.
-    required int32 secs_since_start = 3;
-  }
-
-  // The next operation that would run.
-  optional MaintenanceOpPB best_op = 1;
-
-  // List of all the operations.
-  repeated MaintenanceOpPB registered_operations = 2;
-
-  // This list isn't in order of anything. Can contain the same operation mutiple times.
-  repeated CompletedOpPB completed_operations = 3;
 }

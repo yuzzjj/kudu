@@ -41,12 +41,17 @@ class RowSetInfo {
                              std::vector<RowSetInfo>* min_key,
                              std::vector<RowSetInfo>* max_key);
 
+  int size_bytes() const { return size_bytes_; }
   int size_mb() const { return size_mb_; }
 
   // Return the value of the CDF at the minimum key of this candidate.
   double cdf_min_key() const { return cdf_min_key_; }
   // Return the value of the CDF at the maximum key of this candidate.
   double cdf_max_key() const { return cdf_max_key_; }
+
+  bool has_bounds() const { return has_bounds_; }
+  const std::string& min_key() const { return min_key_; }
+  const std::string& max_key() const { return max_key_; }
 
   // Return the "width" of the candidate rowset.
   //
@@ -76,8 +81,22 @@ class RowSetInfo {
   static void FinalizeCDFVector(std::vector<RowSetInfo>* vec,
                                 double quot);
 
-  RowSet* rowset_;
-  int size_mb_;
+  RowSet* const rowset_;
+
+  // Cached version of rowset_->EstimateOnDiskSize().
+  const int size_bytes_;
+
+  // The size in MB, already clamped so that all rowsets have size at least
+  // 1MB. This is cached to avoid the branch during the selection hot path.
+  const int size_mb_;
+
+  // True if the RowSet has known bounds.
+  // MemRowSets in particular do not.
+  bool has_bounds_;
+
+  // The bounds, if known.
+  std::string min_key_, max_key_;
+
   double cdf_min_key_, cdf_max_key_;
   double density_;
 };

@@ -20,8 +20,10 @@
 
 #include <glog/logging.h>
 #include <algorithm>
+#include <functional>
 #include <stdlib.h>
 #include <string>
+#include <vector>
 
 #include "kudu/cfile/cfile-test-base.h"
 #include "kudu/cfile/cfile_reader.h"
@@ -42,6 +44,7 @@ DEFINE_int32(cfile_test_block_size, 1024,
 
 using kudu::fs::ReadableBlock;
 using kudu::fs::WritableBlock;
+using std::unique_ptr;
 
 namespace kudu {
 namespace cfile {
@@ -211,6 +214,25 @@ class Int32DataGenerator : public DataGenerator<INT32, HAS_NULLS> {
   }
 };
 
+template<bool HAS_NULLS>
+class UInt64DataGenerator : public DataGenerator<UINT64, HAS_NULLS> {
+ public:
+  UInt64DataGenerator() {}
+  uint64_t BuildTestValue(size_t /*block_index*/, size_t value) OVERRIDE {
+    return value * 0x123456789abcdefULL;
+  }
+};
+
+template<bool HAS_NULLS>
+class Int64DataGenerator : public DataGenerator<INT64, HAS_NULLS> {
+ public:
+  Int64DataGenerator() {}
+  int64_t BuildTestValue(size_t /*block_index*/, size_t value) OVERRIDE {
+    int64_t r = (value * 0x123456789abcdefULL) & 0x7fffffffffffffffULL;
+    return value % 2 == 0 ? r : -r;
+  }
+};
+
 // Floating-point data generator.
 // This works for both floats and doubles.
 template<DataType DATA_TYPE, bool HAS_NULLS>
@@ -228,32 +250,27 @@ template<bool HAS_NULLS>
 class StringDataGenerator : public DataGenerator<STRING, HAS_NULLS> {
  public:
   explicit StringDataGenerator(const char* format)
-  : format_(format) {
+      : StringDataGenerator(
+          [=](size_t x) { return StringPrintf(format, x); }) {
+  }
+
+  explicit StringDataGenerator(std::function<std::string(size_t)> formatter)
+      : formatter_(std::move(formatter)) {
   }
 
   Slice BuildTestValue(size_t block_index, size_t value) OVERRIDE {
-    char *buf = data_buffer_[block_index].data;
-    int len = snprintf(buf, kItemBufferSize - 1, format_, value);
-    DCHECK_LT(len, kItemBufferSize);
-    return Slice(buf, len);
+    data_buffers_[block_index] = formatter_(value);
+    return Slice(data_buffers_[block_index]);
   }
 
   void Resize(size_t num_entries) OVERRIDE {
-    if (num_entries > this->block_entries()) {
-      data_buffer_.reset(new Buffer[num_entries]);
-    }
+    data_buffers_.resize(num_entries);
     DataGenerator<STRING, HAS_NULLS>::Resize(num_entries);
   }
 
  private:
-  static const int kItemBufferSize = 16;
-
-  struct Buffer {
-    char data[kItemBufferSize];
-  };
-
-  gscoped_array<Buffer> data_buffer_;
-  const char* format_;
+  std::vector<std::string> data_buffers_;
+  std::function<std::string(size_t)> formatter_;
 };
 
 // Class for generating strings that contain duplicate
@@ -295,16 +312,29 @@ class DuplicateStringDataGenerator : public DataGenerator<STRING, HAS_NULLS> {
   int num_;
 };
 
+// Generator for fully random int32 data.
+class RandomInt32DataGenerator : public DataGenerator<INT32, /* HAS_NULLS= */ false> {
+ public:
+  int32_t BuildTestValue(size_t /*block_index*/, size_t /*value*/) override {
+    return random();
+  }
+};
+
 class CFileTestBase : public KuduTest {
  public:
   void SetUp() OVERRIDE {
     KuduTest::SetUp();
 
-    fs_manager_.reset(new FsManager(env_.get(), GetTestPath("fs_root")));
+    fs_manager_.reset(new FsManager(env_, GetTestPath("fs_root")));
     ASSERT_OK(fs_manager_->CreateInitialFileSystemLayout());
     ASSERT_OK(fs_manager_->Open());
   }
 
+  // Place a ColumnBlock and SelectionVector into a context. This context will
+  // not support decoder evaluation.
+  ColumnMaterializationContext CreateNonDecoderEvalContext(ColumnBlock* cb, SelectionVector* sel) {
+    return ColumnMaterializationContext(0, nullptr, cb, sel);
+  }
  protected:
   enum Flags {
     NO_FLAGS = 0,
@@ -319,7 +349,7 @@ class CFileTestBase : public KuduTest {
                      int num_entries,
                      uint32_t flags,
                      BlockId* block_id) {
-    gscoped_ptr<WritableBlock> sink;
+    unique_ptr<WritableBlock> sink;
     ASSERT_OK(fs_manager_->CreateNewBlock(&sink));
     *block_id = sink->id();
     WriterOptions opts;
@@ -336,12 +366,14 @@ class CFileTestBase : public KuduTest {
     opts.storage_attributes.encoding = encoding;
     opts.storage_attributes.compression = compression;
     CFileWriter w(opts, GetTypeInfo(DataGeneratorType::kDataType),
-                  DataGeneratorType::has_nulls(), sink.Pass());
+                  DataGeneratorType::has_nulls(), std::move(sink));
 
     ASSERT_OK(w.Start());
 
-    // Append given number of values to the test tree
-    const size_t kBufferSize = 8192;
+    // Append given number of values to the test tree. We use 100 to match
+    // the output block size of compaction (kCompactionOutputBlockNumRows in
+    // compaction.cc, unfortunately not linkable from the cfile/ module)
+    const size_t kBufferSize = 100;
     size_t i = 0;
     while (i < num_entries) {
       int towrite = std::min(num_entries - i, kBufferSize);
@@ -391,13 +423,15 @@ SumType FastSum(const Indexable &data, size_t n) {
 }
 
 template<DataType Type, typename SumType>
-static void TimeReadFileForDataType(gscoped_ptr<CFileIterator> &iter, int &count) {
+void TimeReadFileForDataType(gscoped_ptr<CFileIterator> &iter, int &count) {
   ScopedColumnBlock<Type> cb(8192);
-
+  SelectionVector sel(cb.nrows());
+  ColumnMaterializationContext ctx(0, nullptr, &cb, &sel);
+  ctx.SetDecoderEvalNotSupported();
   SumType sum = 0;
   while (iter->HasNext()) {
     size_t n = cb.nrows();
-    ASSERT_OK_FAST(iter->CopyNextValues(&n, &cb));
+    ASSERT_OK_FAST(iter->CopyNextValues(&n, &ctx));
     sum += FastSum<ScopedColumnBlock<Type>, SumType>(cb, n);
     count += n;
     cb.arena()->Reset();
@@ -407,12 +441,15 @@ static void TimeReadFileForDataType(gscoped_ptr<CFileIterator> &iter, int &count
 }
 
 template<DataType Type>
-static void ReadBinaryFile(CFileIterator* iter, int* count) {
+void ReadBinaryFile(CFileIterator* iter, int* count) {
   ScopedColumnBlock<Type> cb(100);
+  SelectionVector sel(cb.nrows());
+  ColumnMaterializationContext ctx(0, nullptr, &cb, &sel);
+  ctx.SetDecoderEvalNotSupported();
   uint64_t sum_lens = 0;
   while (iter->HasNext()) {
     size_t n = cb.nrows();
-    ASSERT_OK_FAST(iter->CopyNextValues(&n, &cb));
+    ASSERT_OK_FAST(iter->CopyNextValues(&n, &ctx));
     for (int i = 0; i < n; i++) {
       sum_lens += cb[i].size();
     }
@@ -423,13 +460,13 @@ static void ReadBinaryFile(CFileIterator* iter, int* count) {
   LOG(INFO) << "Count: " << *count;
 }
 
-static void TimeReadFile(FsManager* fs_manager, const BlockId& block_id, size_t *count_ret) {
+void TimeReadFile(FsManager* fs_manager, const BlockId& block_id, size_t *count_ret) {
   Status s;
 
-  gscoped_ptr<fs::ReadableBlock> source;
+  unique_ptr<fs::ReadableBlock> source;
   ASSERT_OK(fs_manager->OpenBlock(block_id, &source));
-  gscoped_ptr<CFileReader> reader;
-  ASSERT_OK(CFileReader::Open(source.Pass(), ReaderOptions(), &reader));
+  unique_ptr<CFileReader> reader;
+  ASSERT_OK(CFileReader::Open(std::move(source), ReaderOptions(), &reader));
 
   gscoped_ptr<CFileIterator> iter;
   ASSERT_OK(reader->NewIterator(&iter, CFileReader::CACHE_BLOCK));
@@ -466,6 +503,16 @@ static void TimeReadFile(FsManager* fs_manager, const BlockId& block_id, size_t 
     case INT32:
     {
       TimeReadFileForDataType<INT32, int64_t>(iter, count);
+      break;
+    }
+    case UINT64:
+    {
+      TimeReadFileForDataType<UINT64, uint64_t>(iter, count);
+      break;
+    }
+    case INT64:
+    {
+      TimeReadFileForDataType<INT64, uint64_t>(iter, count);
       break;
     }
     case FLOAT:

@@ -17,8 +17,8 @@
 #ifndef KUDU_TSERVER_SCANNERS_H
 #define KUDU_TSERVER_SCANNERS_H
 
-#include <boost/thread/shared_mutex.hpp>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -33,7 +33,9 @@
 #include "kudu/util/memory/arena.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/mutex.h"
 #include "kudu/util/oid_generator.h"
+#include "kudu/util/rw_mutex.h"
 
 namespace kudu {
 
@@ -107,7 +109,7 @@ class ScannerManager {
 
   struct ScannerMapStripe {
     // Lock protecting the scanner map.
-    mutable boost::shared_mutex lock_;
+    mutable RWMutex lock_;
     // Map of the currently active scanners.
     ScannerMap scanners_by_id_;
   };
@@ -123,8 +125,8 @@ class ScannerManager {
   // If true, removal thread should shut itself down. Protected
   // by 'shutdown_lock_' and 'shutdown_cv_'.
   bool shutdown_;
-  mutable boost::mutex shutdown_lock_;
-  boost::condition_variable shutdown_cv_;
+  mutable Mutex shutdown_lock_;
+  ConditionVariable shutdown_cv_;
 
   std::vector<ScannerMapStripe*> scanner_maps_;
 
@@ -165,9 +167,9 @@ class ScopedUnregisterScanner {
 // An open scanner on the server side.
 class Scanner {
  public:
-  explicit Scanner(std::string id,
-                   const scoped_refptr<tablet::TabletPeer>& tablet_peer,
-                   std::string requestor_string, ScannerMetrics* metrics);
+  Scanner(std::string id,
+          const scoped_refptr<tablet::TabletPeer>& tablet_peer,
+          std::string requestor_string, ScannerMetrics* metrics);
   ~Scanner();
 
   // Attach an actual iterator and a ScanSpec to this Scanner.
@@ -179,7 +181,7 @@ class Scanner {
   // Once a Scanner is initialized, it is safe to assume that iter() and spec()
   // return non-NULL for the lifetime of the Scanner object.
   bool IsInitialized() const {
-    boost::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     return iter_ != NULL;
   }
 
@@ -212,9 +214,9 @@ class Scanner {
   // Return the ScanSpec associated with this Scanner.
   const ScanSpec& spec() const;
 
-  const std::string tablet_id() const {
+  const std::string& tablet_id() const {
     // scanners-test passes a null tablet_peer.
-    return tablet_peer_ ? tablet_peer_->tablet_id() : "null tablet";
+    return tablet_peer_ ? tablet_peer_->tablet_id() : kNullTabletId;
   }
 
   const scoped_refptr<tablet::TabletPeer>& tablet_peer() const { return tablet_peer_; }
@@ -223,20 +225,20 @@ class Scanner {
 
   // Returns the current call sequence ID of the scanner.
   uint32_t call_seq_id() const {
-    boost::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     return call_seq_id_;
   }
 
   // Increments the call sequence ID.
   void IncrementCallSeqId() {
-    boost::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     call_seq_id_ += 1;
   }
 
   // Return the delta from the last time this scan was updated to 'now'.
   MonoDelta TimeSinceLastAccess(const MonoTime& now) const {
-    boost::lock_guard<simple_spinlock> l(lock_);
-    return now.GetDeltaSince(last_access_time_);
+    std::lock_guard<simple_spinlock> l(lock_);
+    return now - last_access_time_;
   }
 
   // Returns the time this scan was started.
@@ -272,6 +274,8 @@ class Scanner {
 
  private:
   friend class ScannerManager;
+
+  static const std::string kNullTabletId;
 
   // The unique ID of this scanner.
   const std::string id_;

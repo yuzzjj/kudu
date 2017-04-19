@@ -19,15 +19,20 @@
 #ifndef KUDU_COMMON_WIRE_PROTOCOL_H
 #define KUDU_COMMON_WIRE_PROTOCOL_H
 
+#include <boost/optional.hpp>
 #include <vector>
 
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/util/status.h"
 
+using boost::optional;
+
 namespace kudu {
 
-class ConstContiguousRow;
+class Arena;
+class ColumnPredicate;
 class ColumnSchema;
+class ConstContiguousRow;
 class faststring;
 class HostPort;
 class RowBlock;
@@ -58,14 +63,16 @@ Status AddHostPortPBs(const std::vector<Sockaddr>& addrs,
 enum SchemaPBConversionFlags {
   SCHEMA_PB_WITHOUT_IDS = 1 << 0,
   SCHEMA_PB_WITHOUT_STORAGE_ATTRIBUTES = 1 << 1,
+
+  // When serializing, only write the 'read_default' value into the
+  // protobuf. Used when sending schemas from the client to the master
+  // for create/alter table.
+  SCHEMA_PB_WITHOUT_WRITE_DEFAULT = 1 << 2,
 };
 
 // Convert the specified schema to protobuf.
 // 'flags' is a bitfield of SchemaPBConversionFlags values.
 Status SchemaToPB(const Schema& schema, SchemaPB* pb, int flags = 0);
-
-// Convert the specified schema to protobuf without column IDs.
-Status SchemaToPBWithoutIds(const Schema& schema, SchemaPB *pb);
 
 // Returns the Schema created from the specified protobuf.
 // If the schema is invalid, return a non-OK status.
@@ -94,6 +101,17 @@ Status SchemaToColumnPBs(
   const Schema& schema,
   google::protobuf::RepeatedPtrField<ColumnSchemaPB>* cols,
   int flags = 0);
+
+// Convert the column predicate to protobuf.
+void ColumnPredicateToPB(const ColumnPredicate& predicate, ColumnPredicatePB* pb);
+
+// Convert a column predicate protobuf to a column predicate. The resulting
+// predicate is stored in the 'predicate' out parameter, if the result is
+// successful.
+Status ColumnPredicateFromPB(const Schema& schema,
+                             Arena* arena,
+                             const ColumnPredicatePB& pb,
+                             optional<ColumnPredicate>* predicate);
 
 // Encode the given row block into the provided protobuf and data buffers.
 //

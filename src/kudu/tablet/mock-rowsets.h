@@ -18,6 +18,7 @@
 #define KUDU_TABLET_MOCK_ROWSETS_H
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -45,9 +46,10 @@ class MockRowSet : public RowSet {
     LOG(FATAL) << "Unimplemented";
     return Status::OK();
   }
-  virtual Status NewRowIterator(const Schema *projection,
-                                const MvccSnapshot &snap,
-                                gscoped_ptr<RowwiseIterator>* out) const OVERRIDE {
+  virtual Status NewRowIterator(const Schema* /*projection*/,
+                                const MvccSnapshot& /*snap*/,
+                                OrderMode /*order*/,
+                                gscoped_ptr<RowwiseIterator>* /*out*/) const OVERRIDE {
     LOG(FATAL) << "Unimplemented";
     return Status::OK();
   }
@@ -77,14 +79,12 @@ class MockRowSet : public RowSet {
     LOG(FATAL) << "Unimplemented";
     return 0;
   }
-  virtual boost::mutex *compact_flush_lock() OVERRIDE {
+  virtual std::mutex *compact_flush_lock() OVERRIDE {
     LOG(FATAL) << "Unimplemented";
     return NULL;
   }
   virtual std::shared_ptr<RowSetMetadata> metadata() OVERRIDE {
-    LOG(FATAL) << "Unimplemented";
-    return std::shared_ptr<RowSetMetadata>(
-      reinterpret_cast<RowSetMetadata *>(NULL));
+    return NULL;
   }
 
   virtual size_t DeltaMemStoreSize() const OVERRIDE {
@@ -118,6 +118,27 @@ class MockRowSet : public RowSet {
     return Status::OK();
   }
 
+  virtual Status EstimateBytesInPotentiallyAncientUndoDeltas(Timestamp /*ancient_history_mark*/,
+                                                             int64_t* /*bytes*/) OVERRIDE {
+    LOG(FATAL) << "Unimplemented";
+    return Status::OK();
+  }
+
+  virtual Status InitUndoDeltas(Timestamp /*ancient_history_mark*/,
+                                MonoTime /*deadline*/,
+                                int64_t* /*delta_blocks_initialized*/,
+                                int64_t* /*bytes_in_ancient_undos*/) OVERRIDE {
+    LOG(FATAL) << "Unimplemented";
+    return Status::OK();
+  }
+
+  virtual Status DeleteAncientUndoDeltas(Timestamp /*ancient_history_mark*/,
+                                         int64_t* /*blocks_deleted*/,
+                                         int64_t* /*bytes_deleted*/) OVERRIDE {
+    LOG(FATAL) << "Unimplemented";
+    return Status::OK();
+  }
+
   virtual bool IsAvailableForCompaction() OVERRIDE {
     return true;
   }
@@ -132,10 +153,10 @@ class MockDiskRowSet : public MockRowSet {
         last_key_(std::move(last_key)),
         size_(size) {}
 
-  virtual Status GetBounds(Slice *min_encoded_key,
-                           Slice *max_encoded_key) const OVERRIDE {
-    *min_encoded_key = Slice(first_key_);
-    *max_encoded_key = Slice(last_key_);
+  virtual Status GetBounds(std::string* min_encoded_key,
+                           std::string* max_encoded_key) const OVERRIDE {
+    *min_encoded_key = first_key_;
+    *max_encoded_key = last_key_;
     return Status::OK();
   }
 
@@ -158,8 +179,8 @@ class MockDiskRowSet : public MockRowSet {
 // Mock which acts like a MemRowSet and has no known bounds.
 class MockMemRowSet : public MockRowSet {
  public:
-  virtual Status GetBounds(Slice *min_encoded_key,
-                           Slice *max_encoded_key) const OVERRIDE {
+  virtual Status GetBounds(std::string* min_encoded_key,
+                           std::string* max_encoded_key) const OVERRIDE {
     return Status::NotSupported("");
   }
 

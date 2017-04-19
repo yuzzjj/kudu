@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <boost/thread/locks.hpp>
-#include <boost/thread/mutex.hpp>
 #include <mutex>
 #include <sched.h>
 #include <string>
@@ -24,14 +22,18 @@
 
 #include "kudu/cfile/bloomfile.h"
 #include "kudu/cfile/cfile_writer.h"
+#include "kudu/gutil/atomicops.h"
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/sysinfo.h"
 #include "kudu/util/coding.h"
 #include "kudu/util/hexdump.h"
 #include "kudu/util/malloc.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/threadlocal_cache.h"
 
 DECLARE_bool(cfile_lazy_open);
+
+using std::unique_ptr;
 
 namespace kudu {
 namespace cfile {
@@ -40,11 +42,41 @@ using fs::ReadableBlock;
 using fs::ScopedWritableBlockCloser;
 using fs::WritableBlock;
 
+// Generator for BloomFileReader::instance_nonce_.
+static Atomic64 g_next_nonce = 0;
+
+namespace {
+
+// Frequently, a thread processing a batch of operations will consult the same BloomFile
+// many times in a row. So, we keep a thread-local cache of the state for recently-accessed
+// BloomFileReaders so that we can avoid doing repetitive work.
+class BloomCacheItem {
+ public:
+  explicit BloomCacheItem(CFileReader* reader)
+      : index_iter(reader, reader->validx_root()),
+        cur_block_pointer(0, 0) {
+  }
+
+  // The IndexTreeIterator used to seek the BloomFileReader last time it was accessed.
+  IndexTreeIterator index_iter;
+
+  // The block pointer to the specific block we read last time we used this bloom reader.
+  BlockPointer cur_block_pointer;
+  // The block handle and parsed BloomFilter corresponding to cur_block_pointer.
+  BlockHandle cur_block_handle;
+  BloomFilter cur_bloom;
+
+ private:
+  DISALLOW_COPY_AND_ASSIGN(BloomCacheItem);
+};
+using BloomCacheTLC = ThreadLocalCache<uint64_t, BloomCacheItem>;
+} // anonymous namespace
+
 ////////////////////////////////////////////////////////////
 // Writer
 ////////////////////////////////////////////////////////////
 
-BloomFileWriter::BloomFileWriter(gscoped_ptr<WritableBlock> block,
+BloomFileWriter::BloomFileWriter(unique_ptr<WritableBlock> block,
                                  const BloomFilterSizing &sizing)
   : bloom_builder_(sizing) {
   cfile::WriterOptions opts;
@@ -54,7 +86,7 @@ BloomFileWriter::BloomFileWriter(gscoped_ptr<WritableBlock> block,
   // bloom filters are high-entropy data structures by their nature.
   opts.storage_attributes.encoding  = PLAIN_ENCODING;
   opts.storage_attributes.compression = NO_COMPRESSION;
-  writer_.reset(new cfile::CFileWriter(opts, GetTypeInfo(BINARY), false, block.Pass()));
+  writer_.reset(new cfile::CFileWriter(opts, GetTypeInfo(BINARY), false, std::move(block)));
 }
 
 Status BloomFileWriter::Start() {
@@ -94,11 +126,13 @@ Status BloomFileWriter::AppendKeys(
     if (PREDICT_FALSE(bloom_builder_.count() >= bloom_builder_.expected_count())) {
       RETURN_NOT_OK(FinishCurrentBloomBlock());
 
-      // Copy the next key as the first key of the next block.
-      // Doing this here avoids having to do it in normal code path of the loop.
+      // Update the last key and set the next key as the first key of the next block.
+      // Setting the first key here avoids having to do it in normal code path of the loop.
+      last_key_.assign_copy(keys[i].data(), keys[i].size());
       if (i < n_keys - 1) {
         first_key_.assign_copy(keys[i + 1].data(), keys[i + 1].size());
       }
+
     }
   }
 
@@ -106,14 +140,15 @@ Status BloomFileWriter::AppendKeys(
 }
 
 Status BloomFileWriter::FinishCurrentBloomBlock() {
-  VLOG(1) << "Appending a new bloom block, first_key=" << Slice(first_key_).ToDebugString();
+  VLOG(1) << "Appending a new bloom block, first_key="
+          << KUDU_REDACT(Slice(first_key_).ToDebugString());
 
   // Encode the header.
   BloomBlockHeaderPB hdr;
   hdr.set_num_hash_functions(bloom_builder_.n_hashes());
   faststring hdr_str;
   PutFixed32(&hdr_str, hdr.ByteSize());
-  CHECK(pb_util::AppendToString(hdr, &hdr_str));
+  pb_util::AppendToString(hdr, &hdr_str);
 
   // The data is the concatenation of the header and the bloom itself.
   vector<Slice> slices;
@@ -122,7 +157,8 @@ Status BloomFileWriter::FinishCurrentBloomBlock() {
 
   // Append to the file.
   Slice start_key(first_key_);
-  RETURN_NOT_OK(writer_->AppendRawBlock(slices, 0, &start_key, "bloom block"));
+  Slice last_key(last_key_);
+  RETURN_NOT_OK(writer_->AppendRawBlock(slices, 0, &start_key, last_key, "bloom block"));
 
   bloom_builder_.Clear();
 
@@ -137,37 +173,41 @@ Status BloomFileWriter::FinishCurrentBloomBlock() {
 // Reader
 ////////////////////////////////////////////////////////////
 
-Status BloomFileReader::Open(gscoped_ptr<ReadableBlock> block,
-                             const ReaderOptions& options,
+Status BloomFileReader::Open(unique_ptr<ReadableBlock> block,
+                             ReaderOptions options,
                              gscoped_ptr<BloomFileReader> *reader) {
   gscoped_ptr<BloomFileReader> bf_reader;
-  RETURN_NOT_OK(OpenNoInit(block.Pass(), options, &bf_reader));
+  RETURN_NOT_OK(OpenNoInit(std::move(block),
+                           std::move(options), &bf_reader));
   RETURN_NOT_OK(bf_reader->Init());
 
-  *reader = bf_reader.Pass();
+  *reader = std::move(bf_reader);
   return Status::OK();
 }
 
-Status BloomFileReader::OpenNoInit(gscoped_ptr<ReadableBlock> block,
-                                   const ReaderOptions& options,
+Status BloomFileReader::OpenNoInit(unique_ptr<ReadableBlock> block,
+                                   ReaderOptions options,
                                    gscoped_ptr<BloomFileReader> *reader) {
-  gscoped_ptr<CFileReader> cf_reader;
-  RETURN_NOT_OK(CFileReader::OpenNoInit(block.Pass(), options, &cf_reader));
+  unique_ptr<CFileReader> cf_reader;
+  RETURN_NOT_OK(CFileReader::OpenNoInit(std::move(block),
+                                        options, &cf_reader));
   gscoped_ptr<BloomFileReader> bf_reader(new BloomFileReader(
-      cf_reader.Pass(), options));
+      std::move(cf_reader), std::move(options)));
   if (!FLAGS_cfile_lazy_open) {
     RETURN_NOT_OK(bf_reader->Init());
   }
 
-  *reader = bf_reader.Pass();
+  *reader = std::move(bf_reader);
   return Status::OK();
 }
 
-BloomFileReader::BloomFileReader(gscoped_ptr<CFileReader> reader,
-                                 const ReaderOptions& options)
-  : reader_(reader.Pass()),
-    mem_consumption_(options.parent_mem_tracker,
-                     memory_footprint_excluding_reader()) {
+BloomFileReader::BloomFileReader(unique_ptr<CFileReader> reader,
+                                 ReaderOptions options)
+
+    : instance_nonce_(base::subtle::NoBarrier_AtomicIncrement(&g_next_nonce, 1)),
+      reader_(std::move(reader)),
+      mem_consumption_(std::move(options.parent_mem_tracker),
+                       memory_footprint_excluding_reader()) {
 }
 
 Status BloomFileReader::Init() {
@@ -188,22 +228,6 @@ Status BloomFileReader::InitOnce() {
     return Status::Corruption("bloom file missing value index",
                               reader_->ToString());
   }
-
-  BlockPointer validx_root = reader_->validx_root();
-
-  // Ugly hack: create a per-cpu iterator.
-  // Instead this should be threadlocal, or allow us to just
-  // stack-allocate these things more smartly!
-  int n_cpus = base::MaxCPUIndex() + 1;
-  for (int i = 0; i < n_cpus; i++) {
-    index_iters_.push_back(
-      IndexTreeIterator::Create(reader_.get(), validx_root));
-  }
-  iter_locks_.reset(new padded_spinlock[n_cpus]);
-
-  // The memory footprint has changed.
-  mem_consumption_.Reset(memory_footprint_excluding_reader());
-
   return Status::OK();
 }
 
@@ -240,72 +264,58 @@ Status BloomFileReader::CheckKeyPresent(const BloomKeyProbe &probe,
                                         bool *maybe_present) {
   DCHECK(init_once_.initted());
 
-#if defined(__linux__)
-  int cpu = sched_getcpu();
-#else
-  // Use just one lock if on OS X.
-  int cpu = 0;
-#endif
-  BlockPointer bblk_ptr;
-  {
-    std::unique_lock<simple_spinlock> lock;
-    while (true) {
-      std::unique_lock<simple_spinlock> l(iter_locks_[cpu], std::try_to_lock);
-      if (l.owns_lock()) {
-        lock.swap(l);
-        break;
-      }
-      cpu = (cpu + 1) % index_iters_.size();
-    }
+  // Since we frequently will access the same BloomFile many times in a row
+  // when processing a batch of operations, we put our state in a small thread-local
+  // cache, keyed by the BloomFileReader's nonce. We use this nonce rather than
+  // the BlockID because it's possible that a BloomFile could be closed and
+  // re-opened, in which case we don't want to use our previous cache entry,
+  // which now points to a destructed CFileReader.
+  auto* tlc = BloomCacheTLC::GetInstance();
+  BloomCacheItem* bci = tlc->Lookup(instance_nonce_);
+  // If we didn't hit in the cache, make a new cache entry and instantiate a reader.
+  if (!bci) {
+    bci = tlc->EmplaceNew(instance_nonce_, reader_.get());
+  }
+  DCHECK_EQ(reader_.get(), bci->index_iter.cfile_reader())
+      << "Cached index reader does not match expected instance";
 
-    cfile::IndexTreeIterator *index_iter = &index_iters_[cpu];
+  IndexTreeIterator* index_iter = &bci->index_iter;
+  Status s = index_iter->SeekAtOrBefore(probe.key());
+  if (PREDICT_FALSE(s.IsNotFound())) {
+    // Seek to before the first entry in the file.
+    *maybe_present = false;
+    return Status::OK();
+  }
+  RETURN_NOT_OK(s);
 
-    Status s = index_iter->SeekAtOrBefore(probe.key());
-    if (PREDICT_FALSE(s.IsNotFound())) {
-      // Seek to before the first entry in the file.
-      *maybe_present = false;
-      return Status::OK();
-    }
-    RETURN_NOT_OK(s);
+  // Successfully found the pointer to the bloom block.
+  BlockPointer bblk_ptr = index_iter->GetCurrentBlockPointer();
 
-    // Successfully found the pointer to the bloom block. Read it.
-    bblk_ptr = index_iter->GetCurrentBlockPointer();
+  // If the previous lookup from this bloom on this thread seeked to a different
+  // block in the BloomFile, we need to read the correct block and re-hydrate the
+  // BloomFilter instance.
+  if (!bci->cur_block_pointer.Equals(bblk_ptr)) {
+    BlockHandle dblk_data;
+    RETURN_NOT_OK(reader_->ReadBlock(bblk_ptr, CFileReader::CACHE_BLOCK, &dblk_data));
+
+    // Parse the header in the block.
+    BloomBlockHeaderPB hdr;
+    Slice bloom_data;
+    RETURN_NOT_OK(ParseBlockHeader(dblk_data.data(), &hdr, &bloom_data));
+
+    // Save the data back into our threadlocal cache.
+    bci->cur_bloom = BloomFilter(bloom_data, hdr.num_hash_functions());
+    bci->cur_block_pointer = bblk_ptr;
+    bci->cur_block_handle = std::move(dblk_data);
   }
 
-  BlockHandle dblk_data;
-  RETURN_NOT_OK(reader_->ReadBlock(bblk_ptr, CFileReader::CACHE_BLOCK, &dblk_data));
-
-  // Parse the header in the block.
-  BloomBlockHeaderPB hdr;
-  Slice bloom_data;
-  RETURN_NOT_OK(ParseBlockHeader(dblk_data.data(), &hdr, &bloom_data));
-
   // Actually check the bloom filter.
-  BloomFilter bf(bloom_data, hdr.num_hash_functions());
-  *maybe_present = bf.MayContainKey(probe);
+  *maybe_present = bci->cur_bloom.MayContainKey(probe);
   return Status::OK();
 }
 
 size_t BloomFileReader::memory_footprint_excluding_reader() const {
-  size_t size = kudu_malloc_usable_size(this);
-
-  size += init_once_.memory_footprint_excluding_this();
-
-  // This seems to be the easiest way to get a heap pointer to the ptr_vector.
-  //
-  // TODO: Track the iterators' memory footprint? May change with every seek;
-  // not clear if it's worth doing.
-  size += kudu_malloc_usable_size(
-      const_cast<BloomFileReader*>(this)->index_iters_.c_array());
-  for (int i = 0; i < index_iters_.size(); i++) {
-    size += kudu_malloc_usable_size(&index_iters_[i]);
-  }
-
-  if (iter_locks_) {
-    size += kudu_malloc_usable_size(iter_locks_.get());
-  }
-
-  return size;
+  return kudu_malloc_usable_size(this) + init_once_.memory_footprint_excluding_this();
 }
 
 } // namespace cfile

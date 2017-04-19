@@ -18,16 +18,17 @@
 #include "kudu/master/master.h"
 
 #include <algorithm>
-#include <boost/bind.hpp>
-#include <glog/logging.h>
-#include <list>
 #include <memory>
 #include <vector>
+
+#include <boost/bind.hpp>
+#include <glog/logging.h>
 
 #include "kudu/cfile/block_cache.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/catalog_manager.h"
+#include "kudu/master/master_cert_authority.h"
 #include "kudu/master/master_service.h"
 #include "kudu/master/master.proxy.h"
 #include "kudu/master/master-path-handlers.h"
@@ -35,18 +36,35 @@
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/service_if.h"
 #include "kudu/rpc/service_pool.h"
+#include "kudu/security/token_signer.h"
+#include "kudu/security/token_signing_key.h"
 #include "kudu/server/rpc_server.h"
-#include "kudu/tablet/maintenance_manager.h"
+#include "kudu/tserver/tablet_copy_service.h"
 #include "kudu/tserver/tablet_service.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/maintenance_manager.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/status.h"
 #include "kudu/util/threadpool.h"
+#include "kudu/util/version_info.h"
 
 DEFINE_int32(master_registration_rpc_timeout_ms, 1500,
              "Timeout for retrieving master registration over RPC.");
 TAG_FLAG(master_registration_rpc_timeout_ms, experimental);
+
+DEFINE_int64(tsk_rotation_seconds, 60 * 60 * 24 * 1,
+             "Number of seconds between consecutive activations of newly "
+             "generated TSKs (Token Signing Keys).");
+TAG_FLAG(tsk_rotation_seconds, advanced);
+TAG_FLAG(tsk_rotation_seconds, experimental);
+
+DEFINE_int64(authn_token_validity_seconds, 60 * 60 * 24 * 7,
+             "Period of time for which an issued authentication token is valid. "
+             "It's not possible to renew a token, hence the token validity "
+             "interval defines the longest possible lifetime of an external "
+             "job which uses a token for authentication.");
+TAG_FLAG(authn_token_validity_seconds, experimental);
 
 using std::min;
 using std::shared_ptr;
@@ -54,7 +72,10 @@ using std::vector;
 
 using kudu::consensus::RaftPeerPB;
 using kudu::rpc::ServiceIf;
+using kudu::security::TokenSigner;
+using kudu::security::TokenSigningPrivateKey;
 using kudu::tserver::ConsensusServiceImpl;
+using kudu::tserver::TabletCopyServiceImpl;
 using strings::Substitute;
 
 namespace kudu {
@@ -91,8 +112,20 @@ Status Master::Init() {
 
   RETURN_NOT_OK(ServerBase::Init());
 
-  RETURN_NOT_OK(path_handlers_->Register(web_server_.get()));
+  if (web_server_) {
+    RETURN_NOT_OK(path_handlers_->Register(web_server_.get()));
+  }
 
+  // The certificate authority object is initialized upon loading
+  // CA private key and certificate from the system table when the server
+  // becomes a leader.
+  cert_authority_.reset(new MasterCertAuthority(fs_manager_->uuid()));
+
+  // The TokenSigner loads its keys during catalog manager initialization.
+  token_signer_.reset(new TokenSigner(
+      FLAGS_authn_token_validity_seconds,
+      FLAGS_tsk_rotation_seconds,
+      messenger_->shared_token_verifier()));
   state_ = kInitialized;
   return Status::OK();
 }
@@ -107,14 +140,17 @@ Status Master::Start() {
 Status Master::StartAsync() {
   CHECK_EQ(kInitialized, state_);
 
-  RETURN_NOT_OK(maintenance_manager_->Init());
+  RETURN_NOT_OK(maintenance_manager_->Init(fs_manager_->uuid()));
 
   gscoped_ptr<ServiceIf> impl(new MasterServiceImpl(this));
-  gscoped_ptr<ServiceIf> consensus_service(new ConsensusServiceImpl(metric_entity(),
-                                                                    catalog_manager_.get()));
+  gscoped_ptr<ServiceIf> consensus_service(new ConsensusServiceImpl(
+      this, catalog_manager_.get()));
+  gscoped_ptr<ServiceIf> tablet_copy_service(new TabletCopyServiceImpl(
+      this, catalog_manager_.get()));
 
-  RETURN_NOT_OK(ServerBase::RegisterService(impl.Pass()));
-  RETURN_NOT_OK(ServerBase::RegisterService(consensus_service.Pass()));
+  RETURN_NOT_OK(ServerBase::RegisterService(std::move(impl)));
+  RETURN_NOT_OK(ServerBase::RegisterService(std::move(consensus_service)));
+  RETURN_NOT_OK(ServerBase::RegisterService(std::move(tablet_copy_service)));
   RETURN_NOT_OK(ServerBase::Start());
 
   // Now that we've bound, construct our ServerRegistrationPB.
@@ -146,7 +182,7 @@ Status Master::InitCatalogManager() {
   return Status::OK();
 }
 
-Status Master::WaitForCatalogManagerInit() {
+Status Master::WaitForCatalogManagerInit() const {
   CHECK_EQ(state_, kRunning);
 
   return init_status_.Get();
@@ -154,17 +190,19 @@ Status Master::WaitForCatalogManagerInit() {
 
 Status Master::WaitUntilCatalogManagerIsLeaderAndReadyForTests(const MonoDelta& timeout) {
   Status s;
-  MonoTime start = MonoTime::Now(MonoTime::FINE);
+  MonoTime start = MonoTime::Now();
   int backoff_ms = 1;
   const int kMaxBackoffMs = 256;
   do {
-    s = catalog_manager_->CheckIsLeaderAndReady();
-    if (s.ok()) {
-      return Status::OK();
+    {
+      CatalogManager::ScopedLeaderSharedLock l(catalog_manager_.get());
+      if (l.first_failed_status().ok()) {
+        return Status::OK();
+      }
     }
     SleepFor(MonoDelta::FromMilliseconds(backoff_ms));
     backoff_ms = min(backoff_ms << 1, kMaxBackoffMs);
-  } while (MonoTime::Now(MonoTime::FINE).GetDeltaSince(start).LessThan(timeout));
+  } while (MonoTime::Now() < (start + timeout));
   return Status::TimedOut("Maximum time exceeded waiting for master leadership",
                           s.ToString());
 }
@@ -197,9 +235,14 @@ Status Master::InitMasterRegistration() {
   RETURN_NOT_OK_PREPEND(rpc_server()->GetBoundAddresses(&rpc_addrs),
                         "Couldn't get RPC addresses");
   RETURN_NOT_OK(AddHostPortPBs(rpc_addrs, reg.mutable_rpc_addresses()));
-  vector<Sockaddr> http_addrs;
-  web_server()->GetBoundAddresses(&http_addrs);
-  RETURN_NOT_OK(AddHostPortPBs(http_addrs, reg.mutable_http_addresses()));
+
+  if (web_server()) {
+    vector<Sockaddr> http_addrs;
+    web_server()->GetBoundAddresses(&http_addrs);
+    RETURN_NOT_OK(AddHostPortPBs(http_addrs, reg.mutable_http_addresses()));
+    reg.set_https_enabled(web_server()->IsSecure());
+  }
+  reg.set_software_version(VersionInfo::GetShortVersionString());
 
   registration_.Swap(&reg);
   registration_initialized_.store(true);

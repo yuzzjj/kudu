@@ -19,7 +19,11 @@
 
 import itertools
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    # numpy is not firmly required
+    np = None
 
 import sys
 import six
@@ -29,12 +33,15 @@ from six import BytesIO, StringIO, string_types as py_string
 PY26 = sys.version_info[:2] == (2, 6)
 PY2 = sys.version_info[0] == 2
 
-
-if PY26:
-    import unittest2 as unittest
-else:
-    import unittest
-
+try:
+    if PY26:
+        import unittest2 as unittest
+    else:
+        import unittest
+except ImportError:
+    # If we can't import 'unittest', then our tests won't be able
+    # to run. But, that's fine.
+    pass
 
 if PY2:
     import cPickle
@@ -62,6 +69,10 @@ if PY2:
 
     def frombytes(o):
         return o
+
+    def dict_iter(o):
+        return o.items()
+
 else:
     unicode_type = str
     def lzip(*x):
@@ -82,5 +93,10 @@ else:
     def frombytes(o):
         return o.decode('utf8')
 
+    def dict_iter(o):
+        return list(o.items())
 
-integer_types = six.integer_types + (np.integer,)
+
+integer_types = six.integer_types
+if np is not None:
+    integer_types += (np.integer,)

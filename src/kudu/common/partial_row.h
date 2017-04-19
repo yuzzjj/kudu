@@ -24,6 +24,7 @@
 #ifdef KUDU_HEADERS_NO_STUBS
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
+#include <gtest/gtest_prod.h>
 #else
 // This is a poor module interdependency, but the stubs are header-only and
 // it's only for exported header builds, so we'll make an exception.
@@ -33,6 +34,7 @@
 #include "kudu/util/kudu_export.h"
 #include "kudu/util/slice.h"
 
+/// @cond
 namespace kudu {
 class ColumnSchema;
 namespace client {
@@ -41,161 +43,451 @@ template<typename KeyTypeWrapper> struct SliceKeysTestSetup;
 template<typename KeyTypeWrapper> struct IntKeysTestSetup;
 } // namespace client
 
+namespace tablet {
+  template<typename KeyTypeWrapper> struct SliceTypeRowOps;
+  template<typename KeyTypeWrapper> struct NumTypeRowOps;
+} // namespace tablet
+
+/// @endcond
+
 class Schema;
 class PartialRowPB;
 
-// A row which may only contain values for a subset of the columns.
-// This type contains a normal contiguous row, plus a bitfield indicating
-// which columns have been set. Additionally, this type may optionally own
-// copies of indirect data for variable length columns.
+/// @brief A row which may only contain values for a subset of the columns.
+///
+/// This object contains a normal contiguous row, plus a bitfield indicating
+/// which columns have been set. Additionally, this type may optionally own
+/// copies of indirect data for variable length columns.
 class KUDU_EXPORT KuduPartialRow {
  public:
-  // The given Schema object must remain valid for the lifetime of this
-  // row.
+  /// @param [in] schema
+  ///   Schema to use for the row. The given Schema object must remain valid
+  ///   for the lifetime of this row.
   explicit KuduPartialRow(const Schema* schema);
+
   virtual ~KuduPartialRow();
 
+  /// Create a copy of KuduPartialRow instance.
+  ///
+  /// @param [in] other
+  ///   KuduPartialRow instance to copy from.
   KuduPartialRow(const KuduPartialRow& other);
 
+  /// Overwrite this KuduPartialRow instance with data from other instance.
+  ///
+  /// @param [in] other
+  ///   KuduPartialRow instance to assign from.
+  /// @return Reference to the updated object.
   KuduPartialRow& operator=(KuduPartialRow other);
 
-  //------------------------------------------------------------
-  // Setters
-  //------------------------------------------------------------
-
+  /// @name Setters for integral type columns by name.
+  ///
+  /// Set value for a column by name.
+  ///
+  /// @param [in] col_name
+  ///   Name of the target column.
+  /// @param [in] val
+  ///   The value to set.
+  /// @return Operation result status.
+  ///
+  ///@{
   Status SetBool(const Slice& col_name, bool val) WARN_UNUSED_RESULT;
 
   Status SetInt8(const Slice& col_name, int8_t val) WARN_UNUSED_RESULT;
   Status SetInt16(const Slice& col_name, int16_t val) WARN_UNUSED_RESULT;
   Status SetInt32(const Slice& col_name, int32_t val) WARN_UNUSED_RESULT;
   Status SetInt64(const Slice& col_name, int64_t val) WARN_UNUSED_RESULT;
-  Status SetTimestamp(const Slice& col_name, int64_t micros_since_utc_epoch) WARN_UNUSED_RESULT;
+  Status SetUnixTimeMicros(const Slice& col_name,
+                           int64_t micros_since_utc_epoch) WARN_UNUSED_RESULT;
 
   Status SetFloat(const Slice& col_name, float val) WARN_UNUSED_RESULT;
   Status SetDouble(const Slice& col_name, double val) WARN_UNUSED_RESULT;
+  ///@}
 
-  // Same as above setters, but with numeric column indexes.
-  // These are faster since they avoid a hashmap lookup, so should
-  // be preferred in performance-sensitive code (eg bulk loaders).
+  /// @name Setters for integral type columns by index.
+  ///
+  /// Set value for a column by index.
+  ///
+  /// These setters are the same as corresponding column-name-based setters,
+  /// but with numeric column indexes. These are faster since they avoid
+  /// hashmap lookups, so should be preferred in performance-sensitive code
+  /// (e.g. bulk loaders).
+  ///
+  /// @param [in] col_idx
+  ///   The index of the target column.
+  /// @param [in] val
+  ///   The value to set.
+  /// @return Operation result status.
+  ///
+  ///@{
   Status SetBool(int col_idx, bool val) WARN_UNUSED_RESULT;
 
   Status SetInt8(int col_idx, int8_t val) WARN_UNUSED_RESULT;
   Status SetInt16(int col_idx, int16_t val) WARN_UNUSED_RESULT;
   Status SetInt32(int col_idx, int32_t val) WARN_UNUSED_RESULT;
   Status SetInt64(int col_idx, int64_t val) WARN_UNUSED_RESULT;
-  Status SetTimestamp(int col_idx, int64_t micros_since_utc_epoch) WARN_UNUSED_RESULT;
+  Status SetUnixTimeMicros(int col_idx, int64_t micros_since_utc_epoch) WARN_UNUSED_RESULT;
 
   Status SetFloat(int col_idx, float val) WARN_UNUSED_RESULT;
   Status SetDouble(int col_idx, double val) WARN_UNUSED_RESULT;
+  ///@}
 
-  // Sets the string/binary value but does not copy the value. The slice
-  // must remain valid until the call to AppendToPB().
-  Status SetString(const Slice& col_name, const Slice& val) WARN_UNUSED_RESULT;
-  Status SetString(int col_idx, const Slice& val) WARN_UNUSED_RESULT;
+  /// @name Setters for binary/string columns by name (copying).
+  ///
+  /// Set the binary/string value for a column by name, copying the specified
+  /// data immediately.
+  ///
+  /// @note The copying behavior is new for these methods starting Kudu 0.10.
+  ///   Prior to Kudu 0.10, these methods behaved like
+  ///   KuduPartialRow::SetStringNoCopy() and KuduPartialRow::SetBinaryNoCopy()
+  ///   correspondingly.
+  ///
+  /// @param [in] col_name
+  ///   Name of the target column.
+  /// @param [in] val
+  ///   The value to set.
+  /// @return Operation result status.
+  ///
+  ///@{
   Status SetBinary(const Slice& col_name, const Slice& val) WARN_UNUSED_RESULT;
+  Status SetString(const Slice& col_name, const Slice& val) WARN_UNUSED_RESULT;
+  ///@}
+
+  /// @name Setters for binary/string columns by index (copying).
+  ///
+  /// Set the binary/string value for a column by index, copying the specified
+  /// data immediately.
+  ///
+  /// These setters are the same as the corresponding column-name-based setters,
+  /// but with numeric column indexes. These are faster since they avoid
+  /// hashmap lookups, so should be preferred in performance-sensitive code
+  /// (e.g. bulk loaders).
+  ///
+  /// @note The copying behavior is new for these methods starting Kudu 0.10.
+  ///   Prior to Kudu 0.10, these methods behaved like
+  ///   KuduPartialRow::SetStringNoCopy() and KuduPartialRow::SetBinaryNoCopy()
+  ///   correspondingly.
+  ///
+  /// @param [in] col_idx
+  ///   The index of the target column.
+  /// @param [in] val
+  ///   The value to set.
+  /// @return Operation result status.
+  ///
+  ///@{
   Status SetBinary(int col_idx, const Slice& val) WARN_UNUSED_RESULT;
+  Status SetString(int col_idx, const Slice& val) WARN_UNUSED_RESULT;
+  ///@}
 
-  // Copies 'val' immediately.
-  Status SetStringCopy(const Slice& col_name, const Slice& val) WARN_UNUSED_RESULT;
-  Status SetStringCopy(int col_idx, const Slice& val) WARN_UNUSED_RESULT;
+  /// @name Setters for binary/string columns by name (copying).
+  ///
+  /// Set the binary/string value for a column by name, copying the specified
+  /// data immediately.
+  ///
+  /// @param [in] col_name
+  ///   Name of the target column.
+  /// @param [in] val
+  ///   The value to set.
+  /// @return Operation result status.
+  ///
+  ///@{
   Status SetBinaryCopy(const Slice& col_name, const Slice& val) WARN_UNUSED_RESULT;
-  Status SetBinaryCopy(int col_idx, const Slice& val) WARN_UNUSED_RESULT;
+  Status SetStringCopy(const Slice& col_name, const Slice& val) WARN_UNUSED_RESULT;
+  ///@}
 
-  // Set the given column to NULL. This will only succeed on nullable
-  // columns. Use Unset(...) to restore a column to its default.
+  /// @name Setters for binary/string columns by index (copying).
+  ///
+  /// Set the binary/string value for a column by index, copying the specified
+  /// data immediately.
+  ///
+  /// These setters are the same as the corresponding column-name-based setters,
+  /// but with numeric column indexes. These are faster since they avoid
+  /// hashmap lookups, so should be preferred in performance-sensitive code
+  /// (e.g. bulk loaders).
+  ///
+  /// @param [in] col_idx
+  ///   The index of the target column.
+  /// @param [in] val
+  ///   The value to set.
+  /// @return Operation result status.
+  ///
+  ///@{
+  Status SetStringCopy(int col_idx, const Slice& val) WARN_UNUSED_RESULT;
+  Status SetBinaryCopy(int col_idx, const Slice& val) WARN_UNUSED_RESULT;
+  ///@}
+
+  /// @name Setters for binary/string columns by name (non-copying).
+  ///
+  /// Set the binary/string value for a column by name, not copying the
+  /// specified data.
+  ///
+  /// @note The specified data must remain valid until the corresponding
+  ///   RPC calls are completed to be able to access error buffers,
+  ///   if any errors happened (the errors can be fetched using the
+  ///   KuduSession::GetPendingErrors() method).
+  ///
+  /// @param [in] col_name
+  ///   Name of the target column.
+  /// @param [in] val
+  ///   The value to set.
+  /// @return Operation result status.
+  ///
+  ///@{
+  Status SetBinaryNoCopy(const Slice& col_name, const Slice& val) WARN_UNUSED_RESULT;
+  Status SetStringNoCopy(const Slice& col_name, const Slice& val) WARN_UNUSED_RESULT;
+  ///@}
+
+  /// @name Setters for binary/string columns by index (non-copying).
+  ///
+  /// Set the binary/string value for a column by index, not copying the
+  /// specified data.
+  ///
+  /// These setters are the same as the corresponding column-name-based setters,
+  /// but with numeric column indexes. These are faster since they avoid
+  /// hashmap lookups, so should be preferred in performance-sensitive code
+  /// (e.g. bulk loaders).
+  ///
+  /// @note The specified data must remain valid until the corresponding
+  ///   RPC calls are completed to be able to access error buffers,
+  ///   if any errors happened (the errors can be fetched using the
+  ///   KuduSession::GetPendingErrors() method).
+  ///
+  /// @param [in] col_idx
+  ///   The index of the target column.
+  /// @param [in] val
+  ///   The value to set.
+  /// @return Operation result status.
+  ///
+  ///@{
+  Status SetBinaryNoCopy(int col_idx, const Slice& val) WARN_UNUSED_RESULT;
+  Status SetStringNoCopy(int col_idx, const Slice& val) WARN_UNUSED_RESULT;
+  ///@}
+
+  /// Set column value to @c NULL; the column is identified by its name.
+  ///
+  /// This will only succeed on nullable columns. Use Unset() to restore
+  /// column value to its default.
+  ///
+  /// @param [in] col_name
+  ///   Name of the target column.
+  /// @return Operation result status.
   Status SetNull(const Slice& col_name) WARN_UNUSED_RESULT;
+
+  /// Set column value to @c NULL; the column is identified by its index.
+  ///
+  /// This will only succeed on nullable columns. Use Unset() to restore
+  /// column value to its default.
+  ///
+  /// @param [in] col_idx
+  ///   The index of the target column.
+  /// @return Operation result status.
   Status SetNull(int col_idx) WARN_UNUSED_RESULT;
 
-  // Unsets the given column. Note that this is different from setting
-  // it to NULL.
+  /// Unset the given column by name, restoring its default value.
+  ///
+  /// @note This is different from setting it to @c NULL.
+  ///
+  /// @param [in] col_name
+  ///   Name of the target column.
+  /// @return Operation result status.
   Status Unset(const Slice& col_name) WARN_UNUSED_RESULT;
+
+  /// Unset the given column by index, restoring its default value.
+  ///
+  /// @note This is different from setting it to @c NULL.
+  ///
+  /// @param [in] col_idx
+  ///   The index of the target column.
+  /// @return Operation result status.
   Status Unset(int col_idx) WARN_UNUSED_RESULT;
 
-  //------------------------------------------------------------
-  // Getters
-  //------------------------------------------------------------
-  // These getters return a bad Status if the type does not match,
-  // the value is unset, or the value is NULL. Otherwise they return
-  // the current set value in *val.
-
-  // Return true if the given column has been specified.
+  /// Check whether the specified column is set for the row.
+  ///
+  /// @param [in] col_name
+  ///   Name of the column.
+  /// @return @c true iff the given column has been specified.
   bool IsColumnSet(const Slice& col_name) const;
+
+  /// Check whether the specified column is set for the row.
+  ///
+  /// @param [in] col_idx
+  ///   The index of the column.
+  /// @return @c true iff the given column has been specified.
   bool IsColumnSet(int col_idx) const;
 
+  /// Check whether the specified column is @c NULL for the row.
+  ///
+  /// @param [in] col_name
+  ///   Name of the target column.
+  /// @return @c true iff the given column's value is @c NULL.
   bool IsNull(const Slice& col_name) const;
+
+  /// Check whether the specified column is @c NULL for the row.
+  ///
+  /// @param [in] col_idx
+  ///   The index of the column.
+  /// @return @c true iff the given column's value is @c NULL.
   bool IsNull(int col_idx) const;
 
+  /// @name Getters for integral type columns by column name.
+  ///
+  /// Get value of the column specified by name.
+  ///
+  /// @return Operation result status. Return a bad Status if at least one
+  ///   of the following is @c true:
+  ///     @li The type does not match.
+  ///     @li The value is unset.
+  ///     @li The value is @c NULL.
+  ///
+  ///@{
   Status GetBool(const Slice& col_name, bool* val) const WARN_UNUSED_RESULT;
 
   Status GetInt8(const Slice& col_name, int8_t* val) const WARN_UNUSED_RESULT;
   Status GetInt16(const Slice& col_name, int16_t* val) const WARN_UNUSED_RESULT;
   Status GetInt32(const Slice& col_name, int32_t* val) const WARN_UNUSED_RESULT;
   Status GetInt64(const Slice& col_name, int64_t* val) const WARN_UNUSED_RESULT;
-  Status GetTimestamp(const Slice& col_name,
+  Status GetUnixTimeMicros(const Slice& col_name,
                       int64_t* micros_since_utc_epoch) const WARN_UNUSED_RESULT;
 
   Status GetFloat(const Slice& col_name, float* val) const WARN_UNUSED_RESULT;
   Status GetDouble(const Slice& col_name, double* val) const WARN_UNUSED_RESULT;
+  ///@}
 
-  // Same as above getters, but with numeric column indexes.
-  // These are faster since they avoid a hashmap lookup, so should
-  // be preferred in performance-sensitive code.
+  /// @name Getters for column of integral type by column index.
+  ///
+  /// Get value of a column of integral type by column index.
+  ///
+  /// These getters are the same as the corresponding column-name-based getters,
+  /// but with numeric column indexes. These are faster since they avoid
+  /// hashmap lookups, so should be preferred in performance-sensitive code
+  /// (e.g. bulk loaders).
+  ///
+  /// @param [in] col_idx
+  ///   The index of the target column.
+  /// @return Operation result status. Return a bad Status if at least one
+  ///   of the following is @c true:
+  ///     @li The type does not match.
+  ///     @li The value is unset.
+  ///     @li The value is @c NULL.
+  ///
+  ///@{
   Status GetBool(int col_idx, bool* val) const WARN_UNUSED_RESULT;
 
   Status GetInt8(int col_idx, int8_t* val) const WARN_UNUSED_RESULT;
   Status GetInt16(int col_idx, int16_t* val) const WARN_UNUSED_RESULT;
   Status GetInt32(int col_idx, int32_t* val) const WARN_UNUSED_RESULT;
   Status GetInt64(int col_idx, int64_t* val) const WARN_UNUSED_RESULT;
-  Status GetTimestamp(int col_idx, int64_t* micros_since_utc_epoch) const WARN_UNUSED_RESULT;
+  Status GetUnixTimeMicros(int col_idx, int64_t* micros_since_utc_epoch) const WARN_UNUSED_RESULT;
 
   Status GetFloat(int col_idx, float* val) const WARN_UNUSED_RESULT;
   Status GetDouble(int col_idx, double* val) const WARN_UNUSED_RESULT;
+  ///@}
 
-  // Gets the string/binary value but does not copy the value. Callers should
-  // copy the resulting Slice if necessary.
+  /// @name Getters for string/binary column by column name.
+  ///
+  /// Get the string/binary value for a column by its name.
+  ///
+  /// @param [in] col_name
+  ///   Name of the column.
+  /// @param [out] val
+  ///   Pointer to the placeholder to put the resulting value.
+  ///   Note that the method does not copy the value. Callers should copy
+  ///   the resulting Slice if necessary.
+  /// @return Operation result status. Return a bad Status if at least one
+  ///   of the following is @c true:
+  ///     @li The type does not match.
+  ///     @li The value is unset.
+  ///     @li The value is @c NULL.
+  ///
+  ///@{
   Status GetString(const Slice& col_name, Slice* val) const WARN_UNUSED_RESULT;
-  Status GetString(int col_idx, Slice* val) const WARN_UNUSED_RESULT;
   Status GetBinary(const Slice& col_name, Slice* val) const WARN_UNUSED_RESULT;
+  ///@}
+
+  /// @name Getters for string/binary column by column index.
+  ///
+  /// Get the string/binary value for a column by its index.
+  ///
+  /// These methods are faster than their name-based counterparts
+  /// since they use indices to avoid hashmap lookups, so index-based getters
+  /// should be preferred in performance-sensitive code.
+  ///
+  /// @param [in] col_index
+  ///   The index of the column.
+  /// @param [out] val
+  ///   Pointer to the placeholder to put the resulting value.
+  ///   Note that the method does not copy the value. Callers should copy
+  ///   the resulting Slice if necessary.
+  /// @return Operation result status. Return a bad Status if at least one
+  ///   of the following is @c true:
+  ///     @li The type does not match.
+  ///     @li The value is unset.
+  ///     @li The value is @c NULL.
+  ///
+  ///@{
+  Status GetString(int col_idx, Slice* val) const WARN_UNUSED_RESULT;
   Status GetBinary(int col_idx, Slice* val) const WARN_UNUSED_RESULT;
+  ///@}
 
   //------------------------------------------------------------
   // Key-encoding related functions
   //------------------------------------------------------------
 
-  // Encode a row key suitable for use as a tablet split key, an encoded
-  // key range, etc.
-  //
-  // Requires that all of the key columns must be set; otherwise, returns
-  // InvalidArgument.
+  /// Encode a row key.
+  ///
+  /// The result is suitable for use as a tablet split key, an encoded
+  /// key range, etc.
+  ///
+  /// @pre All of the key columns must be set.
+  ///
+  /// @param [out] encoded_key
+  ///   The encoded key (i.e. the result of the encoding).
+  /// @return Operation result status. In particular, this method returns
+  ///   InvalidArgument if not all the key columns are set.
   Status EncodeRowKey(std::string* encoded_key) const;
 
-  // Convenience method which is equivalent to the above, but triggers a
-  // FATAL error on failure.
+  /// Convenience method which is similar to EncodeRowKey.
+  ///
+  /// This is equivalent to the EncodeRowKey, but triggers a FATAL error
+  /// on failure.
+  ///
+  /// @return The encoded key.
   std::string ToEncodedRowKeyOrDie() const;
 
   //------------------------------------------------------------
   // Utility code
   //------------------------------------------------------------
 
-  // Return true if all of the key columns have been specified
-  // for this mutation.
+  /// @return @c true if all key column values have been set
+  ///   for this mutation.
   bool IsKeySet() const;
 
-  // Return true if all columns have been specified.
+  /// @return @c true if all column values have been set.
   bool AllColumnsSet() const;
 
+  /// @return String representation for the partial row.
+  ///
+  /// @internal
+  /// @note this method does note redact row values. The
+  ///   caller must handle redaction themselves, if necessary.
   std::string ToString() const;
 
+  /// @return The schema object for the partial row.
   const Schema* schema() const { return schema_; }
 
  private:
-  friend class RowKeyUtilTest;
+  friend class client::KuduWriteOperation;   // for row_data_.
+  friend class KeyUtilTest;
+  friend class PartitionSchema;
   friend class RowOperationsPBDecoder;
   friend class RowOperationsPBEncoder;
-  friend class client::KuduWriteOperation;   // for row_data_.
-  friend class PartitionSchema;
+  friend class TestScanSpec;
   template<typename KeyTypeWrapper> friend struct client::SliceKeysTestSetup;
   template<typename KeyTypeWrapper> friend struct client::IntKeysTestSetup;
+  template<typename KeyTypeWrapper> friend struct tablet::SliceTypeRowOps;
+  template<typename KeyTypeWrapper> friend struct tablet::NumTypeRowOps;
+  FRIEND_TEST(PartitionPrunerTest, TestPrimaryKeyRangePruning);
+  FRIEND_TEST(PartitionPrunerTest, TestPartialPrimaryKeyRangePruning);
 
   template<typename T>
   Status Set(const Slice& col_name, const typename T::cpp_type& val,

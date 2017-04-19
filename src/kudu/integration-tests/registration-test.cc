@@ -24,18 +24,24 @@
 #include "kudu/common/wire_protocol-test-util.h"
 #include "kudu/fs/fs_manager.h"
 #include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/mini_cluster.h"
-#include "kudu/master/mini_master.h"
+#include "kudu/master/master-test-util.h"
 #include "kudu/master/master.h"
 #include "kudu/master/master.pb.h"
-#include "kudu/master/master-test-util.h"
+#include "kudu/master/mini_master.h"
 #include "kudu/master/ts_descriptor.h"
+#include "kudu/security/test/test_certs.h"
+#include "kudu/security/tls_context.h"
+#include "kudu/security/token_verifier.h"
 #include "kudu/tserver/mini_tablet_server.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/util/curl_util.h"
 #include "kudu/util/faststring.h"
-#include "kudu/util/test_util.h"
+#include "kudu/util/pb_util.h"
 #include "kudu/util/stopwatch.h"
+#include "kudu/util/test_util.h"
+#include "kudu/util/version_info.h"
 
 DECLARE_int32(heartbeat_interval_ms);
 
@@ -43,6 +49,7 @@ namespace kudu {
 
 using std::vector;
 using std::shared_ptr;
+using std::string;
 using master::MiniMaster;
 using master::TSDescriptor;
 using master::TabletLocationsPB;
@@ -62,7 +69,7 @@ class RegistrationTest : public KuduTest {
 
     KuduTest::SetUp();
 
-    cluster_.reset(new MiniCluster(env_.get(), MiniClusterOptions()));
+    cluster_.reset(new MiniCluster(env_, MiniClusterOptions()));
     ASSERT_OK(cluster_->Start());
   }
 
@@ -70,17 +77,50 @@ class RegistrationTest : public KuduTest {
     cluster_->Shutdown();
   }
 
-  void CheckTabletServersPage() {
+  void CheckTabletServersPage(string* contents = nullptr) {
     EasyCurl c;
     faststring buf;
     string addr = cluster_->mini_master()->bound_http_addr().ToString();
     ASSERT_OK(c.FetchURL(strings::Substitute("http://$0/tablet-servers", addr),
                                 &buf));
+    string buf_str = buf.ToString();
 
     // Should include the TS UUID
     string expected_uuid =
       cluster_->mini_tablet_server(0)->server()->instance_pb().permanent_uuid();
-    ASSERT_STR_CONTAINS(buf.ToString(), expected_uuid);
+    ASSERT_STR_CONTAINS(buf_str, expected_uuid);
+
+    // Should check that the TS software version is included on the page.
+    // tserver version should be the same as returned by GetShortVersionString()
+    ASSERT_STR_CONTAINS(buf_str, VersionInfo::GetShortVersionString());
+    if (contents != nullptr) {
+      *contents = std::move(buf_str);
+    }
+  }
+
+  Status WaitForReplicaCount(const string& tablet_id,
+                             int expected_count,
+                             TabletLocationsPB* locations) {
+    while (true) {
+      master::CatalogManager* catalog =
+          cluster_->mini_master()->master()->catalog_manager();
+      Status s;
+      do {
+        master::CatalogManager::ScopedLeaderSharedLock l(catalog);
+        const Status& ls = l.first_failed_status();
+        if (ls.IsServiceUnavailable()) {
+          // ServiceUnavailable means catalog manager is not yet ready
+          // to serve requests -- try again later.
+          break;  // exiting out of the 'do {...} while (false)' scope
+        }
+        RETURN_NOT_OK(ls);
+        s = catalog->GetTabletLocations(tablet_id, locations);
+      } while (false);
+      if (s.ok() && locations->replicas_size() == expected_count) {
+        return Status::OK();
+      }
+      SleepFor(MonoDelta::FromMilliseconds(1));
+    }
   }
 
  protected:
@@ -91,15 +131,16 @@ class RegistrationTest : public KuduTest {
 TEST_F(RegistrationTest, TestTSRegisters) {
   // Wait for the TS to register.
   vector<shared_ptr<TSDescriptor> > descs;
-  ASSERT_OK(cluster_->WaitForTabletServerCount(1, &descs));
+  ASSERT_OK(cluster_->WaitForTabletServerCount(
+      1, MiniCluster::MatchMode::MATCH_TSERVERS, &descs));
   ASSERT_EQ(1, descs.size());
 
   // Verify that the registration is sane.
-  master::TSRegistrationPB reg;
+  ServerRegistrationPB reg;
   descs[0]->GetRegistration(&reg);
   {
-    SCOPED_TRACE(reg.ShortDebugString());
-    ASSERT_EQ(reg.ShortDebugString().find("0.0.0.0"), string::npos)
+    SCOPED_TRACE(SecureShortDebugString(reg));
+    ASSERT_EQ(SecureShortDebugString(reg).find("0.0.0.0"), string::npos)
       << "Should not include wildcards in registration";
   }
 
@@ -107,6 +148,7 @@ TEST_F(RegistrationTest, TestTSRegisters) {
 
   // Restart the master, so it loses the descriptor, and ensure that the
   // hearbeater thread handles re-registering.
+  cluster_->mini_master()->Shutdown();
   ASSERT_OK(cluster_->mini_master()->Restart());
 
   ASSERT_OK(cluster_->WaitForTabletServerCount(1));
@@ -116,9 +158,20 @@ TEST_F(RegistrationTest, TestTSRegisters) {
   // number.
 }
 
+TEST_F(RegistrationTest, TestMasterSoftwareVersion) {
+  // Verify that the master's software version exists.
+  ServerRegistrationPB reg;
+  cluster_->mini_master()->master()->GetMasterRegistration(&reg);
+  {
+    SCOPED_TRACE(SecureShortDebugString(reg));
+    ASSERT_TRUE(reg.has_software_version());
+    ASSERT_STR_CONTAINS(reg.software_version(),
+                        VersionInfo::GetShortVersionString());
+  }
+}
+
 // Test starting multiple tablet servers and ensuring they both register with the master.
 TEST_F(RegistrationTest, TestMultipleTS) {
-  ASSERT_OK(cluster_->WaitForTabletServerCount(1));
   ASSERT_OK(cluster_->AddTabletServer());
   ASSERT_OK(cluster_->WaitForTabletServerCount(2));
 }
@@ -130,8 +183,6 @@ TEST_F(RegistrationTest, TestTabletReports) {
   string tablet_id_1;
   string tablet_id_2;
 
-  ASSERT_OK(cluster_->WaitForTabletServerCount(1));
-
   MiniTabletServer* ts = cluster_->mini_tablet_server(0);
   string ts_root = cluster_->GetTabletServerFsRoot(0);
 
@@ -139,26 +190,74 @@ TEST_F(RegistrationTest, TestTabletReports) {
   CreateTabletForTesting(cluster_->mini_master(), "fake-table", schema_, &tablet_id_1);
 
   TabletLocationsPB locs;
-  ASSERT_OK(cluster_->WaitForReplicaCount(tablet_id_1, 1, &locs));
+  ASSERT_OK(WaitForReplicaCount(tablet_id_1, 1, &locs));
   ASSERT_EQ(1, locs.replicas_size());
   LOG(INFO) << "Tablet successfully reported on " << locs.replicas(0).ts_info().permanent_uuid();
 
   // Add another tablet, make sure it is reported via incremental.
   CreateTabletForTesting(cluster_->mini_master(), "fake-table2", schema_, &tablet_id_2);
-  ASSERT_OK(cluster_->WaitForReplicaCount(tablet_id_2, 1, &locs));
+  ASSERT_OK(WaitForReplicaCount(tablet_id_2, 1, &locs));
 
   // Shut down the whole system, bring it back up, and make sure the tablets
   // are reported.
   ts->Shutdown();
+  cluster_->mini_master()->Shutdown();
   ASSERT_OK(cluster_->mini_master()->Restart());
   ASSERT_OK(ts->Start());
 
-  ASSERT_OK(cluster_->WaitForReplicaCount(tablet_id_1, 1, &locs));
-  ASSERT_OK(cluster_->WaitForReplicaCount(tablet_id_2, 1, &locs));
+  ASSERT_OK(WaitForReplicaCount(tablet_id_1, 1, &locs));
+  ASSERT_OK(WaitForReplicaCount(tablet_id_2, 1, &locs));
 
   // TODO: KUDU-870: once the master supports detecting failed/lost replicas,
   // we should add a test case here which removes or corrupts metadata, restarts
   // the TS, and verifies that the master notices the issue.
+}
+
+// Check that after the tablet server registers, it gets a signed cert
+// from the master.
+TEST_F(RegistrationTest, TestTSGetsSignedX509Certificate) {
+  MiniTabletServer* ts = cluster_->mini_tablet_server(0);
+  AssertEventually([&](){
+      ASSERT_TRUE(ts->server()->tls_context().has_signed_cert());
+    }, MonoDelta::FromSeconds(10));
+}
+
+// Check that after the tablet server registers, it gets the list of valid
+// public token signing keys.
+TEST_F(RegistrationTest, TestTSGetsTskList) {
+  MiniTabletServer* ts = cluster_->mini_tablet_server(0);
+  AssertEventually([&](){
+      ASSERT_FALSE(ts->server()->token_verifier().ExportKeys().empty());
+    });
+}
+
+// Test that, if the tserver has HTTPS enabled, the master links to it
+// via https:// URLs and not http://.
+TEST_F(RegistrationTest, TestExposeHttpsURLs) {
+  MiniTabletServer* ts = cluster_->mini_tablet_server(0);
+  string password;
+  WebserverOptions* opts = &ts->options()->webserver_opts;
+  ASSERT_OK(security::CreateTestSSLCerts(GetTestDataDirectory(),
+                                         &opts->certificate_file,
+                                         &opts->private_key_file,
+                                         &password));
+  opts->private_key_password_cmd = strings::Substitute("echo $0", password);
+  ts->Shutdown();
+  ASSERT_OK(ts->Start());
+
+  // The URL displayed on the page uses a hostname. Rather than
+  // dealing with figuring out what the hostname should be, just
+  // use a more permissive regex which doesn't check the host.
+  string expected_url_regex = strings::Substitute(
+      "https://[a-zA-Z0-9.-]+:$0/", opts->port);
+
+  // Need "eventually" here because the tserver may take a few seconds
+  // to re-register while starting up.
+  AssertEventually([&](){
+      string contents;
+      NO_FATALS(CheckTabletServersPage(&contents));
+      ASSERT_STR_MATCHES(contents, expected_url_regex);
+    });
 }
 
 } // namespace kudu

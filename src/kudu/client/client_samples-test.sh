@@ -62,7 +62,6 @@ popd
 for include_file in $(find $LIBRARY_DIR -name \*.h) ; do
   echo Checking standalone compilation of $include_file...
   if ! ${CXX:-g++} \
-       -D_GLIBCXX_USE_CXX11_ABI=0 \
        -o /dev/null \
        -I$LIBRARY_DIR/usr/local/include \
        $include_file ; then
@@ -76,28 +75,13 @@ for include_file in $(find $LIBRARY_DIR -name \*.h) ; do
   fi
 done
 
-# Test that client.h prohibits compilation with GCC 5's new ABI. Obviously the
-# macro below will only be set if building with GCC 5; we set it manually for
-# the purpose of the test.
-if ${CXX:-g++} \
-       -o /dev/null \
-       -D_GLIBCXX_USE_CXX11_ABI=1 \
-       -I$LIBRARY_DIR/usr/local/include \
-       $LIBRARY_DIR/usr/local/include/kudu/client/client.h ; then
-    echo
-    echo ---------------------------------------------
-    echo "GCC 5 new ABI conftest unexpectedly passed!"
-    echo ---------------------------------------------
-    exit 1
-fi
-
 # Prefer the cmake on the system path, since we expect our client library
 # to be usable with older versions of cmake. But if it isn't there,
 # use the one from thirdparty.
 CMAKE=$(which cmake || :)
 if [ -z "$CMAKE" ]; then
   # TODO: temporary hack which assumes this script is in src/build/<type>/bin
-  CMAKE=$OUTPUT_DIR/../../../thirdparty/installed/bin/cmake
+  CMAKE=$OUTPUT_DIR/../../../thirdparty/installed/common/bin/cmake
 fi
 
 # Build the client samples using the client library.
@@ -121,19 +105,23 @@ export TMPDIR=${TMPDIR:-/tmp}
 export TEST_TMPDIR=${TEST_TMPDIR:-$TMPDIR/kudutest-$UID}
 mkdir -p $TEST_TMPDIR
 BASE_DIR=$(mktemp -d $TEST_TMPDIR/client_samples-test.XXXXXXXX)
+mkdir -p "$BASE_DIR/master/logs"
 $OUTPUT_DIR/kudu-master \
+  --unlock_experimental_flags \
   --default_num_replicas=1 \
-  --log_dir=$BASE_DIR \
-  --fs_wal_dir=$BASE_DIR/master \
-  --fs_data_dirs=$BASE_DIR/master \
+  --log_dir=$BASE_DIR/master/logs \
+  --fs_wal_dir=$BASE_DIR/master/wals \
+  --fs_data_dirs=$BASE_DIR/master/data \
   --webserver_interface=localhost \
   --webserver_port=0 \
   --rpc_bind_addresses=$LOCALHOST_IP &
 MASTER_PID=$!
+mkdir -p "$BASE_DIR/ts/logs"
 $OUTPUT_DIR/kudu-tserver \
-  --log_dir=$BASE_DIR \
-  --fs_wal_dir=$BASE_DIR/ts \
-  --fs_data_dirs=$BASE_DIR/ts \
+  --unlock_experimental_flags \
+  --log_dir=$BASE_DIR/ts/logs \
+  --fs_wal_dir=$BASE_DIR/ts/wals \
+  --fs_data_dirs=$BASE_DIR/ts/data \
   --rpc_bind_addresses=$LOCALHOST_IP \
   --local_ip_for_outbound_sockets=$LOCALHOST_IP \
   --webserver_interface=localhost \

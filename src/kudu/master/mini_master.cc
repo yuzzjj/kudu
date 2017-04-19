@@ -22,6 +22,7 @@
 #include <glog/logging.h>
 
 #include "kudu/fs/fs_manager.h"
+#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/server/rpc_server.h"
 #include "kudu/server/webserver.h"
@@ -31,6 +32,7 @@
 
 using strings::Substitute;
 
+DECLARE_bool(enable_minidumps);
 DECLARE_bool(rpc_server_allow_ephemeral_ports);
 
 namespace kudu {
@@ -40,7 +42,10 @@ MiniMaster::MiniMaster(Env* env, string fs_root, uint16_t rpc_port)
     : running_(false),
       env_(env),
       fs_root_(std::move(fs_root)),
-      rpc_port_(rpc_port) {}
+      rpc_port_(rpc_port) {
+  // Disable minidump handler (we allow only one per process).
+  FLAGS_enable_minidumps = false;
+}
 
 MiniMaster::~MiniMaster() {
   CHECK(!running_);
@@ -53,18 +58,49 @@ Status MiniMaster::Start() {
   return master_->WaitForCatalogManagerInit();
 }
 
-
 Status MiniMaster::StartDistributedMaster(const vector<uint16_t>& peer_ports) {
   CHECK(!running_);
   return StartDistributedMasterOnPorts(rpc_port_, 0, peer_ports);
 }
 
+Status MiniMaster::Restart() {
+  CHECK(!running_);
+  RETURN_NOT_OK(StartOnPorts(bound_rpc_.port(), bound_http_.port()));
+  CHECK(running_);
+  return WaitForCatalogManagerInit();
+}
+
 void MiniMaster::Shutdown() {
   if (running_) {
+    bound_rpc_ = bound_rpc_addr();
+    bound_http_ = bound_http_addr();
     master_->Shutdown();
   }
   running_ = false;
   master_.reset();
+}
+
+Status MiniMaster::WaitForCatalogManagerInit() const {
+  return master_->WaitForCatalogManagerInit();
+}
+
+const Sockaddr MiniMaster::bound_rpc_addr() const {
+  CHECK(running_);
+  return master_->first_rpc_address();
+}
+
+const Sockaddr MiniMaster::bound_http_addr() const {
+  CHECK(running_);
+  return master_->first_http_address();
+}
+
+std::string MiniMaster::permanent_uuid() const {
+  CHECK(master_);
+  return DCHECK_NOTNULL(master_->fs_manager())->uuid();
+}
+
+std::string MiniMaster::bound_rpc_addr_str() const {
+  return bound_rpc_addr().ToString();
 }
 
 Status MiniMaster::StartOnPorts(uint16_t rpc_port, uint16_t web_port) {
@@ -107,41 +143,6 @@ Status MiniMaster::StartDistributedMasterOnPorts(uint16_t rpc_port, uint16_t web
   opts.master_addresses = peer_addresses;
 
   return StartOnPorts(rpc_port, web_port, &opts);
-}
-
-Status MiniMaster::Restart() {
-  CHECK(running_);
-
-  Sockaddr prev_rpc = bound_rpc_addr();
-  Sockaddr prev_http = bound_http_addr();
-  Shutdown();
-
-  RETURN_NOT_OK(StartOnPorts(prev_rpc.port(), prev_http.port()));
-  CHECK(running_);
-  return WaitForCatalogManagerInit();
-}
-
-Status MiniMaster::WaitForCatalogManagerInit() {
-  return master_->WaitForCatalogManagerInit();
-}
-
-const Sockaddr MiniMaster::bound_rpc_addr() const {
-  CHECK(running_);
-  return master_->first_rpc_address();
-}
-
-const Sockaddr MiniMaster::bound_http_addr() const {
-  CHECK(running_);
-  return master_->first_http_address();
-}
-
-std::string MiniMaster::permanent_uuid() const {
-  CHECK(master_);
-  return DCHECK_NOTNULL(master_->fs_manager())->uuid();
-}
-
-std::string MiniMaster::bound_rpc_addr_str() const {
-  return bound_rpc_addr().ToString();
 }
 
 } // namespace master

@@ -17,7 +17,6 @@
 #ifndef KUDU_TABLET_TABLET_BOOTSTRAP_H_
 #define KUDU_TABLET_TABLET_BOOTSTRAP_H_
 
-#include <boost/thread/shared_mutex.hpp>
 #include <memory>
 #include <string>
 #include <vector>
@@ -26,6 +25,7 @@
 #include "kudu/consensus/log.pb.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/ref_counted.h"
+#include "kudu/util/rw_mutex.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
@@ -43,6 +43,10 @@ namespace consensus {
 struct ConsensusBootstrapInfo;
 } // namespace consensus
 
+namespace rpc {
+class ResultTracker;
+} // namespace rpc
+
 namespace server {
 class Clock;
 }
@@ -50,38 +54,7 @@ class Clock;
 namespace tablet {
 class Tablet;
 class TabletMetadata;
-
-// A listener for logging the tablet related statuses as well as
-// piping it into the web UI.
-class TabletStatusListener {
- public:
-  explicit TabletStatusListener(const scoped_refptr<TabletMetadata>& meta);
-
-  ~TabletStatusListener();
-
-  void StatusMessage(const std::string& status);
-
-  const std::string tablet_id() const;
-
-  const std::string table_name() const;
-
-  const Partition& partition() const;
-
-  const Schema& schema() const;
-
-  std::string last_status() const {
-    boost::shared_lock<boost::shared_mutex> l(lock_);
-    return last_status_;
-  }
-
- private:
-  mutable boost::shared_mutex lock_;
-
-  scoped_refptr<TabletMetadata> meta_;
-  std::string last_status_;
-
-  DISALLOW_COPY_AND_ASSIGN(TabletStatusListener);
-};
+class TabletStatusListener;
 
 extern const char* kLogRecoveryDir;
 
@@ -94,6 +67,7 @@ extern const char* kLogRecoveryDir;
 Status BootstrapTablet(const scoped_refptr<TabletMetadata>& meta,
                        const scoped_refptr<server::Clock>& clock,
                        const std::shared_ptr<MemTracker>& mem_tracker,
+                       const scoped_refptr<rpc::ResultTracker>& result_tracker,
                        MetricRegistry* metric_registry,
                        TabletStatusListener* status_listener,
                        std::shared_ptr<Tablet>* rebuilt_tablet,

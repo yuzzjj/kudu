@@ -23,7 +23,6 @@ are disjoint, ie the set of rows for different RowSets do not
 intersect, so any given key is present in at most one RowSet. While
 RowSets are disjoint, their key spaces may overlap.
 
-============================================================
 Handling Insertions
 ============================================================
 
@@ -42,7 +41,6 @@ of a special header, followed by the packed format of the row data (more detail 
 Since the MemRowSet is fully in-memory, it will eventually fill up and "Flush" to disk --
 this process is described in detail later in this document.
 
-============================================================
 MVCC Overview
 ============================================================
 
@@ -84,7 +82,6 @@ a retention period beyond which old transaction records may be GCed (thus preven
 reads from earlier than that point in history).
 (NOTE: history GC not currently implemented)
 
-============================================================
 MVCC Mutations in MemRowSet
 ============================================================
 
@@ -182,7 +179,6 @@ However, we consider the above inefficiencies tolerable given the following assu
 If it turns out that the above inefficiencies impact real applications, various optimizations
 can be applied in the future to reduce the overhead.
 
-============================================================
 MemRowSet Flushes
 ============================================================
 
@@ -218,7 +214,6 @@ NOTE: other systems such as C-Store call the MemRowSet the
 "write optimized store" (WOS), and the on-disk files the "read-optimized store"
 (ROS).
 
-============================================================
 Historical MVCC in DiskRowSets
 ============================================================
 
@@ -295,7 +290,6 @@ the range of transactions for which UNDO records are present. If the scanner's M
 snapshot indicates that all of these transactions are already committed, then the set
 of deltas may be short circuited, and the query can proceed with no MVCC overhead.
 
-============================================================
 Handling mutations against on-disk files
 ============================================================
 
@@ -341,7 +335,6 @@ This allows for fast updates of small columns without the overhead of reading
 or re-writing larger columns (an advantage compared to the MVCC techniques used
 by systems such as C-Store and PostgreSQL).
 
-============================================================
 Summary of delta file processing
 ============================================================
 
@@ -361,7 +354,6 @@ REDO records: data which needs to be processed in order to bring rows up to date
 
 UNDO records and REDO records are stored in the same file format, called a DeltaFile.
 
-============================================================
 Delta Compactions
 ============================================================
 
@@ -408,17 +400,17 @@ UNDO logs have been removed, there is no remaining record of when any row or
 cell was inserted or updated. If users need this functionality, they should
 keep their own "inserted_on" timestamp column, as they would in a traditional RDBMS.
 
-============================================================
 Types of Delta Compaction
 ============================================================
 
-A delta compaction may be classified as either 'minor' or 'major':
+A REDO delta compaction may be classified as either 'minor' or 'major':
 
-Minor delta compaction:
-------------------------
+Minor REDO delta compaction
+---------------------------
 
 A 'minor' compaction is one that does not include the base data. In this
 type of compaction, the resulting file is itself a delta file.
+
 ```
 +------------+      +---------+     +---------+     +---------+     +---------+
 | base data  | <--- | delta 0 + <-- | delta 1 + <-- | delta 2 + <-- | delta 3 +
@@ -435,14 +427,15 @@ type of compaction, the resulting file is itself a delta file.
                   compaction result
 ```
 
-Minor delta compactions serve only goals 1 and 3: because they do not read or re-write
-base data, they cannot transform REDO records into UNDO.
+Minor REDO delta compactions serve only goal 1: because they do not read or
+re-write base data, they cannot transform REDO records into UNDO.
 
-Major delta compaction:
-------------------------
+Major REDO delta compaction
+---------------------------
 
-A 'major' compaction is one that includes the base data along with any number
-of delta files.
+A 'major' REDO compaction is one that includes the base data along with any
+number of REDO delta files.
+
 ```
 +------------+      +---------+     +---------+     +---------+     +---------+
 | base data  | <--- | delta 0 + <-- | delta 1 + <-- | delta 2 + <-- | delta 3 +
@@ -458,11 +451,12 @@ of delta files.
 \____________________________________/
            compaction result
 ```
-Major delta compactions can satisfy all three goals of delta compactions, but cost
-more than than minor delta compactions since they must read and re-write the base data,
-which is typically larger than the delta data.
 
-A major delta compaction may be performed against any subset of the columns
+Major delta compactions satisfy delta compaction goals 1 and 2, but cost more
+than than minor delta compactions since they must read and re-write the base
+data, which is typically larger than the delta data.
+
+A major REDO delta compaction may be performed against any subset of the columns
 in a DiskRowSet -- if only a single column has received a significant number of updates,
 then a compaction can be performed which only reads and rewrites that column. It is
 assumed that this is a common workload in many EDW-like applications (e.g updating
@@ -474,7 +468,6 @@ compaction file can be introduced into the RowSet by atomically swapping it with
 the compaction inputs. After the swap is complete, the pre-compaction files may
 be removed.
 
-============================================================
 Merging compactions
 ============================================================
 
@@ -525,7 +518,6 @@ in a Merging Compaction. This makes the handling of concurrent mutations a somew
 intricate dance. This process is described in more detail in 'compaction.txt' in this
 directory.
 
-============================================================
 Overall picture
 ============================================================
 
@@ -582,7 +574,6 @@ DiskRowSet 2:
 +-----------------+ /
 ```
 
-============================================================
 Comparison to BigTable approach
 ============================================================
 
@@ -687,7 +678,6 @@ not another dimension in the row key. Instead, Kudu provides native composite ro
 which can be useful for time series.
 
 
-============================================================
 Comparing the MVCC implementation to other databases
 ============================================================
 

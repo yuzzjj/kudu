@@ -20,13 +20,17 @@
 #include <iomanip>
 #include <ios>
 #include <iostream>
-#include <strstream>
+#include <map>
+#include <mutex>
 #include <string>
+#include <sstream>
+#include <utility>
 #include <vector>
 
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/walltime.h"
 #include "kudu/util/memory/arena.h"
+#include "kudu/util/jsonwriter.h"
 
 namespace kudu {
 
@@ -103,7 +107,7 @@ TraceEntry* Trace::NewEntry(int msg_len, const char* file_path, int line_number)
 }
 
 void Trace::AddEntry(TraceEntry* entry) {
-  lock_guard<simple_spinlock> l(&lock_);
+  std::lock_guard<simple_spinlock> l(lock_);
   entry->next = nullptr;
 
   if (entries_tail_ != nullptr) {
@@ -115,15 +119,15 @@ void Trace::AddEntry(TraceEntry* entry) {
   entries_tail_ = entry;
 }
 
-void Trace::Dump(std::ostream* out, bool include_time_deltas) const {
+void Trace::Dump(std::ostream* out, int flags) const {
   // Gather a copy of the list of entries under the lock. This is fast
   // enough that we aren't worried about stalling concurrent tracers
   // (whereas doing the logging itself while holding the lock might be
   // too slow, if the output stream is a file, for example).
   vector<TraceEntry*> entries;
-  vector<scoped_refptr<Trace> > child_traces;
+  vector<pair<StringPiece, scoped_refptr<Trace>>> child_traces;
   {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     for (TraceEntry* cur = entries_head_;
          cur != nullptr;
          cur = cur->next) {
@@ -160,7 +164,7 @@ void Trace::Dump(std::ostream* out, bool include_time_deltas) const {
          << setw(2) << tm_time.tm_min   << ':'
          << setw(2) << tm_time.tm_sec   << '.'
          << setw(6) << usecs << ' ';
-    if (include_time_deltas) {
+    if (flags & INCLUDE_TIME_DELTAS) {
       out->fill(' ');
       *out << "(+" << setw(6) << usecs_since_prev << "us) ";
     }
@@ -171,19 +175,65 @@ void Trace::Dump(std::ostream* out, bool include_time_deltas) const {
     *out << std::endl;
   }
 
-  for (scoped_refptr<Trace> child_trace : child_traces) {
-    *out << "Related trace:" << std::endl;
-    *out << child_trace->DumpToString(include_time_deltas);
+  for (const auto& entry : child_traces) {
+    const auto& t = entry.second;
+    *out << "Related trace '" << entry.first << "':" << std::endl;
+    *out << t->DumpToString(flags & (~INCLUDE_METRICS));
+  }
+
+  if (flags & INCLUDE_METRICS) {
+    *out << "Metrics: " << MetricsAsJSON();
   }
 
   // Restore stream flags.
   out->flags(save_flags);
 }
 
-string Trace::DumpToString(bool include_time_deltas) const {
-  std::stringstream s;
-  Dump(&s, include_time_deltas);
+string Trace::DumpToString(int flags) const {
+  std::ostringstream s;
+  Dump(&s, flags);
   return s.str();
+}
+
+string Trace::MetricsAsJSON() const {
+  std::ostringstream s;
+  JsonWriter jw(&s, JsonWriter::COMPACT);
+  MetricsToJSON(&jw);
+  return s.str();
+}
+
+void Trace::MetricsToJSON(JsonWriter* jw) const {
+  // Convert into a map with 'std::string' keys instead of 'const char*'
+  // keys, so that the results are in a consistent (sorted) order.
+  std::map<string, int64_t> counters;
+  for (const auto& entry : metrics_.Get()) {
+    counters[entry.first] = entry.second;
+  }
+
+  jw->StartObject();
+  for (const auto& e : counters) {
+    jw->String(e.first);
+    jw->Int64(e.second);
+  }
+  vector<pair<StringPiece, scoped_refptr<Trace>>> child_traces;
+  {
+    std::lock_guard<simple_spinlock> l(lock_);
+    child_traces = child_traces_;
+  }
+
+  if (!child_traces.empty()) {
+    jw->String("child_traces");
+    jw->StartArray();
+
+    for (const auto& e : child_traces) {
+      jw->StartArray();
+      jw->String(e.first.data(), e.first.size());
+      e.second->MetricsToJSON(jw);
+      jw->EndArray();
+    }
+    jw->EndArray();
+  }
+  jw->EndObject();
 }
 
 void Trace::DumpCurrentTrace() {
@@ -195,10 +245,17 @@ void Trace::DumpCurrentTrace() {
   t->Dump(&std::cerr, true);
 }
 
-void Trace::AddChildTrace(Trace* child_trace) {
-  lock_guard<simple_spinlock> l(&lock_);
+void Trace::AddChildTrace(StringPiece label, Trace* child_trace) {
+  CHECK(arena_->RelocateStringPiece(label, &label));
+
+  std::lock_guard<simple_spinlock> l(lock_);
   scoped_refptr<Trace> ptr(child_trace);
-  child_traces_.push_back(ptr);
+  child_traces_.emplace_back(label, ptr);
+}
+
+std::vector<std::pair<StringPiece, scoped_refptr<Trace>>> Trace::ChildTraces() const {
+  std::lock_guard<simple_spinlock> l(lock_);
+  return child_traces_;
 }
 
 } // namespace kudu

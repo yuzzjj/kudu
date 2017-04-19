@@ -15,23 +15,29 @@
 % specific language governing permissions and limitations
 % under the License.
 
-\documentclass{vldb}
+\documentclass[twocolumn,9pt]{article}
 \usepackage{graphicx}
 \usepackage{verbatim}
+\oddsidemargin -0.5in
+\evensidemargin -0.5in
+\textwidth 7.5in
+\topmargin -0.75in
+\textheight 9in
+
 \begin{document}
 
 \title{Kudu: Storage for Fast Analytics on Fast Data
-\titlenote{\bf
+\footnote{\bf
 This document is a draft. Edits will be made and re-published to the Kudu
 open source project web site on a rolling basis.}
 }
 % Authors
 %-----------------
-\numberofauthors{1}
 \author{
-  \alignauthor Todd Lipcon, David Alves, Dan Burkert, Jean-Daniel Cryans, Adar Dembo, Mike Percy, Silvius Rus, Dave Wang,
-  Matteo Bertozzi, Colin Patrick McCabe, Andrew Wang\\
-  \affaddr{Cloudera, inc.}\\
+  Todd Lipcon \and David Alves \and Dan Burkert \and Jean-Daniel Cryans \and Adar Dembo \and
+  Mike Percy \and Silvius Rus \and Dave Wang \and Matteo Bertozzi \and Colin Patrick McCabe \and
+  Andrew Wang\\
+  {\small \bf Cloudera, inc.}
 }
 
 \date{28 September 2015}
@@ -357,11 +363,11 @@ by at most one in each configuration change. In order to grow a 3-replica config
 replicas, two separate configuration changes (3$\rightarrow$4, 4$\rightarrow$5) must be proposed
 and committed.
 
-Kudu implements the addition of new servers through a process called {\em remote bootstrap}.
+Kudu implements the addition of new servers through a process called {\em Tablet Copy}.
 In our design, in order to add a new replica, we first add it as a new member in the
 Raft configuration, even before notifying the destination server that a new replica will
 be copied to it. When this configuration change has been committed, the current Raft leader
-replica triggers a {\tt StartRemoteBootstrap} RPC, which causes the destination server to pull a
+replica triggers a {\tt StartTabletCopy} RPC, which causes the destination server to pull a
 snapshot of the tablet data and log from the current leader. When the transfer
 is complete, the new server opens the tablet following the same process as after
 a server restart. When the tablet has opened the tablet data and replayed any necessary
@@ -372,11 +378,11 @@ In our current implementation, new servers are added immediately as {\tt VOTER} 
 the disadvantage that, after moving from a 3-server configuration to a 4-server configuration, three
 out of the four servers must acknowledge each operation. Because the new server is in the process of
 copying, it is unable to acknowledge operations. If another server were to crash during the
-snapshot-transfer process, the tablet would become unavailable for writes until the remote bootstrap
+snapshot-transfer process, the tablet would become unavailable for writes until the Tablet Copy
 finished.
 
 To address this issue, we plan to implement a {\tt PRE\_VOTER} replica state. In this
-state, the leader will send Raft updates and trigger remote bootstrap on the
+state, the leader will send Raft updates and trigger tablet copy on the
 target replica, but not count it as a voter when calculating the size of the configuration's
 majority. Upon detecting that the {\tt PRE\_VOTER} replica has fully caught up to
 the current logs, the leader will automatically propose and commit another configuration change to
@@ -1056,7 +1062,7 @@ not yet support. When these features are added to Kudu, we plan to run these wor
 as well.
 
 \begin{figure}
-  \includegraphics[width=3in]{ycsb-results.pdf}
+  \includegraphics[width=3.5in]{ycsb-results.pdf}
   \caption{Operation throughput of YCSB random-access workloads, comparing Kudu vs.\ HBase}
   \label{fig:ycsb_throughput}
 \end{figure}

@@ -90,6 +90,7 @@ target_link_libraries(log
   gutil
   kudu_common
   kudu_fs
+  kudu_util_compression
   consensus_proto
   log_proto
   consensus_metadata_proto)
@@ -100,12 +101,12 @@ set(CONSENSUS_SRCS
   consensus_peers.cc
   consensus_queue.cc
   leader_election.cc
-  local_consensus.cc
   log_cache.cc
   peer_manager.cc
   quorum_util.cc
   raft_consensus.cc
   raft_consensus_state.cc
+  time_manager.cc
 )
 
 add_library(consensus ${CONSENSUS_SRCS})
@@ -136,11 +137,12 @@ ADD_KUDU_TEST(log_index-test)
 ADD_KUDU_TEST(mt-log-test)
 ADD_KUDU_TEST(quorum_util-test)
 ADD_KUDU_TEST(raft_consensus_quorum-test)
-ADD_KUDU_TEST(raft_consensus_state-test)
-ADD_KUDU_TEST(raft_consensus-test)
+ADD_KUDU_TEST(time_manager-test)
 
-#Tools
-add_executable(log-dump log-dump.cc)
-target_link_libraries(log-dump
-  log
-  ${KUDU_BASE_LIBS})
+# Our current version of gmock overrides virtual functions without adding
+# the 'override' keyword which, since our move to c++11, make the compiler
+# issue warnings. This suppresses those warnings.
+# TODO This problem has been resolved in recent versions of gtest/gmock (now
+# googletest). Remove this when we upgrade.
+set_source_files_properties(raft_consensus-test.cc
+    PROPERTIES COMPILE_FLAGS -Wno-inconsistent-missing-override)

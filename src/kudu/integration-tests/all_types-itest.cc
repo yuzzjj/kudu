@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <gtest/gtest.h>
 #include <vector>
+
+#include <gflags/gflags.h>
+#include <gtest/gtest.h>
 
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/client/row_result.h"
@@ -202,7 +204,7 @@ class AllTypesItest : public KuduTest {
     builder.AddColumn("int16_val")->Type(KuduColumnSchema::INT16);
     builder.AddColumn("int32_val")->Type(KuduColumnSchema::INT32);
     builder.AddColumn("int64_val")->Type(KuduColumnSchema::INT64);
-    builder.AddColumn("timestamp_val")->Type(KuduColumnSchema::TIMESTAMP);
+    builder.AddColumn("timestamp_val")->Type(KuduColumnSchema::UNIXTIME_MICROS);
     builder.AddColumn("string_val")->Type(KuduColumnSchema::STRING);
     builder.AddColumn("bool_val")->Type(KuduColumnSchema::BOOL);
     builder.AddColumn("float_val")->Type(KuduColumnSchema::FLOAT);
@@ -212,23 +214,31 @@ class AllTypesItest : public KuduTest {
   }
 
   Status CreateCluster() {
-    vector<string> ts_flags;
-    // Set the flush threshold low so that we have flushes and test the on-disk formats.
-    ts_flags.push_back("--flush_threshold_mb=1");
-    // Set the major delta compaction ratio low enough that we trigger a lot of them.
-    ts_flags.push_back("--tablet_delta_store_major_compact_min_ratio=0.001");
+    static const vector<string> kTsFlags = {
+      // Set the flush threshold low so that we have flushes and test the on-disk formats.
+      "--flush_threshold_mb=1",
+
+      // Set the major delta compaction ratio low enough that we trigger a lot of them.
+      "--tablet_delta_store_major_compact_min_ratio=0.001",
+
+      // TODO(KUDU-1346) Remove custom consensus_max_batch_size_bytes setting
+      // once KUDU-1346 is fixed. It's necessary to change the default
+      // value of the consensus_max_batch_size_bytes flag to avoid
+      // triggering debug assert when a relatively big chunk of write operations
+      // is flushed to the tablet server.
+      "--consensus_max_batch_size_bytes=2097152",
+    };
 
     ExternalMiniClusterOptions opts;
     opts.num_tablet_servers = kNumTabletServers;
 
-    for (const std::string& flag : ts_flags) {
+    for (const std::string& flag : kTsFlags) {
       opts.extra_tserver_flags.push_back(flag);
     }
 
     cluster_.reset(new ExternalMiniCluster(opts));
     RETURN_NOT_OK(cluster_->Start());
-    KuduClientBuilder builder;
-    return cluster_->CreateClient(builder, &client_);
+    return cluster_->CreateClient(nullptr, &client_);
   }
 
   Status CreateTable() {
@@ -242,6 +252,7 @@ class AllTypesItest : public KuduTest {
 
     RETURN_NOT_OK(table_creator->table_name("all-types-table")
                   .schema(&schema_)
+                  .set_range_partition_columns({ "key" })
                   .split_rows(split_rows)
                   .num_replicas(kNumTabletServers)
                   .Create());
@@ -257,7 +268,7 @@ class AllTypesItest : public KuduTest {
     RETURN_NOT_OK(row->SetInt16("int16_val", int_val));
     RETURN_NOT_OK(row->SetInt32("int32_val", int_val));
     RETURN_NOT_OK(row->SetInt64("int64_val", int_val));
-    RETURN_NOT_OK(row->SetTimestamp("timestamp_val", int_val));
+    RETURN_NOT_OK(row->SetUnixTimeMicros("timestamp_val", int_val));
     string content = strings::Substitute("hello $0", int_val);
     Slice slice_val(content);
     RETURN_NOT_OK(row->SetStringCopy("string_val", slice_val));
@@ -276,17 +287,14 @@ class AllTypesItest : public KuduTest {
   // ended up in the right place.
   Status InsertRows() {
     shared_ptr<KuduSession> session = client_->NewSession();
-    RETURN_NOT_OK(session->SetFlushMode(KuduSession::MANUAL_FLUSH));
-    int max_rows_per_tablet = setup_.GetRowsPerTablet();
+    RETURN_NOT_OK(session->SetFlushMode(KuduSession::AUTO_FLUSH_BACKGROUND));
+    const int max_rows_per_tablet = setup_.GetRowsPerTablet();
     for (int i = 0; i < kNumTablets; ++i) {
       for (int j = 0; j < max_rows_per_tablet; ++j) {
         RETURN_NOT_OK(GenerateRow(session.get(), i, j));
-        if (j % 1000 == 0) {
-          RETURN_NOT_OK(session->Flush());
-        }
       }
-      RETURN_NOT_OK(session->Flush());
     }
+    RETURN_NOT_OK(session->Flush());
     return Status::OK();
   }
 
@@ -324,7 +332,7 @@ class AllTypesItest : public KuduTest {
     ASSERT_OK(row.GetInt64("int64_val", &int64_val));
     ASSERT_EQ(int64_val, expected_int_val);
     int64_t timestamp_val;
-    ASSERT_OK(row.GetTimestamp("timestamp_val", &timestamp_val));
+    ASSERT_OK(row.GetUnixTimeMicros("timestamp_val", &timestamp_val));
     ASSERT_EQ(timestamp_val, expected_int_val);
 
     string content = strings::Substitute("hello $0", expected_int_val);
@@ -376,7 +384,6 @@ class AllTypesItest : public KuduTest {
       RETURN_NOT_OK(scanner.SetBatchSizeBytes(KMaxBatchSize));
       RETURN_NOT_OK(scanner.SetFaultTolerant());
       RETURN_NOT_OK(scanner.SetReadMode(KuduScanner::READ_AT_SNAPSHOT));
-      RETURN_NOT_OK(scanner.SetTimeoutMillis(5000));
       RETURN_NOT_OK(scanner.Open());
       LOG(INFO) << "Scanning tablet: [" << low_split << ", " << high_split << ")";
 
@@ -435,7 +442,7 @@ typedef ::testing::Types<IntKeysTestSetup<KeyTypeWrapper<INT8> >,
                          IntKeysTestSetup<KeyTypeWrapper<INT16> >,
                          IntKeysTestSetup<KeyTypeWrapper<INT32> >,
                          IntKeysTestSetup<KeyTypeWrapper<INT64> >,
-                         IntKeysTestSetup<KeyTypeWrapper<TIMESTAMP> >,
+                         IntKeysTestSetup<KeyTypeWrapper<UNIXTIME_MICROS> >,
                          SliceKeysTestSetup<KeyTypeWrapper<STRING> >,
                          SliceKeysTestSetup<KeyTypeWrapper<BINARY> >
                          > KeyTypes;

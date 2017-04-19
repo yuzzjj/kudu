@@ -18,7 +18,6 @@
 #define KUDU_TABLET_TABLET_TEST_UTIL_H
 
 #include <algorithm>
-#include <gflags/gflags.h>
 #include <memory>
 #include <string>
 #include <vector>
@@ -34,8 +33,6 @@
 #include "kudu/util/metrics.h"
 #include "kudu/util/test_util.h"
 
-DECLARE_bool(enable_data_block_fsync);
-
 namespace kudu {
 namespace tablet {
 
@@ -45,13 +42,12 @@ using std::vector;
 
 class KuduTabletTest : public KuduTest {
  public:
-  explicit KuduTabletTest(const Schema& schema)
+  explicit KuduTabletTest(const Schema& schema,
+                          TabletHarness::Options::ClockType clock_type =
+                          TabletHarness::Options::ClockType::LOGICAL_CLOCK)
     : schema_(schema.CopyWithColumnIds()),
-      client_schema_(schema) {
-    // Keep unit tests fast, but only if no one has set the flag explicitly.
-    if (google::GetCommandLineFlagInfoOrDie("enable_data_block_fsync").is_default) {
-      FLAGS_enable_data_block_fsync = false;
-    }
+      client_schema_(schema),
+      clock_type_(clock_type) {
   }
 
   virtual void SetUp() OVERRIDE {
@@ -64,6 +60,7 @@ class KuduTabletTest : public KuduTest {
     string dir = root_dir.empty() ? GetTestPath("fs_root") : root_dir;
     TabletHarness::Options opts(dir);
     opts.enable_metrics = true;
+    opts.clock_type = clock_type_;
     bool first_time = harness_ == NULL;
     harness_.reset(new TabletHarness(schema_, opts));
     CHECK_OK(harness_->Create(first_time));
@@ -115,6 +112,7 @@ class KuduTabletTest : public KuduTest {
  protected:
   const Schema schema_;
   const Schema client_schema_;
+  const TabletHarness::Options::ClockType clock_type_;
 
   gscoped_ptr<TabletHarness> harness_;
 };
@@ -139,8 +137,27 @@ class KuduRowSetTest : public KuduTabletTest {
   std::shared_ptr<RowSetMetadata> rowset_meta_;
 };
 
-static inline Status IterateToStringList(RowwiseIterator *iter,
-                                         vector<string> *out,
+// Iterate through the values without outputting them at the end
+// This is strictly a measure of decoding and evaluating predicates
+static inline Status SilentIterateToStringList(RowwiseIterator* iter,
+                                               int* fetched) {
+  const Schema& schema = iter->schema();
+  Arena arena(1024, 1024);
+  RowBlock block(schema, 100, &arena);
+  *fetched = 0;
+  while (iter->HasNext()) {
+    RETURN_NOT_OK(iter->NextBlock(&block));
+    for (size_t i = 0; i < block.nrows(); i++) {
+      if (block.selection_vector()->IsRowSelected(i)) {
+        (*fetched)++;
+      }
+    }
+  }
+  return Status::OK();
+}
+
+static inline Status IterateToStringList(RowwiseIterator* iter,
+                                         vector<string>* out,
                                          int limit = INT_MAX) {
   out->clear();
   Schema schema = iter->schema();
@@ -168,10 +185,7 @@ static inline void CollectRowsForSnapshots(Tablet* tablet,
   for (const MvccSnapshot& snapshot : snaps) {
     DVLOG(1) << "Snapshot: " <<  snapshot.ToString();
     gscoped_ptr<RowwiseIterator> iter;
-    ASSERT_OK(tablet->NewRowIterator(schema,
-                                            snapshot,
-                                            Tablet::UNORDERED,
-                                            &iter));
+    ASSERT_OK(tablet->NewRowIterator(schema, snapshot, UNORDERED, &iter));
     ASSERT_OK(iter->Init(NULL));
     auto collector = new vector<string>();
     ASSERT_OK(IterateToStringList(iter.get(), collector));
@@ -195,7 +209,7 @@ static inline void VerifySnapshotsHaveSameResult(Tablet* tablet,
     gscoped_ptr<RowwiseIterator> iter;
     ASSERT_OK(tablet->NewRowIterator(schema,
                                             snapshot,
-                                            Tablet::UNORDERED,
+                                            UNORDERED,
                                             &iter));
     ASSERT_OK(iter->Init(NULL));
     vector<string> collector;
@@ -220,7 +234,7 @@ static inline Status DumpRowSet(const RowSet &rs,
                                 vector<string> *out,
                                 int limit = INT_MAX) {
   gscoped_ptr<RowwiseIterator> iter;
-  RETURN_NOT_OK(rs.NewRowIterator(&projection, snap, &iter));
+  RETURN_NOT_OK(rs.NewRowIterator(&projection, snap, UNORDERED, &iter));
   RETURN_NOT_OK(iter->Init(NULL));
   RETURN_NOT_OK(IterateToStringList(iter.get(), out, limit));
   return Status::OK();

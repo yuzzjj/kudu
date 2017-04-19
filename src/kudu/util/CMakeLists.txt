@@ -16,6 +16,20 @@
 # under the License.
 
 #######################################
+# util_compression_proto
+#######################################
+
+PROTOBUF_GENERATE_CPP(
+  UTIL_COMPRESSION_PROTO_SRCS UTIL_COMPRESSION_PROTO_HDRS UTIL_COMPRESSION_PROTO_TGTS
+  SOURCE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..
+  BINARY_ROOT ${CMAKE_CURRENT_BINARY_DIR}/../..
+  PROTO_FILES compression/compression.proto)
+ADD_EXPORTABLE_LIBRARY(util_compression_proto
+  SRCS ${UTIL_COMPRESSION_PROTO_SRCS}
+  DEPS protobuf
+  NONLINK_DEPS ${UTIL_COMPRESSION_PROTO_TGTS})
+
+#######################################
 # histogram_proto
 #######################################
 
@@ -28,6 +42,20 @@ ADD_EXPORTABLE_LIBRARY(histogram_proto
   SRCS ${HISTOGRAM_PROTO_SRCS}
   DEPS protobuf
   NONLINK_DEPS ${HISTOGRAM_PROTO_TGTS})
+
+#######################################
+# maintenance_manager_proto
+#######################################
+
+PROTOBUF_GENERATE_CPP(
+    MAINTENANCE_MANAGER_PROTO_SRCS MAINTENANCE_MANAGER_PROTO_HDRS MAINTENANCE_MANAGER_PROTO_TGTS
+    SOURCE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..
+    BINARY_ROOT ${CMAKE_CURRENT_BINARY_DIR}/../..
+    PROTO_FILES maintenance_manager.proto)
+ADD_EXPORTABLE_LIBRARY(maintenance_manager_proto
+    SRCS ${MAINTENANCE_MANAGER_PROTO_SRCS}
+    DEPS protobuf
+    NONLINK_DEPS ${MAINTENANCE_MANAGER_PROTO_TGTS})
 
 #######################################
 # pb_util_proto
@@ -88,6 +116,7 @@ else ()
 endif()
 
 set(UTIL_SRCS
+  async_logger.cc
   atomic.cc
   bitmap.cc
   bloom_filter.cc
@@ -106,6 +135,7 @@ set(UTIL_SRCS
   faststring.cc
   failure_detector.cc
   fault_injection.cc
+  file_cache.cc
   flags.cc
   flag_tags.cc
   group_varint.cc
@@ -118,12 +148,15 @@ set(UTIL_SRCS
   kernel_stack_watchdog.cc
   locks.cc
   logging.cc
+  maintenance_manager.cc
   malloc.cc
   memcmpable_varint.cc
-  memory/arena.cc memory/memory.cc
-  memenv/memenv.cc
+  memory/arena.cc
+  memory/memory.cc
+  memory/overwrite.cc
   mem_tracker.cc
   metrics.cc
+  minidump.cc
   monotime.cc
   mutex.cc
   net/dns_resolver.cc
@@ -139,8 +172,10 @@ set(UTIL_SRCS
   random_util.cc
   resettable_heartbeater.cc
   rolling_log.cc
+  rw_mutex.cc
   rwc_lock.cc
   ${SEMAPHORE_CC}
+  signal.cc
   slice.cc
   spinlock_profiling.cc
   status.cc
@@ -148,17 +183,25 @@ set(UTIL_SRCS
   string_case.cc
   striped64.cc
   subprocess.cc
-  sync_point.cc
   test_graph.cc
+  test_util_prod.cc
   thread.cc
   threadlocal.cc
   threadpool.cc
   thread_restrictions.cc
+  throttler.cc
   trace.cc
+  trace_metrics.cc
   user.cc
   url-coding.cc
   version_info.cc
+  zlib.cc
 )
+
+# overwrite.cc contains a single function which would be a hot spot in
+# debug builds. It's separated into a separate file so it can be
+# optimized regardless of the default optimization options.
+set_source_files_properties(memory/overwrite.cc PROPERTIES COMPILE_FLAGS "-O3")
 
 if(NOT APPLE)
   set(UTIL_SRCS
@@ -167,13 +210,13 @@ if(NOT APPLE)
 endif()
 
 set(UTIL_LIBS
-  boost_system
-  boost_thread
   crcutil
   gflags
   glog
   gutil
   histogram_proto
+  libev
+  maintenance_manager_proto
   pb_util_proto
   protobuf
   version_info_proto
@@ -182,6 +225,8 @@ set(UTIL_LIBS
 if(NOT APPLE)
   set(UTIL_LIBS
     ${UTIL_LIBS}
+    breakpad_client
+    dl
     rt
     vmem)
 endif()
@@ -195,46 +240,75 @@ endif()
 ADD_EXPORTABLE_LIBRARY(kudu_util
   SRCS ${UTIL_SRCS}
   DEPS ${UTIL_LIBS}
+  NONLINK_DEPS gen_version_info
   EXPORTED_DEPS ${EXPORTED_UTIL_LIBS})
 
-add_dependencies(kudu_util gen_version_info)
+#######################################
+# kudu_util_compression
+#######################################
+set(UTIL_COMPRESSION_SRCS
+  compression/compression_codec.cc)
+set(UTIL_COMPRESSION_LIBS
+  kudu_util
+  util_compression_proto
+
+  glog
+  gutil
+  lz4
+  snappy
+  zlib)
+ADD_EXPORTABLE_LIBRARY(kudu_util_compression
+  SRCS ${UTIL_COMPRESSION_SRCS}
+  DEPS ${UTIL_COMPRESSION_LIBS})
 
 #######################################
 # kudu_test_util
 #######################################
 
-add_library(kudu_test_util
-  test_util.cc
-  curl_util.cc)
-target_link_libraries(kudu_test_util
-  ${CURL_LIBRARIES}
-  gflags
-  glog
-  gmock
-  kudu_util)
+if(NOT NO_TESTS)
+  add_library(kudu_test_util
+    test_util.cc)
+  target_link_libraries(kudu_test_util
+    gflags
+    glog
+    gmock
+    kudu_util)
 
-if(NOT APPLE)
-target_link_libraries(kudu_test_util
-  vmem)
-endif()
+  if(NOT APPLE)
+    target_link_libraries(kudu_test_util
+      vmem)
+  endif()
+
+#######################################
+# kudu_curl_util
+#######################################
+  add_library(kudu_curl_util
+    curl_util.cc)
+  target_link_libraries(kudu_curl_util
+    security
+    ${CURL_LIBRARIES}
+    glog
+    gutil)
 
 #######################################
 # kudu_test_main
 #######################################
 
-add_library(kudu_test_main
-  test_main.cc)
-target_link_libraries(kudu_test_main
-  gflags
-  glog
-  gmock
-  kudu_util
-  kudu_test_util
-  dl)
-
-if(NOT APPLE)
+  add_library(kudu_test_main
+    test_main.cc)
   target_link_libraries(kudu_test_main
-    rt)
+    ${KRB5_REALM_OVERRIDE}
+    gflags
+    glog
+    gmock
+    kudu_util
+    kudu_test_util)
+
+  if(NOT APPLE)
+    target_link_libraries(kudu_test_main
+      dl
+      rt)
+  endif()
 endif()
 
 #######################################
@@ -260,9 +334,13 @@ ADD_KUDU_TEST(countdown_latch-test)
 ADD_KUDU_TEST(crc-test RUN_SERIAL true) # has a benchmark
 ADD_KUDU_TEST(debug-util-test)
 ADD_KUDU_TEST(env-test LABELS no_tsan)
+ADD_KUDU_TEST(env_util-test)
 ADD_KUDU_TEST(errno-test)
 ADD_KUDU_TEST(failure_detector-test)
+ADD_KUDU_TEST(file_cache-test)
+ADD_KUDU_TEST(file_cache-stress-test RUN_SERIAL true)
 ADD_KUDU_TEST(flag_tags-test)
+ADD_KUDU_TEST(flags-test)
 ADD_KUDU_TEST(group_varint-test)
 ADD_KUDU_TEST(hash_util-test)
 ADD_KUDU_TEST(hdr_histogram-test)
@@ -271,11 +349,11 @@ ADD_KUDU_TEST(interval_tree-test)
 ADD_KUDU_TEST(jsonreader-test)
 ADD_KUDU_TEST(knapsack_solver-test)
 ADD_KUDU_TEST(logging-test)
+ADD_KUDU_TEST(maintenance_manager-test)
 ADD_KUDU_TEST(map-util-test)
-ADD_KUDU_TEST(memcmpable_varint-test LABELS no_tsan)
-ADD_KUDU_TEST(memenv/memenv-test)
-ADD_KUDU_TEST(memory/arena-test)
 ADD_KUDU_TEST(mem_tracker-test)
+ADD_KUDU_TEST(memcmpable_varint-test LABELS no_tsan)
+ADD_KUDU_TEST(memory/arena-test)
 ADD_KUDU_TEST(metrics-test)
 ADD_KUDU_TEST(monotime-test)
 ADD_KUDU_TEST(mt-hdr_histogram-test RUN_SERIAL true)
@@ -284,18 +362,20 @@ ADD_KUDU_TEST(mt-threadlocal-test RUN_SERIAL true)
 ADD_KUDU_TEST(net/dns_resolver-test)
 ADD_KUDU_TEST(net/net_util-test)
 ADD_KUDU_TEST(object_pool-test)
+ADD_KUDU_TEST(oid_generator-test)
 ADD_KUDU_TEST(once-test)
 ADD_KUDU_TEST(os-util-test)
 ADD_KUDU_TEST(path_util-test)
-ADD_KUDU_TEST(pstack_watcher-test)
 ADD_KUDU_TEST(random-test)
 ADD_KUDU_TEST(random_util-test)
 ADD_KUDU_TEST(resettable_heartbeater-test)
 ADD_KUDU_TEST(rle-test)
 ADD_KUDU_TEST(rolling_log-test)
+ADD_KUDU_TEST(rw_mutex-test)
 ADD_KUDU_TEST(rw_semaphore-test)
 ADD_KUDU_TEST(rwc_lock-test)
 ADD_KUDU_TEST(safe_math-test)
+ADD_KUDU_TEST(scoped_cleanup-test)
 ADD_KUDU_TEST(slice-test)
 ADD_KUDU_TEST(spinlock_profiling-test)
 ADD_KUDU_TEST(stack_watchdog-test)
@@ -303,12 +383,17 @@ ADD_KUDU_TEST(status-test)
 ADD_KUDU_TEST(string_case-test)
 ADD_KUDU_TEST(striped64-test)
 ADD_KUDU_TEST(subprocess-test)
-ADD_KUDU_TEST(sync_point-test)
 ADD_KUDU_TEST(thread-test)
 ADD_KUDU_TEST(threadpool-test)
+ADD_KUDU_TEST(throttler-test)
 ADD_KUDU_TEST(trace-test)
 ADD_KUDU_TEST(url-coding-test)
 ADD_KUDU_TEST(user-test)
+
+if (NOT APPLE)
+  ADD_KUDU_TEST(minidump-test)
+  ADD_KUDU_TEST(pstack_watcher-test)
+endif()
 
 #######################################
 # jsonwriter_test_proto
@@ -321,6 +406,7 @@ PROTOBUF_GENERATE_CPP(
   PROTO_FILES jsonwriter_test.proto)
 add_library(jsonwriter_test_proto ${JSONWRITER_TEST_PROTO_SRCS} ${JSONWRITER_TEST_PROTO_HDRS})
 target_link_libraries(jsonwriter_test_proto
+  pb_util_proto
   protobuf)
 
 #######################################
@@ -328,13 +414,13 @@ target_link_libraries(jsonwriter_test_proto
 #######################################
 
 ADD_KUDU_TEST(jsonwriter-test)
-if(NOT "${NO_TESTS}")
+if(NOT NO_TESTS)
   target_link_libraries(jsonwriter-test
     jsonwriter_test_proto)
 endif()
 
 #######################################
-# proto_container_test_proto
+# pb_util_test_proto
 #######################################
 
 PROTOBUF_GENERATE_CPP(
@@ -344,11 +430,13 @@ PROTOBUF_GENERATE_CPP(
   PROTO_FILES
     proto_container_test.proto
     proto_container_test2.proto
-    proto_container_test3.proto)
-add_library(proto_container_test_proto
+    proto_container_test3.proto
+    pb_util_test.proto)
+add_library(pb_util_test_proto
   ${PROTO_CONTAINER_TEST_PROTO_SRCS}
   ${PROTO_CONTAINER_TEST_PROTO_HDRS})
-target_link_libraries(proto_container_test_proto
+target_link_libraries(pb_util_test_proto
+  pb_util_proto
   protobuf)
 
 #######################################
@@ -356,7 +444,16 @@ target_link_libraries(proto_container_test_proto
 #######################################
 
 ADD_KUDU_TEST(pb_util-test)
-if(NOT "${NO_TESTS}")
+if(NOT NO_TESTS)
   target_link_libraries(pb_util-test
-    proto_container_test_proto)
+    pb_util_test_proto)
+endif()
+
+#######################################
+# util/compression tests
+#######################################
+ADD_KUDU_TEST(compression/compression-test)
+if(NOT NO_TESTS)
+  target_link_libraries(compression-test
+    kudu_util_compression)
 endif()

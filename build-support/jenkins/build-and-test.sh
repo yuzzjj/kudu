@@ -56,12 +56,13 @@
 #   BUILD_JAVA        Default: 1
 #     Build and test java code if this is set to 1.
 #
-#   VALIDATE_CSD      Default: 0
-#     If 1, runs the CM CSD validator against the Kudu CSD.
-#     This requires access to an internal Cloudera maven repository.
-#
 #   BUILD_PYTHON       Default: 1
 #     Build and test the Python wrapper of the client API.
+#
+#   BUILD_PYTHON3      Default: 1
+#     Build and test the Python wrapper of the client API in Python. This
+#     option is not mutually exclusive from BUILD_PYTHON. If both options
+#     are set (default), then both will be run.
 #
 #   MVN_FLAGS          Default: ""
 #     Extra flags which are passed to 'mvn' when building and running Java
@@ -102,8 +103,8 @@ export KUDU_ALLOW_SLOW_TESTS=${KUDU_ALLOW_SLOW_TESTS:-$DEFAULT_ALLOW_SLOW_TESTS}
 export KUDU_COMPRESS_TEST_OUTPUT=${KUDU_COMPRESS_TEST_OUTPUT:-1}
 export TEST_TMPDIR=${TEST_TMPDIR:-/tmp/kudutest-$UID}
 BUILD_JAVA=${BUILD_JAVA:-1}
-VALIDATE_CSD=${VALIDATE_CSD:-0}
 BUILD_PYTHON=${BUILD_PYTHON:-1}
+BUILD_PYTHON3=${BUILD_PYTHON3:-1}
 
 # Ensure that the test data directory is usable.
 mkdir -p "$TEST_TMPDIR"
@@ -122,8 +123,13 @@ BUILD_ROOT=$SOURCE_ROOT/build/$BUILD_TYPE_LOWER
 rm -rf $BUILD_ROOT
 mkdir -p $BUILD_ROOT
 
+# Same for the Java tests, which aren't inside BUILD_ROOT
+rm -rf $SOURCE_ROOT/java/*/target
+
 list_flaky_tests() {
-  curl -s "http://$TEST_RESULT_SERVER/list_failed_tests?num_days=3&build_pattern=%25kudu-test%25"
+  local url="http://$TEST_RESULT_SERVER/list_failed_tests?num_days=3&build_pattern=%25kudu-test%25"
+  >&2 echo Fetching flaky test list from "$url" ...
+  curl -s --show-error "$url"
   return $?
 }
 
@@ -145,9 +151,13 @@ if [ -d "$TOOLCHAIN_DIR" ]; then
   PATH=$TOOLCHAIN_DIR/apache-maven-3.0/bin:$PATH
 fi
 
-$SOURCE_ROOT/build-support/enable_devtoolset.sh thirdparty/build-if-necessary.sh
+THIRDPARTY_TYPE=
+if [ "$BUILD_TYPE" = "TSAN" ]; then
+  THIRDPARTY_TYPE=tsan
+fi
+$SOURCE_ROOT/build-support/enable_devtoolset.sh thirdparty/build-if-necessary.sh $THIRDPARTY_TYPE
 
-THIRDPARTY_BIN=$(pwd)/thirdparty/installed/bin
+THIRDPARTY_BIN=$(pwd)/thirdparty/installed/common/bin
 export PPROF_PATH=$THIRDPARTY_BIN/pprof
 
 if which ccache >/dev/null ; then
@@ -156,38 +166,69 @@ else
   CLANG=$(pwd)/thirdparty/clang-toolchain/bin/clang
 fi
 
-# Before running cmake below, clean out any errant cmake state from the source
-# tree. We need this to help transition into a world where out-of-tree builds
-# are required. Once that's done, the cleanup can be removed.
-rm -rf $SOURCE_ROOT/CMakeCache.txt $SOURCE_ROOT/CMakeFiles
-
 # Configure the build
 #
 # ASAN/TSAN can't build the Python bindings because the exported Kudu client
 # library (which the bindings depend on) is missing ASAN/TSAN symbols.
 cd $BUILD_ROOT
 if [ "$BUILD_TYPE" = "ASAN" ]; then
-  $SOURCE_ROOT/build-support/enable_devtoolset.sh \
-    "env CC=$CLANG CXX=$CLANG++ $THIRDPARTY_BIN/cmake -DKUDU_USE_ASAN=1 -DKUDU_USE_UBSAN=1 $SOURCE_ROOT"
-  BUILD_TYPE=fastdebug
+  USE_CLANG=1
+  CMAKE_BUILD=fastdebug
+  EXTRA_BUILD_FLAGS="-DKUDU_USE_ASAN=1 -DKUDU_USE_UBSAN=1"
   BUILD_PYTHON=0
+  BUILD_PYTHON3=0
 elif [ "$BUILD_TYPE" = "TSAN" ]; then
-  $SOURCE_ROOT/build-support/enable_devtoolset.sh \
-    "env CC=$CLANG CXX=$CLANG++ $THIRDPARTY_BIN/cmake -DKUDU_USE_TSAN=1 $SOURCE_ROOT"
-  BUILD_TYPE=fastdebug
+  USE_CLANG=1
+  CMAKE_BUILD=fastdebug
+  EXTRA_BUILD_FLAGS="-DKUDU_USE_TSAN=1"
   EXTRA_TEST_FLAGS="$EXTRA_TEST_FLAGS -LE no_tsan"
   BUILD_PYTHON=0
+  BUILD_PYTHON3=0
 elif [ "$BUILD_TYPE" = "COVERAGE" ]; then
+  USE_CLANG=1
+  CMAKE_BUILD=debug
+  EXTRA_BUILD_FLAGS="-DKUDU_GENERATE_COVERAGE=1"
   DO_COVERAGE=1
-  BUILD_TYPE=debug
-  $SOURCE_ROOT/build-support/enable_devtoolset.sh "$THIRDPARTY_BIN/cmake -DKUDU_GENERATE_COVERAGE=1 $SOURCE_ROOT"
+
+  # We currently dont capture coverage for Java or Python.
+  BUILD_JAVA=0
+  BUILD_PYTHON=0
+  BUILD_PYTHON3=0
 elif [ "$BUILD_TYPE" = "LINT" ]; then
+  CMAKE_BUILD=debug
+else
+  # Must be DEBUG or RELEASE
+  CMAKE_BUILD=$BUILD_TYPE
+fi
+
+# Assemble the cmake command line.
+CMAKE=
+if [ -n "$USE_CLANG" ]; then
+  CMAKE="env CC=$CLANG CXX=$CLANG++"
+fi
+CMAKE="$CMAKE $SOURCE_ROOT/build-support/enable_devtoolset.sh"
+CMAKE="$CMAKE $THIRDPARTY_BIN/cmake"
+CMAKE="$CMAKE -DCMAKE_BUILD_TYPE=$CMAKE_BUILD"
+
+# On distributed tests, force dynamic linking even for release builds. Otherwise,
+# the test binaries are too large and we spend way too much time uploading them
+# to the test slaves.
+if [ "$ENABLE_DIST_TEST" == "1" ]; then
+  CMAKE="$CMAKE -DKUDU_LINK=dynamic"
+fi
+if [ -n "$EXTRA_BUILD_FLAGS" ]; then
+  CMAKE="$CMAKE $EXTRA_BUILD_FLAGS"
+fi
+CMAKE="$CMAKE $SOURCE_ROOT"
+$CMAKE
+
+# Short circuit for LINT builds.
+if [ "$BUILD_TYPE" = "LINT" ]; then
   # Create empty test logs or else Jenkins fails to archive artifacts, which
   # results in the build failing.
   mkdir -p Testing/Temporary
   mkdir -p $TEST_LOGDIR
 
-  $SOURCE_ROOT/build-support/enable_devtoolset.sh "$THIRDPARTY_BIN/cmake $SOURCE_ROOT"
   make lint | tee $TEST_LOGDIR/lint.log
   exit $?
 fi
@@ -215,16 +256,6 @@ if [ "$KUDU_FLAKY_TEST_ATTEMPTS" -gt 1 ]; then
   fi
 fi
 
-# On distributed tests, force dynamic linking even for release builds. Otherwise,
-# the test binaries are too large and we spend way too much time uploading them
-# to the test slaves.
-LINK_FLAGS=
-if [ "$ENABLE_DIST_TEST" == "1" ]; then
-  LINK_FLAGS="-DKUDU_LINK=dynamic"
-fi
-
-$SOURCE_ROOT/build-support/enable_devtoolset.sh "$THIRDPARTY_BIN/cmake -DCMAKE_BUILD_TYPE=${BUILD_TYPE} $LINK_FLAGS $SOURCE_ROOT"
-
 # our tests leave lots of data lying around, clean up before we run
 if [ -d "$TEST_TMPDIR" ]; then
   rm -Rf $TEST_TMPDIR/*
@@ -250,15 +281,25 @@ if [ "$RUN_FLAKY_ONLY" == "1" ] ; then
   echo
   echo Running flaky tests only:
   echo ------------------------------------------------------------
-  list_flaky_tests | tee build/flaky-tests.txt
+  if ! ( set -o pipefail ;
+         list_flaky_tests | tee $BUILD_ROOT/flaky-tests.txt) ; then
+    echo Could not fetch flaky tests list.
+    exit 1
+  fi
   test_regex=$(perl -e '
     chomp(my @lines = <>);
     print join("|", map { "^" . quotemeta($_) . "\$" } @lines);
-   ' build/flaky-tests.txt)
+   ' $BUILD_ROOT/flaky-tests.txt)
+  if [ -z "$test_regex" ]; then
+    echo No tests are flaky.
+    exit 0
+  fi
   EXTRA_TEST_FLAGS="$EXTRA_TEST_FLAGS -R $test_regex"
 
-  # We don't support detecting java flaky tests at the moment.
-  echo Disabling Java build since RUN_FLAKY_ONLY=1
+  # We don't support detecting java and python flaky tests at the moment.
+  echo Disabling Java and python build since RUN_FLAKY_ONLY=1
+  BUILD_PYTHON=0
+  BUILD_PYTHON3=0
   BUILD_JAVA=0
 fi
 
@@ -290,7 +331,11 @@ if [ "$DO_COVERAGE" == "1" ]; then
   echo
   echo Generating coverage report...
   echo ------------------------------------------------------------
-  if ! $SOURCE_ROOT/thirdparty/gcovr-3.0/scripts/gcovr -r $SOURCE_ROOT --xml \
+  if ! $SOURCE_ROOT/thirdparty/installed/common/bin/gcovr \
+      -r $SOURCE_ROOT \
+      --gcov-filter='.*src#kudu.*' \
+      --gcov-executable=$SOURCE_ROOT/build-support/llvm-gcov-wrapper \
+      --xml \
       > $BUILD_ROOT/coverage.xml ; then
     EXIT_STATUS=1
     FAILURES="$FAILURES"$'Coverage report failed\n'
@@ -301,23 +346,26 @@ if [ "$BUILD_JAVA" == "1" ]; then
   echo
   echo Building and testing java...
   echo ------------------------------------------------------------
+
   # Make sure we use JDK7
   export JAVA_HOME=$JAVA7_HOME
   export PATH=$JAVA_HOME/bin:$PATH
   pushd $SOURCE_ROOT/java
   export TSAN_OPTIONS="$TSAN_OPTIONS suppressions=$SOURCE_ROOT/build-support/tsan-suppressions.txt history_size=7"
   set -x
-  VALIDATE_CSD_FLAG=""
-  if [ "$VALIDATE_CSD" == "1" ]; then
-    VALIDATE_CSD_FLAG="-PvalidateCSD"
-  fi
-  if ! mvn $MVN_FLAGS -PbuildCSD \
-      $VALIDATE_CSD_FLAG \
+  if ! mvn $MVN_FLAGS \
       -Dsurefire.rerunFailingTestsCount=3 \
       -Dfailsafe.rerunFailingTestsCount=3 \
       clean verify ; then
     EXIT_STATUS=1
     FAILURES="$FAILURES"$'Java build/test failed\n'
+  fi
+  # Test kudu-spark with Spark 1.x + Scala 2.10 profile
+  # This won't work if there are ever Spark integration tests!
+  rm -rf kudu-spark/target/
+  if ! mvn $MVN_FLAGS -Pspark_2.10 -Dtest="org.apache.kudu.spark.*.*" test; then
+    EXIT_STATUS=1
+    FAILURES="$FAILURES"$'spark build/test failed\n'
   fi
   set +x
   popd
@@ -354,6 +402,41 @@ if [ "$BUILD_PYTHON" == "1" ]; then
     EXIT_STATUS=1
     FAILURES="$FAILURES"$'Python tests failed\n'
   fi
+  deactivate
+  popd
+fi
+
+if [ "$BUILD_PYTHON3" == "1" ]; then
+  echo
+  echo Building and testing python 3.
+  echo ------------------------------------------------------------
+
+  # Failing to compile the Python client should result in a build failure
+  set -e
+  export KUDU_HOME=$SOURCE_ROOT
+  export KUDU_BUILD=$BUILD_ROOT
+  pushd $SOURCE_ROOT/python
+
+  # Create a sane test environment
+  rm -Rf $KUDU_BUILD/py_env
+  virtualenv -p python3 $KUDU_BUILD/py_env
+  source $KUDU_BUILD/py_env/bin/activate
+  pip install --upgrade pip
+  CC=$CLANG CXX=$CLANG++ pip install --disable-pip-version-check -r requirements.txt
+
+  # Delete old Cython extensions to force them to be rebuilt.
+  rm -Rf build kudu_python.egg-info kudu/*.so
+
+  # Assuming we run this script from base dir
+  CC=$CLANG CXX=$CLANG++ python setup.py build_ext
+  set +e
+  if ! python setup.py test \
+      --addopts="kudu --junit-xml=$KUDU_BUILD/test-logs/python3_client.xml" \
+      2> $KUDU_BUILD/test-logs/python3_client.log ; then
+    EXIT_STATUS=1
+    FAILURES="$FAILURES"$'Python 3 tests failed\n'
+  fi
+  deactivate
   popd
 fi
 
@@ -362,13 +445,13 @@ if [ "$ENABLE_DIST_TEST" == "1" ]; then
   echo
   echo Fetching previously submitted dist-test results...
   echo ------------------------------------------------------------
-  if ! $DIST_TEST_HOME/client.py watch ; then
+  if ! $DIST_TEST_HOME/bin/client watch ; then
     EXIT_STATUS=1
     FAILURES="$FAILURES"$'Distributed tests failed\n'
   fi
   DT_DIR=$TEST_LOGDIR/dist-test-out
   rm -Rf $DT_DIR
-  $DIST_TEST_HOME/client.py fetch --artifacts -d $DT_DIR
+  $DIST_TEST_HOME/bin/client fetch --artifacts -d $DT_DIR
   # Fetching the artifacts expands each log into its own directory.
   # Move them back into the main log directory
   rm -f $DT_DIR/*zip
@@ -409,20 +492,15 @@ if [ $EXIT_STATUS != 0 ]; then
 fi
 
 # If all tests passed, ensure that they cleaned up their test output.
-#
-# TODO: Python is currently leaking a tmp directory sometimes (KUDU-1301).
-# Temporarily disabled until that's fixed.
-#
-# if [ $EXIT_STATUS == 0 ]; then
-#   TEST_TMPDIR_CONTENTS=$(ls $TEST_TMPDIR)
-#   if [ -n "$TEST_TMPDIR_CONTENTS" ]; then
-#     echo "All tests passed, yet some left behind their test output:"
-#     for SUBDIR in $TEST_TMPDIR_CONTENTS; do
-#       echo $SUBDIR
-#     done
-#     EXIT_STATUS=1
-#   fi
-# fi
+if [ $EXIT_STATUS == 0 ]; then
+  TEST_TMPDIR_CONTENTS=$(ls $TEST_TMPDIR)
+  if [ -n "$TEST_TMPDIR_CONTENTS" ]; then
+    echo "All tests passed, yet some left behind their test output."
+    echo "TEST_TMPDIR: $TEST_TMPDIR"
+    find $TEST_TMPDIR -ls
+    EXIT_STATUS=1
+  fi
+fi
 
 set -e
 

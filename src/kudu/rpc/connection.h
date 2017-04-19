@@ -18,22 +18,23 @@
 #ifndef KUDU_RPC_CONNECTION_H
 #define KUDU_RPC_CONNECTION_H
 
-#include <boost/intrusive/list.hpp>
-#include <ev++.h>
-#include <memory>
 #include <stdint.h>
-#include <unordered_map>
 
 #include <limits>
+#include <memory>
+#include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+#include <boost/intrusive/list.hpp>
+#include <ev++.h>
 
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/ref_counted.h"
-#include "kudu/rpc/outbound_call.h"
-#include "kudu/rpc/sasl_client.h"
-#include "kudu/rpc/sasl_server.h"
 #include "kudu/rpc/inbound_call.h"
+#include "kudu/rpc/outbound_call.h"
+#include "kudu/rpc/remote_user.h"
 #include "kudu/rpc/transfer.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/sockaddr.h"
@@ -47,6 +48,7 @@ namespace rpc {
 class DumpRunningRpcsRequestPB;
 class RpcConnectionPB;
 class ReactorThread;
+class RpczStore;
 
 //
 // A connection between an endpoint and us.
@@ -79,7 +81,9 @@ class Connection : public RefCountedThreadSafe<Connection> {
   // remote: the address of the remote end
   // socket: the socket to take ownership of.
   // direction: whether we are the client or server side
-  Connection(ReactorThread *reactor_thread, Sockaddr remote, int socket,
+  Connection(ReactorThread *reactor_thread,
+             Sockaddr remote,
+             std::unique_ptr<Socket> socket,
              Direction direction);
 
   // Set underlying socket to non-blocking (or blocking) mode.
@@ -118,14 +122,19 @@ class Connection : public RefCountedThreadSafe<Connection> {
   // The address of the remote end of the connection.
   const Sockaddr &remote() const { return remote_; }
 
-  // Set the user credentials which should be used to log in.
-  void set_user_credentials(const UserCredentials &user_credentials);
-
-  // Modify the user credentials which will be used to log in.
-  UserCredentials* mutable_user_credentials() { return &user_credentials_; }
+  // Set the user credentials for an outbound connection.
+  void set_local_user_credentials(UserCredentials creds) {
+    DCHECK_EQ(direction_, CLIENT);
+    local_user_credentials_ = std::move(creds);
+  }
 
   // Get the user credentials which will be used to log in.
-  const UserCredentials &user_credentials() const { return user_credentials_; }
+  const UserCredentials& local_user_credentials() const {
+    DCHECK_EQ(direction_, CLIENT);
+    return local_user_credentials_;
+  }
+
+  RpczStore* rpcz_store();
 
   // libev callback when data is available to read.
   void ReadHandler(ev::io &watcher, int revents);
@@ -138,22 +147,10 @@ class Connection : public RefCountedThreadSafe<Connection> {
 
   Direction direction() const { return direction_; }
 
-  Socket *socket() { return &socket_; }
-
-  // Return SASL client instance for this connection.
-  SaslClient &sasl_client() { return sasl_client_; }
-
-  // Return SASL server instance for this connection.
-  SaslServer &sasl_server() { return sasl_server_; }
-
-  // Initialize SASL client before negotiation begins.
-  Status InitSaslClient();
-
-  // Initialize SASL server before negotiation begins.
-  Status InitSaslServer();
+  Socket* socket() { return socket_.get(); }
 
   // Go through the process of transferring control of the underlying socket back to the Reactor.
-  void CompleteNegotiation(const Status &negotiation_status);
+  void CompleteNegotiation(const Status& negotiation_status);
 
   // Indicate that negotiation is complete and that the Reactor is now in control of the socket.
   void MarkNegotiationComplete();
@@ -161,7 +158,29 @@ class Connection : public RefCountedThreadSafe<Connection> {
   Status DumpPB(const DumpRunningRpcsRequestPB& req,
                 RpcConnectionPB* resp);
 
-  ReactorThread *reactor_thread() const { return reactor_thread_; }
+  ReactorThread* reactor_thread() const { return reactor_thread_; }
+
+  std::unique_ptr<Socket> release_socket() {
+    return std::move(socket_);
+  }
+
+  void adopt_socket(std::unique_ptr<Socket> socket) {
+    socket_ = std::move(socket);
+  }
+
+  void set_remote_features(std::set<RpcFeatureFlag> remote_features) {
+    remote_features_ = std::move(remote_features);
+  }
+
+  void set_remote_user(RemoteUser user) {
+    DCHECK_EQ(direction_, SERVER);
+    remote_user_ = std::move(user);
+  }
+
+  const RemoteUser& remote_user() const {
+    DCHECK_EQ(direction_, SERVER);
+    return remote_user_;
+  }
 
  private:
   friend struct CallAwaitingResponse;
@@ -179,6 +198,10 @@ class Connection : public RefCountedThreadSafe<Connection> {
     Connection *conn;
     std::shared_ptr<OutboundCall> call;
     ev::timer timeout_timer;
+
+    // We time out RPC calls in two stages. This is set to the amount of timeout
+    // remaining after the next timeout fires. See Connection::QueueOutboundCall().
+    double remaining_timeout;
   };
 
   typedef std::unordered_map<uint64_t, CallAwaitingResponse*> car_map_t;
@@ -216,16 +239,19 @@ class Connection : public RefCountedThreadSafe<Connection> {
   void QueueOutbound(gscoped_ptr<OutboundTransfer> transfer);
 
   // The reactor thread that created this connection.
-  ReactorThread * const reactor_thread_;
-
-  // The socket we're communicating on.
-  Socket socket_;
+  ReactorThread* const reactor_thread_;
 
   // The remote address we're talking to.
   const Sockaddr remote_;
 
+  // The socket we're communicating on.
+  std::unique_ptr<Socket> socket_;
+
   // The credentials of the user operating on this connection (if a client user).
-  UserCredentials user_credentials_;
+  UserCredentials local_user_credentials_;
+
+  // The authenticated remote user (if this is an inbound connection on the server).
+  RemoteUser remote_user_;
 
   // whether we are client or server
   Direction direction_;
@@ -267,16 +293,13 @@ class Connection : public RefCountedThreadSafe<Connection> {
   // when serializing calls.
   std::vector<Slice> slices_tmp_;
 
+  // RPC features supported by the remote end of the connection.
+  std::set<RpcFeatureFlag> remote_features_;
+
   // Pool from which CallAwaitingResponse objects are allocated.
   // Also a funny name.
   ObjectPool<CallAwaitingResponse> car_pool_;
   typedef ObjectPool<CallAwaitingResponse>::scoped_ptr scoped_car;
-
-  // SASL client instance used for connection negotiation when Direction == CLIENT.
-  SaslClient sasl_client_;
-
-  // SASL server instance used for connection negotiation when Direction == SERVER.
-  SaslServer sasl_server_;
 
   // Whether we completed connection negotiation.
   bool negotiation_complete_;

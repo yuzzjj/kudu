@@ -39,6 +39,8 @@
 #include "kudu/tserver/tserver_service.pb.h"
 #include "kudu/tserver/tserver_service.proxy.h"
 #include "kudu/util/net/net_util.h"
+#include "kudu/util/pb_util.h"
+#include "kudu/util/test_macros.h"
 
 namespace kudu {
 namespace itest {
@@ -76,6 +78,7 @@ using std::string;
 using std::unordered_map;
 using std::vector;
 using strings::Substitute;
+using tablet::TabletDataState;
 using tserver::CreateTsClientProxies;
 using tserver::ListTabletsResponsePB;
 using tserver::DeleteTabletRequestPB;
@@ -93,7 +96,7 @@ const string& TServerDetails::uuid() const {
 string TServerDetails::ToString() const {
   return Substitute("TabletServer: $0, Rpc address: $1",
                     instance_id.permanent_uuid(),
-                    registration.rpc_addresses(0).ShortDebugString());
+                    SecureShortDebugString(registration.rpc_addresses(0)));
 }
 
 client::KuduSchema SimpleIntKeyKuduSchema() {
@@ -125,7 +128,7 @@ Status GetLastOpIdForEachReplica(const string& tablet_id,
     RETURN_NOT_OK_PREPEND(
       ts->consensus_proxy->GetLastOpId(opid_req, &opid_resp, &controller),
       Substitute("Failed to fetch last op id from $0",
-                 ts->instance_id.ShortDebugString()));
+                 SecureShortDebugString(ts->instance_id)));
     op_ids->push_back(opid_resp.opid());
   }
 
@@ -137,10 +140,8 @@ Status GetLastOpIdForReplica(const std::string& tablet_id,
                              consensus::OpIdType opid_type,
                              const MonoDelta& timeout,
                              consensus::OpId* op_id) {
-  vector<TServerDetails*> replicas;
-  replicas.push_back(replica);
   vector<OpId> op_ids;
-  RETURN_NOT_OK(GetLastOpIdForEachReplica(tablet_id, replicas, opid_type, timeout, &op_ids));
+  RETURN_NOT_OK(GetLastOpIdForEachReplica(tablet_id, { replica }, opid_type, timeout, &op_ids));
   CHECK_EQ(1, op_ids.size());
   *op_id = op_ids[0];
   return Status::OK();
@@ -150,11 +151,9 @@ Status WaitForServersToAgree(const MonoDelta& timeout,
                              const TabletServerMap& tablet_servers,
                              const string& tablet_id,
                              int64_t minimum_index) {
-  MonoTime now = MonoTime::Now(MonoTime::COARSE);
-  MonoTime deadline = now;
-  deadline.AddDelta(timeout);
+  const MonoTime deadline = MonoTime::Now() + timeout;
 
-  for (int i = 1; now.ComesBefore(deadline); i++) {
+  for (int i = 1; MonoTime::Now() < deadline; i++) {
     vector<TServerDetails*> servers;
     AppendValuesFromMap(tablet_servers, &servers);
     vector<OpId> ids;
@@ -186,8 +185,6 @@ Status WaitForServersToAgree(const MonoDelta& timeout,
 
     LOG(INFO) << "Not converged past " << minimum_index << " yet: " << ids;
     SleepFor(MonoDelta::FromMilliseconds(min(i * 100, 1000)));
-
-    now = MonoTime::Now(MonoTime::COARSE);
   }
   return Status::TimedOut(Substitute("Index $0 not available on all replicas after $1. ",
                                               minimum_index, timeout.ToString()));
@@ -198,7 +195,7 @@ Status WaitUntilAllReplicasHaveOp(const int64_t log_index,
                                   const string& tablet_id,
                                   const vector<TServerDetails*>& replicas,
                                   const MonoDelta& timeout) {
-  MonoTime start = MonoTime::Now(MonoTime::FINE);
+  MonoTime start = MonoTime::Now();
   MonoDelta passed = MonoDelta::FromMilliseconds(0);
   while (true) {
     vector<OpId> op_ids;
@@ -216,8 +213,8 @@ Status WaitUntilAllReplicasHaveOp(const int64_t log_index,
     } else {
       LOG(WARNING) << "Got error getting last opid for each replica: " << s.ToString();
     }
-    passed = MonoTime::Now(MonoTime::FINE).GetDeltaSince(start);
-    if (passed.MoreThan(timeout)) {
+    passed = MonoTime::Now() - start;
+    if (passed > timeout) {
       break;
     }
     SleepFor(MonoDelta::FromMilliseconds(50));
@@ -228,8 +225,8 @@ Status WaitUntilAllReplicasHaveOp(const int64_t log_index,
     replicas_str += "{ " + replica->ToString() + " }";
   }
   return Status::TimedOut(Substitute("Index $0 not available on all replicas after $1. "
-                                              "Replicas: [ $2 ]",
-                                              log_index, passed.ToString()));
+                                     "Replicas: [ $2 ]",
+                                     log_index, passed.ToString(), replicas_str));
 }
 
 Status CreateTabletServerMap(MasterServiceProxy* master_proxy,
@@ -242,7 +239,7 @@ Status CreateTabletServerMap(MasterServiceProxy* master_proxy,
   RETURN_NOT_OK(master_proxy->ListTabletServers(req, &resp, &controller));
   RETURN_NOT_OK(controller.status());
   if (resp.has_error()) {
-    return Status::RemoteError("Response had an error", resp.error().ShortDebugString());
+    return Status::RemoteError("Response had an error", SecureShortDebugString(resp.error()));
   }
 
   ts_map->clear();
@@ -294,16 +291,15 @@ Status WaitUntilCommittedConfigNumVotersIs(int config_size,
                                            const TServerDetails* replica,
                                            const std::string& tablet_id,
                                            const MonoDelta& timeout) {
-  MonoTime start = MonoTime::Now(MonoTime::FINE);
-  MonoTime deadline = start;
-  deadline.AddDelta(timeout);
+  MonoTime start = MonoTime::Now();
+  MonoTime deadline = start + timeout;
 
   int backoff_exp = 0;
   const int kMaxBackoffExp = 7;
   Status s;
   ConsensusStatePB cstate;
   while (true) {
-    MonoDelta remaining_timeout = deadline.GetDeltaSince(MonoTime::Now(MonoTime::FINE));
+    MonoDelta remaining_timeout = deadline - MonoTime::Now();
     s = GetConsensusState(replica, tablet_id, CONSENSUS_CONFIG_COMMITTED,
                           remaining_timeout, &cstate);
     if (s.ok()) {
@@ -312,7 +308,7 @@ Status WaitUntilCommittedConfigNumVotersIs(int config_size,
       }
     }
 
-    if (MonoTime::Now(MonoTime::FINE).GetDeltaSince(start).MoreThan(timeout)) {
+    if (MonoTime::Now() > start + timeout) {
       break;
     }
     SleepFor(MonoDelta::FromMilliseconds(1 << backoff_exp));
@@ -321,61 +317,105 @@ Status WaitUntilCommittedConfigNumVotersIs(int config_size,
   return Status::TimedOut(Substitute("Number of voters does not equal $0 after waiting for $1."
                                      "Last consensus state: $2. Last status: $3",
                                      config_size, timeout.ToString(),
-                                     cstate.ShortDebugString(), s.ToString()));
+                                     SecureShortDebugString(cstate), s.ToString()));
 }
 
 Status WaitUntilCommittedConfigOpIdIndexIs(int64_t opid_index,
                                            const TServerDetails* replica,
                                            const std::string& tablet_id,
                                            const MonoDelta& timeout) {
-  MonoTime start = MonoTime::Now(MonoTime::FINE);
-  MonoTime deadline = start;
-  deadline.AddDelta(timeout);
+  MonoTime start = MonoTime::Now();
+  MonoTime deadline = start + timeout;
 
   Status s;
   ConsensusStatePB cstate;
   while (true) {
-    MonoDelta remaining_timeout = deadline.GetDeltaSince(MonoTime::Now(MonoTime::FINE));
+    MonoDelta remaining_timeout = deadline - MonoTime::Now();
     s = GetConsensusState(replica, tablet_id, CONSENSUS_CONFIG_COMMITTED,
                           remaining_timeout, &cstate);
     if (s.ok() && cstate.config().opid_index() == opid_index) {
       return Status::OK();
     }
-    if (MonoTime::Now(MonoTime::FINE).GetDeltaSince(start).MoreThan(timeout)) break;
+    if (MonoTime::Now() > deadline) break;
     SleepFor(MonoDelta::FromMilliseconds(10));
   }
   return Status::TimedOut(Substitute("Committed config opid_index does not equal $0 "
                                      "after waiting for $1. "
                                      "Last consensus state: $2. Last status: $3",
                                      opid_index,
-                                     MonoTime::Now(MonoTime::FINE).GetDeltaSince(start).ToString(),
-                                     cstate.ShortDebugString(), s.ToString()));
+                                     (MonoTime::Now() - start).ToString(),
+                                     SecureShortDebugString(cstate), s.ToString()));
+}
+
+Status WaitForReplicasReportedToMaster(
+    const shared_ptr<master::MasterServiceProxy>& master_proxy,
+    int num_replicas, const string& tablet_id,
+    const MonoDelta& timeout,
+    WaitForLeader wait_for_leader,
+    bool* has_leader,
+    master::TabletLocationsPB* tablet_locations) {
+  MonoTime deadline(MonoTime::Now() + timeout);
+  while (true) {
+    RETURN_NOT_OK(GetTabletLocations(master_proxy, tablet_id, timeout, tablet_locations));
+    *has_leader = false;
+    if (tablet_locations->replicas_size() == num_replicas) {
+      for (const master::TabletLocationsPB_ReplicaPB& replica :
+                    tablet_locations->replicas()) {
+        if (replica.role() == RaftPeerPB::LEADER) {
+          *has_leader = true;
+        }
+      }
+      if (wait_for_leader == DONT_WAIT_FOR_LEADER ||
+          (wait_for_leader == WAIT_FOR_LEADER && *has_leader)) {
+        break;
+      }
+    }
+    if (deadline < MonoTime::Now()) {
+      return Status::TimedOut(Substitute("Timed out after waiting "
+          "for tablet $1 expected to report master with $2 replicas, has_leader: $3",
+          tablet_id, num_replicas, *has_leader));
+    }
+    SleepFor(MonoDelta::FromMilliseconds(20));
+  }
+  if (num_replicas != tablet_locations->replicas_size()) {
+      return Status::NotFound(Substitute("Number of replicas for tablet $0 "
+          "reported to master $1:$2",
+          tablet_id, tablet_locations->replicas_size(),
+          SecureDebugString(*tablet_locations)));
+  }
+  if (wait_for_leader == WAIT_FOR_LEADER && !(*has_leader)) {
+    return Status::NotFound(Substitute("Leader for tablet $0 not found on master, "
+                                       "number of replicas $1:$2",
+                                       tablet_id, tablet_locations->replicas_size(),
+                                       SecureDebugString(*tablet_locations)));
+  }
+  return Status::OK();
 }
 
 Status WaitUntilCommittedOpIdIndexIs(int64_t opid_index,
                                      TServerDetails* replica,
                                      const string& tablet_id,
                                      const MonoDelta& timeout) {
-  MonoTime start = MonoTime::Now(MonoTime::FINE);
-  MonoTime deadline = start;
-  deadline.AddDelta(timeout);
+  MonoTime start = MonoTime::Now();
+  MonoTime deadline = start + timeout;
 
   Status s;
   OpId op_id;
   while (true) {
-    MonoDelta remaining_timeout = deadline.GetDeltaSince(MonoTime::Now(MonoTime::FINE));
+    MonoDelta remaining_timeout = deadline - MonoTime::Now();
     s = GetLastOpIdForReplica(tablet_id, replica, consensus::COMMITTED_OPID, remaining_timeout,
                               &op_id);
     if (s.ok() && op_id.index() == opid_index) {
       return Status::OK();
     }
-    if (MonoTime::Now(MonoTime::FINE).GetDeltaSince(start).MoreThan(timeout)) break;
+    if (MonoTime::Now() > deadline) break;
     SleepFor(MonoDelta::FromMilliseconds(10));
   }
   return Status::TimedOut(Substitute("Committed consensus opid_index does not equal $0 "
-                                     "after waiting for $1. Last status: $2",
+                                     "after waiting for $1. Last opid: $2. Last status: $3",
                                      opid_index,
-                                     MonoTime::Now(MonoTime::FINE).GetDeltaSince(start).ToString(),
+                                     (MonoTime::Now() - start).ToString(),
+                                     OpIdToString(op_id),
                                      s.ToString()));
 }
 
@@ -401,21 +441,20 @@ Status GetReplicaStatusAndCheckIfLeader(const TServerDetails* replica,
 Status WaitUntilLeader(const TServerDetails* replica,
                        const string& tablet_id,
                        const MonoDelta& timeout) {
-  MonoTime start = MonoTime::Now(MonoTime::FINE);
-  MonoTime deadline = start;
-  deadline.AddDelta(timeout);
+  MonoTime start = MonoTime::Now();
+  MonoTime deadline = start + timeout;
 
   int backoff_exp = 0;
   const int kMaxBackoffExp = 7;
   Status s;
   while (true) {
-    MonoDelta remaining_timeout = deadline.GetDeltaSince(MonoTime::Now(MonoTime::FINE));
+    MonoDelta remaining_timeout = deadline - MonoTime::Now();
     s = GetReplicaStatusAndCheckIfLeader(replica, tablet_id, remaining_timeout);
     if (s.ok()) {
       return Status::OK();
     }
 
-    if (MonoTime::Now(MonoTime::FINE).GetDeltaSince(start).MoreThan(timeout)) {
+    if (MonoTime::Now() > deadline) {
       break;
     }
     SleepFor(MonoDelta::FromMilliseconds(1 << backoff_exp));
@@ -432,20 +471,19 @@ Status FindTabletLeader(const TabletServerMap& tablet_servers,
   vector<TServerDetails*> tservers;
   AppendValuesFromMap(tablet_servers, &tservers);
 
-  MonoTime start = MonoTime::Now(MonoTime::FINE);
-  MonoTime deadline = start;
-  deadline.AddDelta(timeout);
+  MonoTime start = MonoTime::Now();
+  MonoTime deadline = start + timeout;
   Status s;
   int i = 0;
   while (true) {
-    MonoDelta remaining_timeout = deadline.GetDeltaSince(MonoTime::Now(MonoTime::FINE));
+    MonoDelta remaining_timeout = deadline - MonoTime::Now();
     s = GetReplicaStatusAndCheckIfLeader(tservers[i], tablet_id, remaining_timeout);
     if (s.ok()) {
       *leader = tservers[i];
       return Status::OK();
     }
 
-    if (deadline.ComesBefore(MonoTime::Now(MonoTime::FINE))) break;
+    if (MonoTime::Now() > deadline) break;
     i = (i + 1) % tservers.size();
     if (i == 0) {
       SleepFor(MonoDelta::FromMilliseconds(10));
@@ -453,8 +491,24 @@ Status FindTabletLeader(const TabletServerMap& tablet_servers,
   }
   return Status::TimedOut(Substitute("Unable to find leader of tablet $0 after $1. "
                                      "Status message: $2", tablet_id,
-                                     MonoTime::Now(MonoTime::FINE).GetDeltaSince(start).ToString(),
+                                     (MonoTime::Now() - start).ToString(),
                                      s.ToString()));
+}
+
+Status FindTabletFollowers(const TabletServerMap& tablet_servers,
+                           const string& tablet_id,
+                           const MonoDelta& timeout,
+                           vector<TServerDetails*>* followers) {
+  vector<TServerDetails*> tservers;
+  AppendValuesFromMap(tablet_servers, &tservers);
+  TServerDetails* leader;
+  RETURN_NOT_OK(FindTabletLeader(tablet_servers, tablet_id, timeout, &leader));
+  for (TServerDetails* ts : tservers) {
+    if (ts->uuid() != leader->uuid()) {
+      followers->push_back(ts);
+    }
+  }
+  return Status::OK();
 }
 
 Status StartElection(const TServerDetails* replica,
@@ -623,10 +677,10 @@ Status GetTabletLocations(const shared_ptr<MasterServiceProxy>& master_proxy,
     return StatusFromPB(resp.error().status());
   }
   if (resp.errors_size() > 0) {
-    CHECK_EQ(1, resp.errors_size()) << resp.ShortDebugString();
+    CHECK_EQ(1, resp.errors_size()) << SecureShortDebugString(resp);
     return StatusFromPB(resp.errors(0).status());
   }
-  CHECK_EQ(1, resp.tablet_locations_size()) << resp.ShortDebugString();
+  CHECK_EQ(1, resp.tablet_locations_size()) << SecureShortDebugString(resp);
   *tablet_locations = resp.tablet_locations(0);
   return Status::OK();
 }
@@ -652,12 +706,11 @@ Status WaitForNumVotersInConfigOnMaster(const shared_ptr<MasterServiceProxy>& ma
                                         int num_voters,
                                         const MonoDelta& timeout) {
   Status s;
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(timeout);
+  MonoTime deadline = MonoTime::Now() + timeout;
   int num_voters_found = 0;
   while (true) {
     TabletLocationsPB tablet_locations;
-    MonoDelta time_remaining = deadline.GetDeltaSince(MonoTime::Now(MonoTime::FINE));
+    MonoDelta time_remaining = deadline - MonoTime::Now();
     s = GetTabletLocations(master_proxy, tablet_id, time_remaining, &tablet_locations);
     if (s.ok()) {
       num_voters_found = 0;
@@ -666,7 +719,7 @@ Status WaitForNumVotersInConfigOnMaster(const shared_ptr<MasterServiceProxy>& ma
       }
       if (num_voters_found == num_voters) break;
     }
-    if (deadline.ComesBefore(MonoTime::Now(MonoTime::FINE))) break;
+    if (MonoTime::Now() > deadline) break;
     SleepFor(MonoDelta::FromMilliseconds(10));
   }
   RETURN_NOT_OK(s);
@@ -682,13 +735,17 @@ Status WaitForNumTabletsOnTS(TServerDetails* ts,
                              int count,
                              const MonoDelta& timeout,
                              vector<ListTabletsResponsePB::StatusAndSchemaPB>* tablets) {
+  // If the user doesn't care about collecting the resulting tablets, collect into a local
+  // vector.
+  vector<ListTabletsResponsePB::StatusAndSchemaPB> tablets_local;
+  if (tablets == nullptr) tablets = &tablets_local;
+
   Status s;
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(timeout);
+  MonoTime deadline = MonoTime::Now() + timeout;
   while (true) {
     s = ListTablets(ts, MonoDelta::FromSeconds(10), tablets);
     if (s.ok() && tablets->size() == count) break;
-    if (deadline.ComesBefore(MonoTime::Now(MonoTime::FINE))) break;
+    if (MonoTime::Now() > deadline) break;
     SleepFor(MonoDelta::FromMilliseconds(10));
   }
   RETURN_NOT_OK(s);
@@ -700,44 +757,55 @@ Status WaitForNumTabletsOnTS(TServerDetails* ts,
   return Status::OK();
 }
 
+Status CheckIfTabletInState(TServerDetails* ts,
+                            const std::string& tablet_id,
+                            tablet::TabletStatePB expected_state,
+                            const MonoDelta& timeout) {
+  vector<ListTabletsResponsePB::StatusAndSchemaPB> tablets;
+  RETURN_NOT_OK(ListTablets(ts, timeout, &tablets));
+  for (const ListTabletsResponsePB::StatusAndSchemaPB& t : tablets) {
+    if (t.tablet_status().tablet_id() == tablet_id) {
+      tablet::TabletStatePB current_state = t.tablet_status().state();
+      if (current_state != expected_state) {
+        return Status::IllegalState(Substitute("Tablet not in expected state $0 (state = $1)",
+                                               TabletStatePB_Name(expected_state),
+                                               TabletStatePB_Name(current_state)));
+      }
+      return Status::OK();
+    }
+  }
+  return Status::NotFound("Tablet " + tablet_id + " not found");
+}
+
+Status CheckIfTabletRunning(TServerDetails* ts,
+                            const std::string& tablet_id,
+                            const MonoDelta& timeout) {
+  return CheckIfTabletInState(ts, tablet_id, tablet::RUNNING, timeout);
+}
+
 Status WaitUntilTabletInState(TServerDetails* ts,
                               const std::string& tablet_id,
                               tablet::TabletStatePB state,
                               const MonoDelta& timeout) {
-  MonoTime start = MonoTime::Now(MonoTime::FINE);
-  MonoTime deadline = start;
-  deadline.AddDelta(timeout);
-  vector<ListTabletsResponsePB::StatusAndSchemaPB> tablets;
+  MonoTime start = MonoTime::Now();
+  MonoTime deadline = start + timeout;
   Status s;
-  tablet::TabletStatePB last_state = tablet::UNKNOWN;
   while (true) {
-    s = ListTablets(ts, MonoDelta::FromSeconds(10), &tablets);
+    s = CheckIfTabletInState(ts, tablet_id, state, deadline - MonoTime::Now());
     if (s.ok()) {
-      bool seen = false;
-      for (const ListTabletsResponsePB::StatusAndSchemaPB& t : tablets) {
-        if (t.tablet_status().tablet_id() == tablet_id) {
-          seen = true;
-          last_state = t.tablet_status().state();
-          if (last_state == state) {
-            return Status::OK();
-          }
-        }
-      }
-      if (!seen) {
-        s = Status::NotFound("Tablet " + tablet_id + " not found");
-      }
+      return Status::OK();
     }
-    if (deadline.ComesBefore(MonoTime::Now(MonoTime::FINE))) {
+    if (MonoTime::Now() > deadline) {
       break;
     }
     SleepFor(MonoDelta::FromMilliseconds(10));
   }
   return Status::TimedOut(Substitute("T $0 P $1: Tablet not in $2 state after $3: "
-                                     "Tablet state: $4, Status message: $5",
+                                     "Status message: $4",
                                      tablet_id, ts->uuid(),
                                      tablet::TabletStatePB_Name(state),
-                                     MonoTime::Now(MonoTime::FINE).GetDeltaSince(start).ToString(),
-                                     tablet::TabletStatePB_Name(last_state), s.ToString()));
+                                     (MonoTime::Now() - start).ToString(),
+                                     s.ToString()));
 }
 
 // Wait until the specified tablet is in RUNNING state.
@@ -749,7 +817,7 @@ Status WaitUntilTabletRunning(TServerDetails* ts,
 
 Status DeleteTablet(const TServerDetails* ts,
                     const std::string& tablet_id,
-                    const tablet::TabletDataState delete_type,
+                    const TabletDataState delete_type,
                     const boost::optional<int64_t>& cas_config_opid_index_less_or_equal,
                     const MonoDelta& timeout,
                     tserver::TabletServerErrorPB::Code* error_code) {
@@ -775,24 +843,43 @@ Status DeleteTablet(const TServerDetails* ts,
   return Status::OK();
 }
 
-Status StartRemoteBootstrap(const TServerDetails* ts,
-                            const string& tablet_id,
-                            const string& bootstrap_source_uuid,
-                            const HostPort& bootstrap_source_addr,
-                            int64_t caller_term,
-                            const MonoDelta& timeout) {
-  consensus::StartRemoteBootstrapRequestPB req;
-  consensus::StartRemoteBootstrapResponsePB resp;
+void DeleteTabletWithRetries(const TServerDetails* ts,
+                             const string& tablet_id,
+                             TabletDataState delete_type,
+                             const boost::optional<int64_t>& config_opid_index,
+                             const MonoDelta& timeout) {
+  MonoTime start(MonoTime::Now());
+  MonoTime deadline = start + timeout;
+  Status s;
+  while (true) {
+    s = DeleteTablet(ts, tablet_id, delete_type, config_opid_index, timeout);
+    if (s.ok()) return;
+    if (deadline < MonoTime::Now()) {
+      break;
+    }
+    SleepFor(MonoDelta::FromMilliseconds(10));
+  }
+  ASSERT_OK(s);
+}
+
+Status StartTabletCopy(const TServerDetails* ts,
+                       const string& tablet_id,
+                       const string& copy_source_uuid,
+                       const HostPort& copy_source_addr,
+                       int64_t caller_term,
+                       const MonoDelta& timeout) {
+  consensus::StartTabletCopyRequestPB req;
+  consensus::StartTabletCopyResponsePB resp;
   RpcController rpc;
   rpc.set_timeout(timeout);
 
   req.set_dest_uuid(ts->uuid());
   req.set_tablet_id(tablet_id);
-  req.set_bootstrap_peer_uuid(bootstrap_source_uuid);
-  RETURN_NOT_OK(HostPortToPB(bootstrap_source_addr, req.mutable_bootstrap_peer_addr()));
+  req.set_copy_peer_uuid(copy_source_uuid);
+  RETURN_NOT_OK(HostPortToPB(copy_source_addr, req.mutable_copy_peer_addr()));
   req.set_caller_term(caller_term);
 
-  RETURN_NOT_OK(ts->consensus_proxy->StartRemoteBootstrap(req, &resp, &rpc));
+  RETURN_NOT_OK(ts->consensus_proxy->StartTabletCopy(req, &resp, &rpc));
   if (resp.has_error()) {
     return StatusFromPB(resp.error().status());
   }

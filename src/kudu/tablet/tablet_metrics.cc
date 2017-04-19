@@ -16,7 +16,12 @@
 // under the License.
 #include "kudu/tablet/tablet_metrics.h"
 
+#include <functional>
+#include <map>
+#include <utility>
+
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/util/memory/arena.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/trace.h"
 
@@ -24,6 +29,9 @@
 METRIC_DEFINE_counter(tablet, rows_inserted, "Rows Inserted",
     kudu::MetricUnit::kRows,
     "Number of rows inserted into this tablet since service start");
+METRIC_DEFINE_counter(tablet, rows_upserted, "Rows Upserted",
+    kudu::MetricUnit::kRows,
+    "Number of rows upserted into this tablet since service start");
 METRIC_DEFINE_counter(tablet, rows_updated, "Rows Updated",
     kudu::MetricUnit::kRows,
     "Number of row update operations performed on this tablet since service start");
@@ -103,6 +111,13 @@ METRIC_DEFINE_counter(tablet, bytes_flushed, "Bytes Flushed",
                       kudu::MetricUnit::kBytes,
                       "Amount of data that has been flushed to disk by this tablet.");
 
+METRIC_DEFINE_counter(tablet, undo_delta_block_gc_bytes_deleted,
+                      "Undo Delta Block GC Bytes Deleted",
+                      kudu::MetricUnit::kBytes,
+                      "Number of bytes deleted by garbage-collecting old UNDO delta blocks "
+                      "on this tablet since this server was restarted. "
+                      "Does not include bytes garbage collected during compactions.");
+
 METRIC_DEFINE_histogram(tablet, bloom_lookups_per_op, "Bloom Lookups per Operation",
                         kudu::MetricUnit::kProbes,
                         "Tracks the number of bloom filter lookups performed by each "
@@ -174,6 +189,17 @@ METRIC_DEFINE_gauge_uint32(tablet, delta_major_compact_rs_running,
   kudu::MetricUnit::kMaintenanceOperations,
   "Number of delta major compactions currently running.");
 
+METRIC_DEFINE_gauge_uint32(tablet, undo_delta_block_gc_running,
+  "Undo Delta Block GC Running",
+  kudu::MetricUnit::kMaintenanceOperations,
+  "Number of UNDO delta block GC operations currently running.");
+
+METRIC_DEFINE_gauge_int64(tablet, undo_delta_block_estimated_retained_bytes,
+  "Estimated Deletable Bytes Retained in Undo Delta Blocks",
+  kudu::MetricUnit::kBytes,
+  "Estimated bytes of deletable data in undo delta blocks for this tablet. "
+  "May be an overestimate.");
+
 METRIC_DEFINE_histogram(tablet, flush_dms_duration,
   "DeltaMemStore Flush Duration",
   kudu::MetricUnit::kMilliseconds,
@@ -199,12 +225,29 @@ METRIC_DEFINE_histogram(tablet, delta_major_compact_rs_duration,
   kudu::MetricUnit::kSeconds,
   "Seconds spent major delta compacting.", 60000000LU, 2);
 
+METRIC_DEFINE_histogram(tablet, undo_delta_block_gc_init_duration,
+  "Undo Delta Block GC Init Duration",
+  kudu::MetricUnit::kMilliseconds,
+  "Time spent initializing ancient UNDO delta blocks.", 60000LU, 1);
+
+METRIC_DEFINE_histogram(tablet, undo_delta_block_gc_delete_duration,
+  "Undo Delta Block GC Delete Duration",
+  kudu::MetricUnit::kMilliseconds,
+  "Time spent deleting ancient UNDO delta blocks.", 60000LU, 1);
+
+METRIC_DEFINE_histogram(tablet, undo_delta_block_gc_perform_duration,
+  "Undo Delta Block GC Perform Duration",
+  kudu::MetricUnit::kMilliseconds,
+  "Time spent running the maintenance operation to GC ancient UNDO delta blocks.", 60000LU, 1);
+
 METRIC_DEFINE_counter(tablet, leader_memory_pressure_rejections,
   "Leader Memory Pressure Rejections",
   kudu::MetricUnit::kRequests,
   "Number of RPC requests rejected due to memory pressure while LEADER.");
 
 using strings::Substitute;
+using std::unordered_map;
+
 
 namespace kudu {
 namespace tablet {
@@ -213,6 +256,7 @@ namespace tablet {
 #define GINIT(x) x(METRIC_##x.Instantiate(entity, 0))
 TabletMetrics::TabletMetrics(const scoped_refptr<MetricEntity>& entity)
   : MINIT(rows_inserted),
+    MINIT(rows_upserted),
     MINIT(rows_updated),
     MINIT(rows_deleted),
     MINIT(insertions_failed_dup_key),
@@ -228,6 +272,7 @@ TabletMetrics::TabletMetrics(const scoped_refptr<MetricEntity>& entity)
     MINIT(delta_file_lookups),
     MINIT(mrs_lookups),
     MINIT(bytes_flushed),
+    MINIT(undo_delta_block_gc_bytes_deleted),
     MINIT(bloom_lookups_per_op),
     MINIT(key_file_lookups_per_op),
     MINIT(delta_file_lookups_per_op),
@@ -240,30 +285,72 @@ TabletMetrics::TabletMetrics(const scoped_refptr<MetricEntity>& entity)
     GINIT(compact_rs_running),
     GINIT(delta_minor_compact_rs_running),
     GINIT(delta_major_compact_rs_running),
+    GINIT(undo_delta_block_gc_running),
+    GINIT(undo_delta_block_estimated_retained_bytes),
     MINIT(flush_dms_duration),
     MINIT(flush_mrs_duration),
     MINIT(compact_rs_duration),
     MINIT(delta_minor_compact_rs_duration),
     MINIT(delta_major_compact_rs_duration),
+    MINIT(undo_delta_block_gc_init_duration),
+    MINIT(undo_delta_block_gc_delete_duration),
+    MINIT(undo_delta_block_gc_perform_duration),
     MINIT(leader_memory_pressure_rejections) {
 }
 #undef MINIT
 #undef GINIT
 
-void TabletMetrics::AddProbeStats(const ProbeStats& stats) {
-  bloom_lookups->IncrementBy(stats.blooms_consulted);
-  key_file_lookups->IncrementBy(stats.keys_consulted);
-  delta_file_lookups->IncrementBy(stats.deltas_consulted);
-  mrs_lookups->IncrementBy(stats.mrs_consulted);
+void TabletMetrics::AddProbeStats(const ProbeStats* stats_array, int len,
+                                  Arena* work_arena) {
+  // In most cases, different operations within a batch will have the same
+  // statistics (e.g. 1 or 2 bloom lookups, 0 key lookups, 0 delta lookups).
+  //
+  // Given that, we pre-aggregate our contributions to the tablet histograms
+  // in local maps here. We also pre-aggregate our normal counter contributions
+  // to minimize contention on the counter metrics.
+  //
+  // To avoid any actual expensive allocation, we allocate these local maps from
+  // 'work_arena'.
+  typedef ArenaAllocator<std::pair<const int32_t, int32_t>, false> AllocType;
+  typedef std::map<int32_t, int32_t, std::less<int32_t>, AllocType> MapType;
+  AllocType alloc(work_arena);
+  MapType bloom_lookups_hist(std::less<int32_t>(), alloc);
+  MapType key_file_lookups_hist(std::less<int32_t>(), alloc);
+  MapType delta_file_lookups_hist(std::less<int32_t>(), alloc);
 
-  bloom_lookups_per_op->Increment(stats.blooms_consulted);
-  key_file_lookups_per_op->Increment(stats.keys_consulted);
-  delta_file_lookups_per_op->Increment(stats.deltas_consulted);
+  ProbeStats sum;
+  for (int i = 0; i < len; i++) {
+    const ProbeStats& stats = stats_array[i];
+
+    sum.blooms_consulted += stats.blooms_consulted;
+    sum.keys_consulted += stats.keys_consulted;
+    sum.deltas_consulted += stats.deltas_consulted;
+    sum.mrs_consulted += stats.mrs_consulted;
+
+    bloom_lookups_hist[stats.blooms_consulted]++;
+    key_file_lookups_hist[stats.keys_consulted]++;
+    delta_file_lookups_hist[stats.deltas_consulted]++;
+  }
+
+  bloom_lookups->IncrementBy(sum.blooms_consulted);
+  key_file_lookups->IncrementBy(sum.keys_consulted);
+  delta_file_lookups->IncrementBy(sum.deltas_consulted);
+  mrs_lookups->IncrementBy(sum.mrs_consulted);
+
+  for (const auto& entry : bloom_lookups_hist) {
+    bloom_lookups_per_op->IncrementBy(entry.first, entry.second);
+  }
+  for (const auto& entry : key_file_lookups_hist) {
+    key_file_lookups_per_op->IncrementBy(entry.first, entry.second);
+  }
+  for (const auto& entry : delta_file_lookups_hist) {
+    delta_file_lookups_per_op->IncrementBy(entry.first, entry.second);
+  }
 
   TRACE("ProbeStats: bloom_lookups=$0,key_file_lookups=$1,"
         "delta_file_lookups=$2,mrs_lookups=$3",
-        stats.blooms_consulted, stats.keys_consulted,
-        stats.deltas_consulted, stats.mrs_consulted);
+        sum.blooms_consulted, sum.keys_consulted,
+        sum.deltas_consulted, sum.mrs_consulted);
 }
 
 } // namespace tablet

@@ -14,34 +14,23 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-
 #ifndef IMPALA_UTIL_BIT_STREAM_UTILS_INLINE_H
 #define IMPALA_UTIL_BIT_STREAM_UTILS_INLINE_H
 
 #include <algorithm>
 
+#include "glog/logging.h"
 #include "kudu/util/bit-stream-utils.h"
 #include "kudu/util/alignment.h"
 
 namespace kudu {
 
 inline void BitWriter::PutValue(uint64_t v, int num_bits) {
-  // TODO: revisit this limit if necessary (can be raised to 64 by fixing some edge cases)
-  DCHECK_LE(num_bits, 32);
-  DCHECK_EQ(v >> num_bits, 0) << "v = " << v << ", num_bits = " << num_bits;
+  DCHECK_LE(num_bits, 64);
+  // Truncate the higher-order bits. This is necessary to
+  // support signed values.
+  v &= ~0ULL >> (64 - num_bits);
+
 
   buffered_values_ |= v << bit_offset_;
   bit_offset_ += num_bits;
@@ -55,7 +44,7 @@ inline void BitWriter::PutValue(uint64_t v, int num_bits) {
     buffered_values_ = 0;
     byte_offset_ += 8;
     bit_offset_ -= 64;
-    buffered_values_ = v >> (num_bits - bit_offset_);
+    buffered_values_ = BitUtil::ShiftRightZeroOnOverflow(v, (num_bits - bit_offset_));
   }
   DCHECK_LT(bit_offset_, 64);
 }
@@ -121,8 +110,7 @@ inline void BitReader::BufferValues() {
 
 template<typename T>
 inline bool BitReader::GetValue(int num_bits, T* v) {
-  // TODO: revisit this limit if necessary
-  DCHECK_LE(num_bits, 32);
+  DCHECK_LE(num_bits, 64);
   DCHECK_LE(num_bits, sizeof(T) * 8);
 
   if (PREDICT_FALSE(byte_offset_ * 8 + bit_offset_ + num_bits > max_bytes_ * 8)) return false;
@@ -135,8 +123,9 @@ inline bool BitReader::GetValue(int num_bits, T* v) {
     bit_offset_ -= 64;
     BufferValues();
     // Read bits of v that crossed into new buffered_values_
-    *v |= BitUtil::TrailingBits(buffered_values_, bit_offset_)
-          << (num_bits - bit_offset_);
+    *v |= BitUtil::ShiftLeftZeroOnOverflow(
+        BitUtil::TrailingBits(buffered_values_, bit_offset_),
+        (num_bits - bit_offset_));
   }
   DCHECK_LE(bit_offset_, 64);
   return true;

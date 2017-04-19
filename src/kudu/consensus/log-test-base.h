@@ -22,14 +22,15 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <string>
 #include <utility>
 #include <vector>
-#include <string>
 
 #include "kudu/common/timestamp.h"
 #include "kudu/common/wire_protocol-test-util.h"
 #include "kudu/consensus/log_anchor_registry.h"
 #include "kudu/consensus/log_reader.h"
+#include "kudu/consensus/metadata.pb.h"
 #include "kudu/fs/fs_manager.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/stl_util.h"
@@ -38,18 +39,16 @@
 #include "kudu/gutil/strings/util.h"
 #include "kudu/server/clock.h"
 #include "kudu/server/hybrid_clock.h"
-#include "kudu/server/metadata.h"
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/util/env_util.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/path_util.h"
+#include "kudu/util/pb_util.h"
+#include "kudu/util/stopwatch.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
-#include "kudu/util/stopwatch.h"
 
 METRIC_DECLARE_entity(tablet);
-
-DECLARE_int32(log_min_seconds_to_retain);
 
 namespace kudu {
 namespace log {
@@ -68,19 +67,20 @@ using tablet::TxResultPB;
 using tablet::OperationResultPB;
 using tablet::MemStoreTargetPB;
 
-const char* kTestTable = "test-log-table";
-const char* kTestTablet = "test-log-tablet";
-const bool APPEND_SYNC = true;
-const bool APPEND_ASYNC = false;
+constexpr char kTestTable[] = "test-log-table";
+constexpr char kTestTableId[] = "test-log-table-id";
+constexpr char kTestTablet[] = "test-log-tablet";
+constexpr bool APPEND_SYNC = true;
+constexpr bool APPEND_ASYNC = false;
 
 // Append a single batch of 'count' NoOps to the log.
 // If 'size' is not NULL, increments it by the expected increase in log size.
 // Increments 'op_id''s index once for each operation logged.
-static Status AppendNoOpsToLogSync(const scoped_refptr<Clock>& clock,
-                                   Log* log,
-                                   OpId* op_id,
-                                   int count,
-                                   int* size = NULL) {
+inline Status AppendNoOpsToLogSync(const scoped_refptr<Clock>& clock,
+                            Log* log,
+                            OpId* op_id,
+                            int count,
+                            int* size = NULL) {
 
   vector<consensus::ReplicateRefPtr> replicates;
   for (int i = 0; i < count; i++) {
@@ -104,21 +104,51 @@ static Status AppendNoOpsToLogSync(const scoped_refptr<Clock>& clock,
 
   // Account for the entry batch header and wrapper PB.
   if (size) {
-    *size += log::kEntryHeaderSize + 5;
+    *size += log::kEntryHeaderSizeV2 + 5;
   }
 
   Synchronizer s;
   RETURN_NOT_OK(log->AsyncAppendReplicates(replicates,
                                            s.AsStatusCallback()));
-  s.Wait();
-  return Status::OK();
+  return s.Wait();
 }
 
-static Status AppendNoOpToLogSync(const scoped_refptr<Clock>& clock,
-                                  Log* log,
-                                  OpId* op_id,
-                                  int* size = NULL) {
+inline Status AppendNoOpToLogSync(const scoped_refptr<Clock>& clock,
+                           Log* log,
+                           OpId* op_id,
+                           int* size = NULL) {
   return AppendNoOpsToLogSync(clock, log, op_id, 1, size);
+}
+
+
+// Corrupts the last segment of the provided log by either truncating it
+// or modifying a byte at the given offset.
+enum CorruptionType {
+  TRUNCATE_FILE,
+  FLIP_BYTE
+};
+
+inline Status CorruptLogFile(Env* env, const string& log_path,
+                             CorruptionType type, int corruption_offset) {
+  faststring buf;
+  RETURN_NOT_OK_PREPEND(ReadFileToString(env, log_path, &buf),
+                        "Couldn't read log");
+
+  switch (type) {
+    case TRUNCATE_FILE:
+      buf.resize(corruption_offset);
+      break;
+    case FLIP_BYTE:
+      CHECK_LT(corruption_offset, buf.size());
+      buf[corruption_offset] ^= 0xff;
+      break;
+  }
+
+  // Rewrite the file with the corrupt log.
+  RETURN_NOT_OK_PREPEND(WriteStringToFile(env, Slice(buf), log_path),
+                        "Couldn't rewrite corrupt log file");
+
+  return Status::OK();
 }
 
 class LogTestBase : public KuduTest {
@@ -134,7 +164,7 @@ class LogTestBase : public KuduTest {
   virtual void SetUp() OVERRIDE {
     KuduTest::SetUp();
     current_index_ = 1;
-    fs_manager_.reset(new FsManager(env_.get(), GetTestPath("fs_root")));
+    fs_manager_.reset(new FsManager(env_, GetTestPath("fs_root")));
     metric_registry_.reset(new MetricRegistry());
     metric_entity_ = METRIC_ENTITY_tablet.Instantiate(metric_registry_.get(), "log-test-base");
     ASSERT_OK(fs_manager_->CreateInitialFileSystemLayout());
@@ -142,8 +172,6 @@ class LogTestBase : public KuduTest {
 
     clock_.reset(new server::HybridClock());
     ASSERT_OK(clock_->Init());
-
-    FLAGS_log_min_seconds_to_retain = 0;
   }
 
   virtual void TearDown() OVERRIDE {
@@ -151,15 +179,15 @@ class LogTestBase : public KuduTest {
     STLDeleteElements(&entries_);
   }
 
-  void BuildLog() {
+  Status BuildLog() {
     Schema schema_with_ids = SchemaBuilder(schema_).Build();
-    CHECK_OK(Log::Open(options_,
-                       fs_manager_.get(),
-                       kTestTablet,
-                       schema_with_ids,
-                       0, // schema_version
-                       metric_entity_.get(),
-                       &log_));
+    return Log::Open(options_,
+                     fs_manager_.get(),
+                     kTestTablet,
+                     schema_with_ids,
+                     0, // schema_version
+                     metric_entity_.get(),
+                     &log_);
   }
 
   void CheckRightNumberOfSegmentFiles(int expected) {
@@ -181,7 +209,7 @@ class LogTestBase : public KuduTest {
 
   void EntriesToIdList(vector<uint32_t>* ids) {
     for (const LogEntryPB* entry : entries_) {
-      VLOG(2) << "Entry contents: " << entry->DebugString();
+      VLOG(2) << "Entry contents: " << SecureDebugString(*entry);
       if (entry->type() == REPLICATE) {
         ids->push_back(entry->replicate().id().index());
       }
@@ -264,16 +292,35 @@ class LogTestBase : public KuduTest {
     MemStoreTargetPB* target = mutate->add_mutated_stores();
     target->set_dms_id(dms_id);
     target->set_rs_id(rs_id);
-    AppendCommit(commit.Pass(), sync);
+    AppendCommit(std::move(commit), sync);
+  }
+
+  // Append a COMMIT message for 'original_opid', but with results
+  // indicating that the associated writes failed due to
+  // "NotFound" errors.
+  void AppendCommitWithNotFoundOpResults(const OpId& original_opid) {
+    gscoped_ptr<CommitMsg> commit(new CommitMsg);
+    commit->set_op_type(WRITE_OP);
+
+    commit->mutable_commited_op_id()->CopyFrom(original_opid);
+
+    TxResultPB* result = commit->mutable_result();
+
+    OperationResultPB* insert = result->add_ops();
+    StatusToPB(Status::NotFound("fake failed write"), insert->mutable_failed_status());
+    OperationResultPB* mutate = result->add_ops();
+    StatusToPB(Status::NotFound("fake failed write"), mutate->mutable_failed_status());
+
+    AppendCommit(std::move(commit));
   }
 
   void AppendCommit(gscoped_ptr<CommitMsg> commit, bool sync = APPEND_SYNC) {
     if (sync) {
       Synchronizer s;
-      ASSERT_OK(log_->AsyncAppendCommit(commit.Pass(), s.AsStatusCallback()));
+      ASSERT_OK(log_->AsyncAppendCommit(std::move(commit), s.AsStatusCallback()));
       ASSERT_OK(s.Wait());
     } else {
-      ASSERT_OK(log_->AsyncAppendCommit(commit.Pass(),
+      ASSERT_OK(log_->AsyncAppendCommit(std::move(commit),
                                                Bind(&LogTestBase::CheckCommitResult)));
     }
   }
@@ -318,9 +365,10 @@ class LogTestBase : public KuduTest {
       strings::SubstituteAndAppend(&dump, "Segment: $0, Path: $1\n",
                                    segment->header().sequence_number(), segment->path());
       strings::SubstituteAndAppend(&dump, "Header: $0\n",
-                                   segment->header().ShortDebugString());
+                                   SecureShortDebugString(segment->header()));
       if (segment->HasFooter()) {
-        strings::SubstituteAndAppend(&dump, "Footer: $0\n", segment->footer().ShortDebugString());
+        strings::SubstituteAndAppend(&dump, "Footer: $0\n",
+                                     SecureShortDebugString(segment->footer()));
       } else {
         dump.append("Footer: None or corrupt.");
       }
@@ -334,43 +382,13 @@ class LogTestBase : public KuduTest {
   gscoped_ptr<MetricRegistry> metric_registry_;
   scoped_refptr<MetricEntity> metric_entity_;
   scoped_refptr<Log> log_;
-  int32_t current_index_;
+  int64_t current_index_;
   LogOptions options_;
   // Reusable entries vector that deletes the entries on destruction.
   vector<LogEntryPB* > entries_;
   scoped_refptr<LogAnchorRegistry> log_anchor_registry_;
   scoped_refptr<Clock> clock_;
 };
-
-// Corrupts the last segment of the provided log by either truncating it
-// or modifying a byte at the given offset.
-enum CorruptionType {
-  TRUNCATE_FILE,
-  FLIP_BYTE
-};
-
-Status CorruptLogFile(Env* env, const string& log_path,
-                      CorruptionType type, int corruption_offset) {
-  faststring buf;
-  RETURN_NOT_OK_PREPEND(ReadFileToString(env, log_path, &buf),
-                        "Couldn't read log");
-
-  switch (type) {
-    case TRUNCATE_FILE:
-      buf.resize(corruption_offset);
-      break;
-    case FLIP_BYTE:
-      CHECK_LT(corruption_offset, buf.size());
-      buf[corruption_offset] ^= 0xff;
-      break;
-  }
-
-  // Rewrite the file with the corrupt log.
-  RETURN_NOT_OK_PREPEND(WriteStringToFile(env, Slice(buf), log_path),
-                        "Couldn't rewrite corrupt log file");
-
-  return Status::OK();
-}
 
 } // namespace log
 } // namespace kudu

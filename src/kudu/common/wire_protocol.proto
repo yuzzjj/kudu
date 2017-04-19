@@ -22,17 +22,18 @@
 // place such as common/common.proto or within cfile/, server/, etc.
 package kudu;
 
-option java_package = "org.kududb";
+option java_package = "org.apache.kudu";
 
 import "kudu/common/common.proto";
 import "kudu/consensus/metadata.proto";
+import "kudu/util/pb_util.proto";
 
 // Error status returned by any RPC method.
 // Every RPC method which could generate an application-level error
 // should have this (or a more complex error result) as an optional field
 // in its response.
 //
-// This maps to kudu::Status in C++.
+// This maps to kudu::Status in C++ and org.apache.kudu.Status in Java.
 message AppStatusPB {
   enum ErrorCode {
     UNKNOWN_ERROR = 999;
@@ -79,10 +80,17 @@ message NodeInstancePB {
   required int64 instance_seqno = 2;
 }
 
-// RPC and HTTP addresses for each server.
+// Some basic properties common to both masters and tservers.
+// They are guaranteed not to change unless the server is restarted.
 message ServerRegistrationPB {
   repeated HostPortPB rpc_addresses = 1;
   repeated HostPortPB http_addresses = 2;
+  optional string software_version = 3;
+
+  // True if HTTPS has been enabled for the web interface.
+  // In this case, https:// URLs should be generated for the above
+  // 'http_addresses' field.
+  optional bool https_enabled = 4;
 }
 
 message ServerEntryPB {
@@ -138,15 +146,36 @@ message RowwiseRowBlockPB {
   optional int32 indirect_data_sidecar = 3;
 }
 
-// A set of operations (INSERT, UPDATE, or DELETE) to apply to a table.
+// A set of operations (INSERT, UPDATE, UPSERT, or DELETE) to apply to a table,
+// or the set of split rows and range bounds when creating or altering table.
+// Range bounds determine the boundaries of range partitions during table
+// creation, split rows further subdivide the ranges into more partitions.
 message RowOperationsPB {
   enum Type {
     UNKNOWN = 0;
     INSERT = 1;
     UPDATE = 2;
     DELETE = 3;
+    UPSERT = 5;
+
     // Used when specifying split rows on table creation.
     SPLIT_ROW = 4;
+    // Used when specifying an inclusive lower bound range on table creation.
+    // Should be followed by the associated upper bound. If all values are
+    // missing, then signifies unbounded.
+    RANGE_LOWER_BOUND = 6;
+    // Used when specifying an exclusive upper bound range on table creation.
+    // Should be preceded by the associated lower bound. If all values are
+    // missing, then signifies unbounded.
+    RANGE_UPPER_BOUND = 7;
+    // Used when specifying an exclusive lower bound range on table creation.
+    // Should be followed by the associated upper bound. If all values are
+    // missing, then signifies unbounded.
+    EXCLUSIVE_RANGE_LOWER_BOUND = 8;
+    // Used when specifying an inclusive upper bound range on table creation.
+    // Should be preceded by the associated lower bound. If all values are
+    // missing, then signifies unbounded.
+    INCLUSIVE_RANGE_UPPER_BOUND = 9;
   }
 
   // The row data for each operation is stored in the following format:
@@ -166,6 +195,6 @@ message RowOperationsPB {
   //   For string data, the pointers are relative to 'indirect_data'.
   //
   // The rows are concatenated end-to-end with no padding/alignment.
-  optional bytes rows = 2;
-  optional bytes indirect_data = 3;
+  optional bytes rows = 2 [(kudu.REDACT) = true];
+  optional bytes indirect_data = 3 [(kudu.REDACT) = true];
 }

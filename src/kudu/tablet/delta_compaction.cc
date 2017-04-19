@@ -18,6 +18,7 @@
 #include "kudu/tablet/delta_compaction.h"
 
 #include <algorithm>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -43,6 +44,7 @@ using cfile::CFileIterator;
 using cfile::CFileReader;
 using cfile::IndexTreeIterator;
 using fs::WritableBlock;
+using std::unique_ptr;
 using std::vector;
 using strings::Substitute;
 
@@ -58,19 +60,21 @@ const size_t kRowsPerBlock = 100; // Number of rows per block of columns
 // to materialize it? should write a test for this.
 MajorDeltaCompaction::MajorDeltaCompaction(
     FsManager* fs_manager, const Schema& base_schema, CFileSet* base_data,
-    shared_ptr<DeltaIterator> delta_iter,
+    unique_ptr<DeltaIterator> delta_iter,
     vector<shared_ptr<DeltaStore> > included_stores,
-    const vector<ColumnId>& col_ids)
+    vector<ColumnId> col_ids,
+    HistoryGcOpts history_gc_opts)
     : fs_manager_(fs_manager),
       base_schema_(base_schema),
-      column_ids_(col_ids),
+      column_ids_(std::move(col_ids)),
+      history_gc_opts_(std::move(history_gc_opts)),
       base_data_(base_data),
       included_stores_(std::move(included_stores)),
       delta_iter_(std::move(delta_iter)),
       redo_delta_mutations_written_(0),
       undo_delta_mutations_written_(0),
       state_(kInitialized) {
-  CHECK(!col_ids.empty());
+  CHECK(!column_ids_.empty());
 }
 
 MajorDeltaCompaction::~MajorDeltaCompaction() {
@@ -110,7 +114,6 @@ Status MajorDeltaCompaction::FlushRowSetAndDeltas() {
   DVLOG(1) << "Applying deltas and rewriting columns (" << partial_schema_.ToString() << ")";
   DeltaStats redo_stats;
   DeltaStats undo_stats;
-  uint64_t num_rows_history_truncated = 0;
   size_t nrows = 0;
   // We know that we're reading everything from disk so we're including all transactions.
   MvccSnapshot snap = MvccSnapshot::CreateSnapshotIncludingAllTransactions();
@@ -122,42 +125,52 @@ Status MajorDeltaCompaction::FlushRowSetAndDeltas() {
     size_t n = block.nrows();
 
     // 2) Fetch all the REDO mutations.
-    vector<Mutation *> redo_mutation_block(kRowsPerBlock, reinterpret_cast<Mutation *>(NULL));
+    vector<Mutation *> redo_mutation_block(kRowsPerBlock, static_cast<Mutation *>(nullptr));
     RETURN_NOT_OK(delta_iter_->PrepareBatch(n, DeltaIterator::PREPARE_FOR_COLLECT));
     RETURN_NOT_OK(delta_iter_->CollectMutations(&redo_mutation_block, block.arena()));
 
-    // 3) Apply new UNDO mutations for the current block. The REDO mutations are picked up
-    //    at step 6).
+    // 3) Write new UNDO mutations for the current block. The REDO mutations
+    //    are written out in step 6.
     vector<CompactionInputRow> input_rows;
     input_rows.resize(block.nrows());
     for (int i = 0; i < block.nrows(); i++) {
-      CompactionInputRow &input_row = input_rows.at(i);
-      input_row.row.Reset(&block, i);
-      input_row.redo_head = redo_mutation_block[i];
-      input_row.undo_head = nullptr;
+      CompactionInputRow* input_row = &input_rows[i];
+      input_row->row.Reset(&block, i);
+      input_row->redo_head = redo_mutation_block[i];
+      Mutation::ReverseMutationList(&input_row->redo_head);
+      input_row->undo_head = nullptr;
 
       RowBlockRow dst_row = block.row(i);
-      RETURN_NOT_OK(CopyRow(input_row.row, &dst_row, reinterpret_cast<Arena*>(NULL)));
+      RETURN_NOT_OK(CopyRow(input_row->row, &dst_row, static_cast<Arena*>(nullptr)));
 
       Mutation* new_undos_head = nullptr;
-      // We're ignoring the result from new_redos_head because we'll find them later at step 5).
+      // We're ignoring the result from new_redos_head because we'll find them
+      // later at step 5.
       Mutation* new_redos_head = nullptr;
 
+      // Since this is a delta compaction the input and output row id's are the same.
+      rowid_t row_id = nrows + input_row->row.row_index();
+
+      DVLOG(3) << "MDC Input Row - RowId: " << row_id << " "
+               << CompactionInputRowToString(*input_row);
+
+      // NOTE: This is presently ignored.
       bool is_garbage_collected;
 
       RETURN_NOT_OK(ApplyMutationsAndGenerateUndos(snap,
-                                                   input_row,
-                                                   &base_schema_,
+                                                   *input_row,
                                                    &new_undos_head,
                                                    &new_redos_head,
                                                    &arena,
-                                                   &dst_row,
-                                                   &is_garbage_collected,
-                                                   &num_rows_history_truncated));
+                                                   &dst_row));
 
-      VLOG(2) << "Output Row: " << dst_row.schema()->DebugRow(dst_row)
-        << " Undo Mutations: " << Mutation::StringifyMutationList(partial_schema_, new_undos_head)
-        << " Redo Mutations: " << Mutation::StringifyMutationList(partial_schema_, new_redos_head);
+      RemoveAncientUndos(history_gc_opts_,
+                         &new_undos_head,
+                         new_redos_head,
+                         &is_garbage_collected);
+
+      DVLOG(3) << "MDC Output Row - RowId: " << row_id << " "
+               << RowToString(dst_row, new_undos_head, new_redos_head);
 
       // We only create a new undo delta file if we need to.
       if (new_undos_head != nullptr && !new_undo_delta_writer_) {
@@ -174,8 +187,9 @@ Status MajorDeltaCompaction::FlushRowSetAndDeltas() {
     // 4) Write the new base data.
     RETURN_NOT_OK(base_data_writer_->AppendBlock(block));
 
-    // 5) Remove the columns that we're compacting from the delta flush, but keep all the
-    //    delete mutations.
+    // 5) Remove the columns that we've done our major REDO delta compaction on
+    //    from this delta flush, except keep all the delete and reinsert
+    //    mutations.
     arena.Reset();
     vector<DeltaKeyAndUpdate> out;
     RETURN_NOT_OK(delta_iter_->FilterColumnIdsAndCollectDeltas(column_ids_, &out, &arena));
@@ -185,9 +199,12 @@ Status MajorDeltaCompaction::FlushRowSetAndDeltas() {
       RETURN_NOT_OK(OpenRedoDeltaFileWriter());
     }
 
-    // 6) Write the deltas we're not compacting back into a delta file.
+    // 6) Write the remaining REDO deltas that we haven't compacted away back
+    //    into a REDO delta file.
     for (const DeltaKeyAndUpdate& key_and_update : out) {
       RowChangeList update(key_and_update.cell);
+      DVLOG(4) << "Keeping delta as REDO: "
+               << key_and_update.Stringify(DeltaType::REDO, base_schema_);
       RETURN_NOT_OK_PREPEND(new_redo_delta_writer_->AppendDelta<REDO>(key_and_update.key, update),
                             "Failed to append a delta");
       WARN_NOT_OK(redo_stats.UpdateStats(key_and_update.key.timestamp(), update),
@@ -200,12 +217,12 @@ Status MajorDeltaCompaction::FlushRowSetAndDeltas() {
   RETURN_NOT_OK(base_data_writer_->Finish());
 
   if (redo_delta_mutations_written_ > 0) {
-    RETURN_NOT_OK(new_redo_delta_writer_->WriteDeltaStats(redo_stats));
+    new_redo_delta_writer_->WriteDeltaStats(redo_stats);
     RETURN_NOT_OK(new_redo_delta_writer_->Finish());
   }
 
   if (undo_delta_mutations_written_ > 0) {
-    RETURN_NOT_OK(new_undo_delta_writer_->WriteDeltaStats(undo_stats));
+    new_undo_delta_writer_->WriteDeltaStats(undo_stats);
     RETURN_NOT_OK(new_undo_delta_writer_->Finish());
   }
 
@@ -231,20 +248,20 @@ Status MajorDeltaCompaction::OpenBaseDataWriter() {
 }
 
 Status MajorDeltaCompaction::OpenRedoDeltaFileWriter() {
-  gscoped_ptr<WritableBlock> block;
+  unique_ptr<WritableBlock> block;
   RETURN_NOT_OK_PREPEND(fs_manager_->CreateNewBlock(&block),
                         "Unable to create REDO delta output block");
   new_redo_delta_block_ = block->id();
-  new_redo_delta_writer_.reset(new DeltaFileWriter(block.Pass()));
+  new_redo_delta_writer_.reset(new DeltaFileWriter(std::move(block)));
   return new_redo_delta_writer_->Start();
 }
 
 Status MajorDeltaCompaction::OpenUndoDeltaFileWriter() {
-  gscoped_ptr<WritableBlock> block;
+  unique_ptr<WritableBlock> block;
   RETURN_NOT_OK_PREPEND(fs_manager_->CreateNewBlock(&block),
                         "Unable to create UNDO delta output block");
   new_undo_delta_block_ = block->id();
-  new_undo_delta_writer_.reset(new DeltaFileWriter(block.Pass()));
+  new_undo_delta_writer_.reset(new DeltaFileWriter(std::move(block)));
   return new_undo_delta_writer_->Start();
 }
 
@@ -258,7 +275,7 @@ Status MajorDeltaCompaction::Compact() {
     LOG(INFO) << "Preparing to major compact delta file: " << ds->ToString();
   }
 
-  // We defer on calling OpenNewDeltaBlock since we might not need to flush.
+  // We defer calling OpenRedoDeltaFileWriter() since we might not need to flush.
   RETURN_NOT_OK(OpenBaseDataWriter());
   RETURN_NOT_OK(FlushRowSetAndDeltas());
   LOG(INFO) << "Finished major delta compaction of columns " <<
@@ -290,7 +307,7 @@ Status MajorDeltaCompaction::CreateMetadataUpdate(
   }
 
   // Replace old column blocks with new ones
-  RowSetMetadata::ColumnIdToBlockIdMap new_column_blocks;
+  std::map<ColumnId, BlockId> new_column_blocks;
   base_data_writer_->GetFlushedBlocksByColumnId(&new_column_blocks);
 
   // NOTE: in the case that one of the columns being compacted is deleted,
@@ -339,12 +356,11 @@ Status MajorDeltaCompaction::UpdateDeltaTracker(DeltaTracker* tracker) {
   if (undo_delta_mutations_written_ > 0) {
     vector<BlockId> new_undo_blocks;
     new_undo_blocks.push_back(new_undo_delta_block_);
-    return tracker->AtomicUpdateStores(SharedDeltaStoreVector(),
+    return tracker->AtomicUpdateStores({},
                                        new_undo_blocks,
                                        UNDO);
-  } else {
-    return Status::OK();
   }
+  return Status::OK();
 }
 
 } // namespace tablet

@@ -92,15 +92,14 @@ Status PstackWatcher::HasProgram(const char* progname) {
   proc.DisableStdout();
   RETURN_NOT_OK_PREPEND(proc.Start(),
       Substitute("HasProgram($0): error running 'which'", progname));
-  int wait_status = 0;
-  RETURN_NOT_OK(proc.Wait(&wait_status));
-  if ((WIFEXITED(wait_status)) && (0 == WEXITSTATUS(wait_status))) {
+  RETURN_NOT_OK(proc.Wait());
+  int exit_status;
+  string exit_info;
+  RETURN_NOT_OK(proc.GetExitStatus(&exit_status, &exit_info));
+  if (exit_status == 0) {
     return Status::OK();
   }
-  return Status::NotFound(Substitute("can't find $0: exited?=$1, status=$2",
-                                     progname,
-                                     static_cast<bool>(WIFEXITED(wait_status)),
-                                     WEXITSTATUS(wait_status)));
+  return Status::NotFound(Substitute("can't find $0: $1", progname, exit_info));
 }
 
 Status PstackWatcher::DumpStacks(int flags) {
@@ -133,9 +132,19 @@ Status PstackWatcher::RunGdbStackDump(pid_t pid, int flags) {
   string prog("gdb");
   vector<string> argv;
   argv.push_back(prog);
+  // Don't print introductory version/copyright messages.
   argv.push_back("-quiet");
+  // Exit after processing all of the commands below.
   argv.push_back("-batch");
+  // Don't run commands from .gdbinit
   argv.push_back("-nx");
+  // On RHEL6 and older Ubuntu, we occasionally would see gdb spin forever
+  // trying to collect backtraces. Setting a backtrace limit is a reasonable
+  // workaround, since we don't really expect >100-deep stacks anyway.
+  //
+  // See https://bugs.launchpad.net/ubuntu/+source/gdb/+bug/434168
+  argv.push_back("-ex");
+  argv.push_back("set backtrace limit 100");
   argv.push_back("-ex");
   argv.push_back("set print pretty on");
   argv.push_back("-ex");
@@ -173,10 +182,13 @@ Status PstackWatcher::RunStackDump(const string& prog, const vector<string>& arg
   if (::close(pstack_proc.ReleaseChildStdinFd()) == -1) {
     return Status::IOError("Unable to close child stdin", ErrnoToString(errno), errno);
   }
-  int ret;
-  RETURN_NOT_OK_PREPEND(pstack_proc.Wait(&ret), "RunStackDump proc.Wait() failed");
-  if (ret == -1) {
-    return Status::RuntimeError("RunStackDump proc.Wait() error", ErrnoToString(errno), errno);
+  RETURN_NOT_OK_PREPEND(pstack_proc.Wait(), "RunStackDump proc.Wait() failed");
+  int exit_code;
+  string exit_info;
+  RETURN_NOT_OK_PREPEND(pstack_proc.GetExitStatus(&exit_code, &exit_info),
+                        "RunStackDump proc.GetExitStatus() failed");
+  if (exit_code != 0) {
+    return Status::RuntimeError("RunStackDump proc.Wait() error", exit_info);
   }
   printf("************************* END STACKS ***************************\n");
   if (fflush(stdout) == EOF) {

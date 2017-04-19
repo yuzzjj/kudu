@@ -37,13 +37,14 @@
 #define KUDU_CFILE_BINARY_DICT_BLOCK_H
 
 #include <string>
-#include <unordered_map>
 #include <vector>
 
+#include <sparsehash/dense_hash_map>
+
+#include "kudu/cfile/binary_plain_block.h"
 #include "kudu/cfile/block_encodings.h"
 #include "kudu/cfile/block_pointer.h"
 #include "kudu/cfile/cfile.pb.h"
-#include "kudu/cfile/binary_plain_block.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/stringpiece.h"
@@ -64,11 +65,11 @@ enum DictEncodingMode {
   DictEncodingMode_max = 2
 };
 
-class BinaryDictBlockBuilder : public BlockBuilder {
+class BinaryDictBlockBuilder final : public BlockBuilder {
  public:
   explicit BinaryDictBlockBuilder(const WriterOptions* options);
 
-  bool IsBlockFull(size_t limit) const OVERRIDE;
+  bool IsBlockFull() const override;
 
   // Append the dictionary block for the current cfile to the end of the cfile and set the footer
   // accordingly.
@@ -84,10 +85,15 @@ class BinaryDictBlockBuilder : public BlockBuilder {
 
   Status GetFirstKey(void* key) const OVERRIDE;
 
+  Status GetLastKey(void* key) const OVERRIDE;
+
   static const size_t kMaxHeaderSize = sizeof(uint32_t) * 1;
 
  private:
   int AddCodeWords(const uint8_t* vals, size_t count);
+
+  ATTRIBUTE_COLD
+  bool AddToDict(Slice val, uint32_t* codeword);
 
   faststring buffer_;
   bool finished_;
@@ -97,10 +103,10 @@ class BinaryDictBlockBuilder : public BlockBuilder {
 
   // dict_block_, dictionary_, dictionary_strings_arena_
   // is related to the dictionary block (one per cfile).
-  // They should NOT be clear in the Reset() method.
+  // They should NOT be cleared in the Reset() method.
   BinaryPlainBlockBuilder dict_block_;
 
-  std::unordered_map<StringPiece, uint32_t, GoodFastHash<StringPiece> > dictionary_;
+  google::dense_hash_map<StringPiece, uint32_t, GoodFastHash<StringPiece> > dictionary_;
   // Memory to hold the actual content for strings in the dictionary_.
   //
   // The size of it should be bigger than the size limit for dictionary block
@@ -111,13 +117,13 @@ class BinaryDictBlockBuilder : public BlockBuilder {
 
   DictEncodingMode mode_;
 
-  // First key when mode_ = kCodeWodeMode
+  // First key when mode_ = kCodeWordMode
   faststring first_key_;
 };
 
 class CFileIterator;
 
-class BinaryDictBlockDecoder : public BlockDecoder {
+class BinaryDictBlockDecoder final : public BlockDecoder {
  public:
   explicit BinaryDictBlockDecoder(Slice slice, CFileIterator* iter);
 
@@ -125,6 +131,10 @@ class BinaryDictBlockDecoder : public BlockDecoder {
   virtual void SeekToPositionInBlock(uint pos) OVERRIDE;
   virtual Status SeekAtOrAfterValue(const void* value, bool* exact_match) OVERRIDE;
   Status CopyNextValues(size_t* n, ColumnDataView* dst) OVERRIDE;
+  Status CopyNextAndEval(size_t* n,
+                         ColumnMaterializationContext* ctx,
+                         SelectionVectorView* sel,
+                         ColumnDataView* dst) override;
 
   virtual bool HasNext() const OVERRIDE {
     return data_decoder_->HasNext();
@@ -154,6 +164,10 @@ class BinaryDictBlockDecoder : public BlockDecoder {
   BinaryPlainBlockDecoder* dict_decoder_;
 
   gscoped_ptr<BlockDecoder> data_decoder_;
+
+  // Parent CFileIterator, each dictionary decoder in the same CFile will share
+  // the same vocabulary, and thus, the same set of matching codewords.
+  CFileIterator* parent_cfile_iter_;
 
   DictEncodingMode mode_;
 

@@ -21,6 +21,7 @@
 #include <unordered_map>
 
 #include "kudu/gutil/singleton.h"
+#include "kudu/util/logging.h"
 
 using std::shared_ptr;
 using std::unordered_map;
@@ -34,13 +35,18 @@ TypeInfo::TypeInfo(TypeTraitsClass t)
     name_(TypeTraitsClass::name()),
     size_(TypeTraitsClass::size),
     min_value_(TypeTraitsClass::min_value()),
+    max_value_(TypeTraitsClass::max_value()),
     append_func_(TypeTraitsClass::AppendDebugStringForValue),
     compare_func_(TypeTraitsClass::Compare),
     are_consecutive_func_(TypeTraitsClass::AreConsecutive) {
 }
 
 void TypeInfo::AppendDebugStringForValue(const void *ptr, string *str) const {
-  append_func_(ptr, str);
+  if (KUDU_SHOULD_REDACT()) {
+    str->append(kRedactionMessage);
+  } else {
+    append_func_(ptr, str);
+  }
 }
 
 int TypeInfo::Compare(const void *lhs, const void *rhs) const {
@@ -70,7 +76,7 @@ class TypeInfoResolver {
     AddMapping<INT32>();
     AddMapping<UINT64>();
     AddMapping<INT64>();
-    AddMapping<TIMESTAMP>();
+    AddMapping<UNIXTIME_MICROS>();
     AddMapping<STRING>();
     AddMapping<BOOL>();
     AddMapping<FLOAT>();

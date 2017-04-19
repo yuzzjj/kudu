@@ -25,7 +25,10 @@
 // etc, as appropriate.
 package kudu;
 
-option java_package = "org.kududb";
+option java_package = "org.apache.kudu";
+
+import "kudu/util/compression/compression.proto";
+import "kudu/util/pb_util.proto";
 
 // If you add a new type keep in mind to add it to the end
 // or update AddMapping() functions like the one in key_encoder.cc
@@ -45,7 +48,7 @@ enum DataType {
   FLOAT = 10;
   DOUBLE = 11;
   BINARY = 12;
-  TIMESTAMP = 13;
+  UNIXTIME_MICROS = 13;
 }
 
 enum EncodingType {
@@ -53,19 +56,11 @@ enum EncodingType {
   AUTO_ENCODING = 0;
   PLAIN_ENCODING = 1;
   PREFIX_ENCODING = 2;
+  // GROUP_VARINT encoding is deprecated and no longer implemented.
   GROUP_VARINT = 3;
   RLE = 4;
   DICT_ENCODING = 5;
   BIT_SHUFFLE = 6;
-}
-
-enum CompressionType {
-  UNKNOWN_COMPRESSION = 999;
-  DEFAULT_COMPRESSION = 0;
-  NO_COMPRESSION = 1;
-  SNAPPY = 2;
-  LZ4 = 3;
-  ZLIB = 4;
 }
 
 // TODO: Differentiate between the schema attributes
@@ -78,6 +73,18 @@ message ColumnSchemaPB {
   required DataType type = 3;
   optional bool is_key = 4 [default = false];
   optional bool is_nullable = 5 [default = false];
+
+  // Default values.
+  // NOTE: as far as clients are concerned, there is only one
+  // "default value" of a column. The read/write defaults are used
+  // internally and should not be exposed by any public client APIs.
+  //
+  // When passing schemas to the master for create/alter table,
+  // specify the default in 'read_default_value'.
+  //
+  // Contrary to this, when the client opens a table, it will receive
+  // both the read and write defaults, but the *write* default is
+  // what should be exposed as the "current" default.
   optional bytes read_default_value = 6;
   optional bytes write_default_value = 7;
 
@@ -267,4 +274,53 @@ message PartitionPB {
   optional bytes partition_key_start = 2;
   // The encoded end partition key (exclusive).
   optional bytes partition_key_end = 3;
+}
+
+// A predicate that can be applied on a Kudu column.
+message ColumnPredicatePB {
+  // The predicate column name.
+  optional string column = 1;
+
+  message Range {
+
+    // Bounds should be encoded as follows:
+    // - STRING/BINARY values: simply the exact string value for the bound.
+    // - other type: the canonical x86 in-memory representation -- eg for
+    //   uint32s, a little-endian value.
+    //
+    // Note that this predicate type should not be used for NULL data --
+    // NULL is defined to neither be greater than or less than other values
+    // for the comparison operator. We will eventually add a special
+    // predicate type for null-ness.
+
+    // The inclusive lower bound.
+    optional bytes lower = 1 [(kudu.REDACT) = true];
+
+    // The exclusive upper bound.
+    optional bytes upper = 2 [(kudu.REDACT) = true];
+  }
+
+  message Equality {
+    // The inclusive lower bound. See comment in Range for notes on the
+    // encoding.
+    optional bytes value = 1 [(kudu.REDACT) = true];
+  }
+
+  message InList {
+    // A list of values for the field. See comment in Range for notes on
+    // the encoding.
+    repeated bytes values = 1 [(kudu.REDACT) = true];
+  }
+
+  message IsNotNull {}
+
+  message IsNull {}
+
+  oneof predicate {
+    Range range = 2;
+    Equality equality = 3;
+    IsNotNull is_not_null = 4;
+    InList in_list = 5;
+    IsNull is_null = 6;
+  }
 }

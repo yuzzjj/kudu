@@ -16,16 +16,17 @@
 // under the License.
 
 #include "kudu/fs/block_manager.h"
+
+#include <mutex>
+
+#include <glog/logging.h>
+
+#include "kudu/gutil/integral_types.h"
+#include "kudu/gutil/strings/substitute.h"
+#include "kudu/util/env.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/metrics.h"
 
-// The default value is optimized for the case where:
-// 1. the cfile blocks are colocated with the WALs.
-// 2. The underlying hardware is a spinning disk.
-// 3. The underlying filesystem is either XFS or EXT4.
-// 4. cfile_do_on_finish is 'close' (see cfile/cfile_writer.cc).
-//
-// When all conditions hold, this value ensures low latency for WAL writes.
 DEFINE_bool(block_coalesce_close, false,
             "Coalesce synchronization of data during CloseBlocks()");
 TAG_FLAG(block_coalesce_close, experimental);
@@ -35,16 +36,46 @@ DEFINE_bool(block_manager_lock_dirs, true,
             "Note that read-only concurrent usage is still allowed.");
 TAG_FLAG(block_manager_lock_dirs, unsafe);
 
+DEFINE_int64(block_manager_max_open_files, -1,
+             "Maximum number of open file descriptors to be used for data "
+             "blocks. If 0, there is no limit. If -1, Kudu will use 40% of "
+             "its resource limit as per getrlimit(). This is a soft limit.");
+TAG_FLAG(block_manager_max_open_files, advanced);
+TAG_FLAG(block_manager_max_open_files, evolving);
+
+using strings::Substitute;
+
 namespace kudu {
 namespace fs {
-
-const char* BlockManager::kInstanceMetadataFileName = "block_manager_instance";
 
 BlockManagerOptions::BlockManagerOptions()
   : read_only(false) {
 }
 
 BlockManagerOptions::~BlockManagerOptions() {
+}
+
+int64_t GetFileCacheCapacityForBlockManager(Env* env) {
+  // Maximize this process' open file limit first, if possible.
+  static std::once_flag once;
+  std::call_once(once, [&]() {
+    env->IncreaseOpenFileLimit();
+  });
+
+  // See block_manager_max_open_files.
+  if (FLAGS_block_manager_max_open_files == -1) {
+    return (2 * env->GetOpenFileLimit()) / 5;
+  }
+  if (FLAGS_block_manager_max_open_files == 0) {
+    return kint64max;
+  }
+  int64_t file_limit = env->GetOpenFileLimit();
+  LOG_IF(FATAL, FLAGS_block_manager_max_open_files > file_limit) <<
+      Substitute(
+          "Configured open file limit (block_manager_max_open_files) $0 "
+          "exceeds process fd limit (ulimit) $1",
+          FLAGS_block_manager_max_open_files, file_limit);
+  return FLAGS_block_manager_max_open_files;
 }
 
 } // namespace fs

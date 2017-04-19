@@ -15,15 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <boost/lexical_cast.hpp>
-#include <gtest/gtest.h>
+#include <iosfwd>
 #include <memory>
 #include <unordered_map>
+
+#include <gflags/gflags.h>
+#include <gtest/gtest.h>
 
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/tools/ksck.h"
+#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/test_util.h"
+
+DECLARE_string(color);
 
 namespace kudu {
 namespace tools {
@@ -32,39 +37,45 @@ using std::shared_ptr;
 using std::static_pointer_cast;
 using std::string;
 using std::unordered_map;
-using std::vector;
+using strings::Substitute;
+
+// Import this symbol from ksck.cc so we can introspect the
+// errors being written to stderr.
+extern std::ostream* g_err_stream;
 
 class MockKsckTabletServer : public KsckTabletServer {
  public:
   explicit MockKsckTabletServer(const string& uuid)
       : KsckTabletServer(uuid),
-        connect_status_(Status::OK()),
+        fetch_info_status_(Status::OK()),
         address_("<mock>") {
   }
 
-  virtual Status Connect() const OVERRIDE {
-    return connect_status_;
+  Status FetchInfo() override {
+    timestamp_ = 12345;
+    if (fetch_info_status_.ok()) {
+      state_ = kFetched;
+    } else {
+      state_ = kFetchFailed;
+    }
+    return fetch_info_status_;
   }
 
   virtual void RunTabletChecksumScanAsync(
       const std::string& tablet_id,
       const Schema& schema,
       const ChecksumOptions& options,
-      const ReportResultCallback& callback) OVERRIDE {
-    callback.Run(Status::OK(), 0);
+      ChecksumProgressCallbacks* callbacks) OVERRIDE {
+    callbacks->Progress(10, 20);
+    callbacks->Finished(Status::OK(), 0);
   }
 
-  virtual Status CurrentTimestamp(uint64_t* timestamp) const OVERRIDE {
-    *timestamp = 0;
-    return Status::OK();
-  }
-
-  virtual const std::string& address() const OVERRIDE {
+  virtual std::string address() const OVERRIDE {
     return address_;
   }
 
   // Public because the unit tests mutate this variable directly.
-  Status connect_status_;
+  Status fetch_info_status_;
 
  private:
   const string address_;
@@ -73,11 +84,11 @@ class MockKsckTabletServer : public KsckTabletServer {
 class MockKsckMaster : public KsckMaster {
  public:
   MockKsckMaster()
-      : connect_status_(Status::OK()) {
+      : fetch_info_status_(Status::OK()) {
   }
 
-  virtual Status Connect() const OVERRIDE {
-    return connect_status_;
+  virtual Status Connect() OVERRIDE {
+    return fetch_info_status_;
   }
 
   virtual Status RetrieveTabletServers(TSMap* tablet_servers) OVERRIDE {
@@ -95,7 +106,7 @@ class MockKsckMaster : public KsckMaster {
   }
 
   // Public because the unit tests mutate these variables directly.
-  Status connect_status_;
+  Status fetch_info_status_;
   TSMap tablet_servers_;
   vector<shared_ptr<KsckTable>> tables_;
 };
@@ -106,13 +117,20 @@ class KsckTest : public KuduTest {
       : master_(new MockKsckMaster()),
         cluster_(new KsckCluster(static_pointer_cast<KsckMaster>(master_))),
         ksck_(new Ksck(cluster_)) {
+    FLAGS_color = "never";
     unordered_map<string, shared_ptr<KsckTabletServer>> tablet_servers;
     for (int i = 0; i < 3; i++) {
-      string name = strings::Substitute("$0", i);
+      string name = Substitute("ts-id-$0", i);
       shared_ptr<MockKsckTabletServer> ts(new MockKsckTabletServer(name));
       InsertOrDie(&tablet_servers, ts->uuid(), ts);
     }
     master_->tablet_servers_.swap(tablet_servers);
+
+    g_err_stream = &err_stream_;
+  }
+
+  ~KsckTest() {
+    g_err_stream = NULL;
   }
 
  protected:
@@ -128,63 +146,106 @@ class KsckTest : public KuduTest {
   void CreateOneTableOneTablet() {
     CreateDefaultAssignmentPlan(1);
 
-    shared_ptr<KsckTablet> tablet(new KsckTablet("1"));
-    CreateAndFillTablet(tablet, 1, true);
-
-    CreateAndAddTable({ tablet }, "test", 1);
+    auto table = CreateAndAddTable("test", 1);
+    shared_ptr<KsckTablet> tablet(new KsckTablet(table.get(), "tablet-id-1"));
+    CreateAndFillTablet(tablet, 1, true, true);
+    table->set_tablets({ tablet });
   }
 
   void CreateOneSmallReplicatedTable() {
     int num_replicas = 3;
     int num_tablets = 3;
-    vector<shared_ptr<KsckTablet>> tablets;
     CreateDefaultAssignmentPlan(num_replicas * num_tablets);
+    auto table = CreateAndAddTable("test", num_replicas);
+
+    vector<shared_ptr<KsckTablet>> tablets;
     for (int i = 0; i < num_tablets; i++) {
-      shared_ptr<KsckTablet> tablet(new KsckTablet(boost::lexical_cast<string>(i)));
-      CreateAndFillTablet(tablet, num_replicas, true);
+      shared_ptr<KsckTablet> tablet(new KsckTablet(
+          table.get(), Substitute("tablet-id-$0", i)));
+      CreateAndFillTablet(tablet, num_replicas, true, true);
       tablets.push_back(tablet);
     }
+    table->set_tablets(tablets);
+  }
 
-    CreateAndAddTable(tablets, "test", num_replicas);
+  void CreateOneSmallReplicatedTableWithTabletNotRunning() {
+    int num_replicas = 3;
+    int num_tablets = 3;
+    CreateDefaultAssignmentPlan(num_replicas * num_tablets);
+    auto table = CreateAndAddTable("test", num_replicas);
+
+    vector<shared_ptr<KsckTablet>> tablets;
+    for (int i = 0; i < num_tablets; i++) {
+      shared_ptr<KsckTablet> tablet(new KsckTablet(
+          table.get(), Substitute("tablet-id-$0", i)));
+      CreateAndFillTablet(tablet, num_replicas, true, i != 0);
+      tablets.push_back(tablet);
+    }
+    table->set_tablets(tablets);
   }
 
   void CreateOneOneTabletReplicatedBrokenTable() {
     // We're placing only two tablets, the 3rd goes nowhere.
     CreateDefaultAssignmentPlan(2);
 
-    shared_ptr<KsckTablet> tablet(new KsckTablet("1"));
-    CreateAndFillTablet(tablet, 2, false);
+    auto table = CreateAndAddTable("test", 3);
 
-    CreateAndAddTable({ tablet }, "test", 3);
+    shared_ptr<KsckTablet> tablet(new KsckTablet(table.get(), "tablet-id-1"));
+    CreateAndFillTablet(tablet, 2, false, true);
+    table->set_tablets({ tablet });
   }
 
-  void CreateAndAddTable(vector<shared_ptr<KsckTablet>> tablets,
-                         const string& name, int num_replicas) {
+  shared_ptr<KsckTable> CreateAndAddTable(const string& name, int num_replicas) {
     shared_ptr<KsckTable> table(new KsckTable(name, Schema(), num_replicas));
-    table->set_tablets(tablets);
-
     vector<shared_ptr<KsckTable>> tables = { table };
     master_->tables_.assign(tables.begin(), tables.end());
+    return table;
   }
 
-  void CreateAndFillTablet(shared_ptr<KsckTablet>& tablet, int num_replicas, bool has_leader) {
+  void CreateAndFillTablet(shared_ptr<KsckTablet>& tablet, int num_replicas,
+                           bool has_leader, bool is_running) {
     vector<shared_ptr<KsckTabletReplica>> replicas;
     if (has_leader) {
-      CreateReplicaAndAdd(replicas, true);
+      CreateReplicaAndAdd(replicas, tablet->id(), true, is_running);
       num_replicas--;
     }
     for (int i = 0; i < num_replicas; i++) {
-      CreateReplicaAndAdd(replicas, false);
+      CreateReplicaAndAdd(replicas, tablet->id(), false, is_running);
     }
     tablet->set_replicas(replicas);
   }
 
-  void CreateReplicaAndAdd(vector<shared_ptr<KsckTabletReplica>>& replicas, bool is_leader) {
+  void CreateReplicaAndAdd(vector<shared_ptr<KsckTabletReplica>>& replicas,
+                           string tablet_id,
+                           bool is_leader,
+                           bool is_running) {
     shared_ptr<KsckTabletReplica> replica(new KsckTabletReplica(assignment_plan_.back(),
-                                                                is_leader, !is_leader));
+                                                                is_leader));
+    shared_ptr<MockKsckTabletServer> ts = static_pointer_cast<MockKsckTabletServer>(
+            master_->tablet_servers_.at(assignment_plan_.back()));
+
     assignment_plan_.pop_back();
     replicas.push_back(replica);
+
+    // Add the equivalent replica on the tablet server.
+    tablet::TabletStatusPB pb;
+    pb.set_tablet_id(tablet_id);
+    pb.set_table_name("fake-table");
+    pb.set_state(is_running ? tablet::RUNNING : tablet::FAILED);
+    InsertOrDie(&ts->tablet_status_map_, tablet_id, std::move(pb));
   }
+
+  Status RunKsck() {
+    auto c = MakeScopedCleanup([this]() {
+        LOG(INFO) << "Ksck output:\n" << err_stream_.str();
+      });
+    RETURN_NOT_OK(ksck_->CheckMasterRunning());
+    RETURN_NOT_OK(ksck_->FetchTableAndTabletInfo());
+    RETURN_NOT_OK(ksck_->FetchInfoFromTabletServers());
+    RETURN_NOT_OK(ksck_->CheckTablesConsistency());
+    return Status::OK();
+  }
+
 
   shared_ptr<MockKsckMaster> master_;
   shared_ptr<KsckCluster> cluster_;
@@ -195,6 +256,8 @@ class KsckTest : public KuduTest {
   // you should have a list that looks like ts1,ts2,ts3,ts3,ts2,ts1 so that the two LEADERS, which
   // are assigned first, end up on ts1 and ts3.
   vector<string> assignment_plan_;
+
+  std::ostringstream err_stream_;
 };
 
 TEST_F(KsckTest, TestMasterOk) {
@@ -203,55 +266,148 @@ TEST_F(KsckTest, TestMasterOk) {
 
 TEST_F(KsckTest, TestMasterUnavailable) {
   Status error = Status::NetworkError("Network failure");
-  master_->connect_status_ = error;
+  master_->fetch_info_status_ = error;
   ASSERT_TRUE(ksck_->CheckMasterRunning().IsNetworkError());
 }
 
 TEST_F(KsckTest, TestTabletServersOk) {
-  ASSERT_OK(ksck_->CheckMasterRunning());
-  ASSERT_OK(ksck_->FetchTableAndTabletInfo());
-  ASSERT_OK(ksck_->CheckTabletServersRunning());
+  ASSERT_OK(RunKsck());
 }
 
 TEST_F(KsckTest, TestBadTabletServer) {
-  ASSERT_OK(ksck_->CheckMasterRunning());
+  CreateOneSmallReplicatedTable();
+
+  // Mock a failure to connect to one of the tablet servers.
   Status error = Status::NetworkError("Network failure");
-  static_pointer_cast<MockKsckTabletServer>(master_->tablet_servers_.begin()->second)
-      ->connect_status_ = error;
+  static_pointer_cast<MockKsckTabletServer>(master_->tablet_servers_["ts-id-1"])
+      ->fetch_info_status_ = error;
+
+  ASSERT_OK(ksck_->CheckMasterRunning());
   ASSERT_OK(ksck_->FetchTableAndTabletInfo());
-  Status s = ksck_->CheckTabletServersRunning();
+  Status s = ksck_->FetchInfoFromTabletServers();
   ASSERT_TRUE(s.IsNetworkError()) << "Status returned: " << s.ToString();
+
+  s = ksck_->CheckTablesConsistency();
+  EXPECT_EQ("Corruption: 1 table(s) are bad", s.ToString());
+  ASSERT_STR_CONTAINS(
+      err_stream_.str(),
+      "WARNING: Unable to connect to Tablet Server "
+      "ts-id-1 (<mock>): Network error: Network failure");
+  ASSERT_STR_CONTAINS(
+      err_stream_.str(),
+      "Tablet tablet-id-0 of table 'test' is under-replicated: 1 replica(s) not RUNNING\n"
+      "  ts-id-0 (<mock>): RUNNING [LEADER]\n"
+      "  ts-id-1 (<mock>): TS unavailable\n"
+      "  ts-id-2 (<mock>): RUNNING\n");
+  ASSERT_STR_CONTAINS(
+      err_stream_.str(),
+      "Tablet tablet-id-1 of table 'test' is under-replicated: 1 replica(s) not RUNNING\n"
+      "  ts-id-0 (<mock>): RUNNING [LEADER]\n"
+      "  ts-id-1 (<mock>): TS unavailable\n"
+      "  ts-id-2 (<mock>): RUNNING\n");
+  ASSERT_STR_CONTAINS(
+      err_stream_.str(),
+      "Tablet tablet-id-2 of table 'test' is under-replicated: 1 replica(s) not RUNNING\n"
+      "  ts-id-0 (<mock>): RUNNING [LEADER]\n"
+      "  ts-id-1 (<mock>): TS unavailable\n"
+      "  ts-id-2 (<mock>): RUNNING\n");
+}
+
+TEST_F(KsckTest, TestZeroTabletReplicasCheck) {
+  ASSERT_OK(RunKsck());
 }
 
 TEST_F(KsckTest, TestZeroTableCheck) {
-  ASSERT_OK(ksck_->CheckMasterRunning());
-  ASSERT_OK(ksck_->FetchTableAndTabletInfo());
-  ASSERT_OK(ksck_->CheckTabletServersRunning());
-  ASSERT_OK(ksck_->CheckTablesConsistency());
+  ASSERT_OK(RunKsck());
 }
 
 TEST_F(KsckTest, TestOneTableCheck) {
   CreateOneTableOneTablet();
-  ASSERT_OK(ksck_->CheckMasterRunning());
-  ASSERT_OK(ksck_->FetchTableAndTabletInfo());
-  ASSERT_OK(ksck_->CheckTabletServersRunning());
-  ASSERT_OK(ksck_->CheckTablesConsistency());
+  ASSERT_OK(RunKsck());
+  ASSERT_OK(ksck_->ChecksumData(ChecksumOptions()));
+  ASSERT_STR_CONTAINS(err_stream_.str(),
+                      "0/1 replicas remaining (20B from disk, 10 rows summed)");
 }
 
 TEST_F(KsckTest, TestOneSmallReplicatedTable) {
   CreateOneSmallReplicatedTable();
-  ASSERT_OK(ksck_->CheckMasterRunning());
-  ASSERT_OK(ksck_->FetchTableAndTabletInfo());
-  ASSERT_OK(ksck_->CheckTabletServersRunning());
-  ASSERT_OK(ksck_->CheckTablesConsistency());
+  ASSERT_OK(RunKsck());
+  ASSERT_OK(ksck_->ChecksumData(ChecksumOptions()));
+  ASSERT_STR_CONTAINS(err_stream_.str(),
+                      "0/9 replicas remaining (180B from disk, 90 rows summed)");
+
+  // Test filtering (a non-matching pattern)
+  err_stream_.str("");
+  ksck_->set_table_filters({"xyz"});
+  ASSERT_OK(RunKsck());
+  Status s = ksck_->ChecksumData(ChecksumOptions());
+  EXPECT_EQ("Not found: No table found. Filter: table_filters=xyz", s.ToString());
+  ASSERT_STR_CONTAINS(err_stream_.str(),
+                      "The cluster doesn't have any matching tables");
+
+  // Test filtering with a matching table pattern.
+  err_stream_.str("");
+  ksck_->set_table_filters({"te*"});
+  ASSERT_OK(RunKsck());
+  ASSERT_OK(ksck_->ChecksumData(ChecksumOptions()));
+  ASSERT_STR_CONTAINS(err_stream_.str(),
+                      "0/9 replicas remaining (180B from disk, 90 rows summed)");
+
+  // Test filtering with a matching tablet ID pattern.
+  err_stream_.str("");
+  ksck_->set_table_filters({});
+  ksck_->set_tablet_id_filters({"*-id-2"});
+  ASSERT_OK(RunKsck());
+  ASSERT_OK(ksck_->ChecksumData(ChecksumOptions()));
+  ASSERT_STR_CONTAINS(err_stream_.str(),
+                      "0/3 replicas remaining (60B from disk, 30 rows summed)");
 }
 
 TEST_F(KsckTest, TestOneOneTabletBrokenTable) {
   CreateOneOneTabletReplicatedBrokenTable();
-  ASSERT_OK(ksck_->CheckMasterRunning());
-  ASSERT_OK(ksck_->FetchTableAndTabletInfo());
-  ASSERT_OK(ksck_->CheckTabletServersRunning());
-  ASSERT_TRUE(ksck_->CheckTablesConsistency().IsCorruption());
+  Status s = RunKsck();
+  EXPECT_EQ("Corruption: 1 table(s) are bad", s.ToString());
+  ASSERT_STR_CONTAINS(err_stream_.str(),
+                      "Tablet tablet-id-1 of table 'test' is under-replicated: "
+                      "configuration has 2 replicas vs desired 3");
+}
+
+TEST_F(KsckTest, TestMismatchedAssignments) {
+  CreateOneSmallReplicatedTable();
+  shared_ptr<MockKsckTabletServer> ts = static_pointer_cast<MockKsckTabletServer>(
+      master_->tablet_servers_.at(Substitute("ts-id-$0", 0)));
+  ASSERT_EQ(1, ts->tablet_status_map_.erase("tablet-id-2"));
+
+  Status s = RunKsck();
+  EXPECT_EQ("Corruption: 1 table(s) are bad", s.ToString());
+  ASSERT_STR_CONTAINS(err_stream_.str(),
+                      "Tablet tablet-id-2 of table 'test' is under-replicated: "
+                      "1 replica(s) not RUNNING\n"
+                      "  ts-id-0 (<mock>): missing [LEADER]\n"
+                      "  ts-id-1 (<mock>): RUNNING\n"
+                      "  ts-id-2 (<mock>): RUNNING\n");
+}
+
+TEST_F(KsckTest, TestTabletNotRunning) {
+  CreateOneSmallReplicatedTableWithTabletNotRunning();
+
+  Status s = RunKsck();
+  EXPECT_EQ("Corruption: 1 table(s) are bad", s.ToString());
+  ASSERT_STR_CONTAINS(
+      err_stream_.str(),
+      "Tablet tablet-id-0 of table 'test' is unavailable: 3 replica(s) not RUNNING\n"
+      "  ts-id-0 (<mock>): bad state [LEADER]\n"
+      "    State:       FAILED\n"
+      "    Data state:  TABLET_DATA_UNKNOWN\n"
+      "    Last status: \n"
+      "  ts-id-1 (<mock>): bad state\n"
+      "    State:       FAILED\n"
+      "    Data state:  TABLET_DATA_UNKNOWN\n"
+      "    Last status: \n"
+      "  ts-id-2 (<mock>): bad state\n"
+      "    State:       FAILED\n"
+      "    Data state:  TABLET_DATA_UNKNOWN\n"
+      "    Last status: \n");
 }
 
 } // namespace tools

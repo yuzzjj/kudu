@@ -63,6 +63,19 @@
 #endif
 #endif
 
+// For deprecated functions or variables, generate a warning at usage sites.
+// Verified to work as early as GCC 3.1.1 and clang 3.2 (so we'll assume any
+// clang is new enough).
+#ifndef ATTRIBUTE_DEPRECATED
+#if defined(__clang__) || \
+  (defined(COMPILER_GCC) && \
+   (__GNUC__ * 10000 + __GNUC_MINOR__ * 100) >= 30200)
+#define ATTRIBUTE_DEPRECATED(msg) __attribute__ ((deprecated (msg) ))
+#else
+#define ATTRIBUTE_DEPRECATED(msg)
+#endif
+#endif // #ifndef ATTRIBUTE_DEPRECATED
+
 #ifndef COMPILE_ASSERT
 // The COMPILE_ASSERT macro can be used to verify that a compile time
 // expression is true. For example, you could use it to verify the
@@ -79,9 +92,11 @@
 // the expression is false, most compilers will issue a warning/error
 // containing the name of the variable.
 
+/// @cond
 template <bool>
 struct StubsCompileAssert {
 };
+/// @endcond
 
 #define COMPILE_ASSERT(expr, msg) \
   typedef StubsCompileAssert<(bool(expr))> msg[bool(expr) ? 1 : -1] ATTRIBUTE_UNUSED // NOLINT(*)
@@ -157,16 +172,30 @@ namespace kudu {
 
 namespace internal_logging {
 
+/// @brief A helper for the nil log sink.
+///
+/// Using this helper is analogous to sending log messages to /dev/null:
+/// nothing gets logged.
 class NullLog {
  public:
+  /// The no-op output operator.
+  ///
+  /// @param [in] t
+  ///   The object to send into the nil sink.
+  /// @return Reference to the updated object.
   template<class T>
   NullLog& operator<<(const T& t) {
     return *this;
   }
 };
 
+/// @brief A helper for stderr log sink.
 class CerrLog {
  public:
+  /// Create a CerrLog sink helper object.
+  ///
+  /// @param [in] severity
+  ///   The severity for log messages output to the sink (stderr).
   CerrLog(int severity) // NOLINT(runtime/explicit)
     : severity_(severity),
       has_logged_(false) {
@@ -181,6 +210,11 @@ class CerrLog {
     }
   }
 
+  /// The output operator.
+  ///
+  /// @param [in] t
+  ///   The object to print into stderr.
+  /// @return Reference to the updated object.
   template<class T>
   CerrLog& operator<<(const T& t) {
     has_logged_ = true;

@@ -20,18 +20,79 @@
 
 from libcpp.string cimport string
 from libcpp cimport bool as c_bool
+from libcpp.map cimport map
 
 cimport cpython
 from cython.operator cimport dereference as deref
 
 from libkudu_client cimport *
-
-from kudu.compat import tobytes, frombytes
-from kudu.schema cimport Schema, ColumnSchema
+from kudu.compat import tobytes, frombytes, dict_iter
+from kudu.schema cimport Schema, ColumnSchema, ColumnSpec, KuduValue, KuduType
 from kudu.errors cimport check_status
+from kudu.util import to_unixtime_micros, from_unixtime_micros, from_hybridtime
 from errors import KuduException
 
 import six
+
+# Replica selection enums
+LEADER_ONLY = ReplicaSelection_Leader
+CLOSEST_REPLICA = ReplicaSelection_Closest
+FIRST_REPLICA = ReplicaSelection_First
+
+cdef dict _replica_selection_policies = {
+    'leader': ReplicaSelection_Leader,
+    'closest': ReplicaSelection_Closest,
+    'first': ReplicaSelection_First
+}
+
+# Read mode enums
+READ_LATEST = ReadMode_Latest
+READ_AT_SNAPSHOT = ReadMode_Snapshot
+
+cdef dict _read_modes = {
+    'latest': ReadMode_Latest,
+    'snapshot': ReadMode_Snapshot
+}
+
+cdef dict _type_names = {
+    KUDU_INT8 : "KUDU_INT8",
+    KUDU_INT16 : "KUDU_INT16",
+    KUDU_INT32 : "KUDU_INT32",
+    KUDU_INT64 : "KUDU_INT64",
+    KUDU_STRING : "KUDU_STRING",
+    KUDU_BOOL : "KUDU_BOOL",
+    KUDU_FLOAT : "KUDU_FLOAT",
+    KUDU_DOUBLE : "KUDU_DOUBLE",
+    KUDU_BINARY : "KUDU_BINARY",
+    KUDU_UNIXTIME_MICROS : "KUDU_UNIXTIME_MICROS"
+}
+
+# Range Partition Bound Type enums
+EXCLUSIVE_BOUND = PartitionType_Exclusive
+INCLUSIVE_BOUND = PartitionType_Inclusive
+
+cdef dict _partition_bound_types = {
+    'exclusive': PartitionType_Exclusive,
+    'inclusive': PartitionType_Inclusive
+}
+
+def _check_convert_range_bound_type(bound):
+    # Convert bounds types to constants and raise exception if invalid.
+    def invalid_bound_type(bound_type):
+        raise ValueError('Invalid range partition bound type: {0}'
+                         .format(bound_type))
+
+    if isinstance(bound, int):
+        if bound >= len(_partition_bound_types) \
+                or bound < 0:
+            invalid_bound_type(bound)
+        else:
+            return bound
+    else:
+        try:
+            return _partition_bound_types[bound.lower()]
+        except KeyError:
+            invalid_bound_type(bound)
 
 
 cdef class TimeDelta:
@@ -175,13 +236,6 @@ cdef class Client:
     kudu.connect instead.
     """
 
-    cdef:
-        shared_ptr[KuduClient] client
-        KuduClient* cp
-
-    cdef readonly:
-        list master_addrs
-
     def __cinit__(self, addr_or_addrs, admin_timeout_ms=None,
                   rpc_timeout_ms=None):
         cdef:
@@ -190,10 +244,25 @@ cdef class Client:
             KuduClientBuilder builder
             TimeDelta timeout
 
+        # Python programs will often have already imported _ssl, which
+        # has the side effect of initializing OpenSSL. So, we detect
+        # whether _ssl is present, and if we can import it, we disable
+        # Kudu's initialization to avoid a conflict.
+        try:
+          import _ssl
+          DisableOpenSSLInitialization()
+        except:
+          pass
+
         if isinstance(addr_or_addrs, six.string_types):
             addr_or_addrs = [addr_or_addrs]
         elif not isinstance(addr_or_addrs, list):
             addr_or_addrs = list(addr_or_addrs)
+
+        # Raise exception for empty iters, otherwise the connection call
+        # will hang
+        if not addr_or_addrs:
+            raise ValueError("Empty iterator for addr_or_addrs.")
 
         self.master_addrs = addr_or_addrs
         for addr in addr_or_addrs:
@@ -226,7 +295,26 @@ cdef class Client:
         # Nothing yet to clean up here
         pass
 
-    def create_table(self, table_name, Schema schema):
+    def latest_observed_timestamp(self):
+        """
+        Get the highest timestamp observed by the client in UTC. This
+        is intended to gain external consistency across clients.
+
+        Note: The latest observed timestamp can also be used to start a
+        snapshot scan on a table which is guaranteed to contain all data
+        written or previously read by this client. This should be treated
+        as experimental as it this method will change or disappear in a
+        future release. Additionally, note that 1 must be added to the
+        value to be used in snapshot reads (this is taken care of in the
+        from_hybridtime method).
+
+        Returns
+        -------
+        latest : datetime.datetime
+        """
+        return from_hybridtime(self.cp.GetLatestObservedTimestamp())
+
+    def create_table(self, table_name, Schema schema, partitioning, n_replicas=None):
         """
         Creates a new Kudu table from the passed Schema and options.
 
@@ -235,18 +323,73 @@ cdef class Client:
         table_name : string
         schema : kudu.Schema
           Create using kudu.schema_builder
+        partitioning : Partitioning object
+        n_replicas : int Number of replicas to set. This should be an odd number.
+          If not provided (or if <= 0), falls back to the server-side default.
         """
         cdef:
             KuduTableCreator* c
             Status s
         c = self.cp.NewTableCreator()
         try:
-            s = (c.table_name(tobytes(table_name))
-                 .schema(schema.schema)
-                 .Create())
+            c.table_name(tobytes(table_name))
+            c.schema(schema.schema)
+            self._apply_partitioning(c, partitioning, schema)
+            if n_replicas:
+                c.num_replicas(n_replicas)
+            s = c.Create()
             check_status(s)
         finally:
             del c
+
+    cdef _apply_partitioning(self, KuduTableCreator* c, part, Schema schema):
+        cdef:
+            vector[string] v
+            PartialRow lower_bound
+            PartialRow upper_bound
+            PartialRow split_row
+
+        # Apply hash partitioning.
+        for col_names, num_buckets, seed in part._hash_partitions:
+            v.clear()
+            for n in col_names:
+                v.push_back(tobytes(n))
+            if seed:
+                c.add_hash_partitions(v, num_buckets, seed)
+            else:
+                c.add_hash_partitions(v, num_buckets)
+        # Apply range partitioning
+        if part._range_partition_cols is not None:
+            v.clear()
+            for n in part._range_partition_cols:
+                v.push_back(tobytes(n))
+            c.set_range_partition_columns(v)
+            if part._range_partitions:
+                for partition in part._range_partitions:
+                    if not isinstance(partition[0], PartialRow):
+                        lower_bound = schema.new_row(partition[0])
+                    else:
+                        lower_bound = partition[0]
+                    lower_bound._own = 0
+                    if not isinstance(partition[1], PartialRow):
+                        upper_bound = schema.new_row(partition[1])
+                    else:
+                        upper_bound = partition[1]
+                    upper_bound._own = 0
+                    c.add_range_partition(
+                        lower_bound.row,
+                        upper_bound.row,
+                        _check_convert_range_bound_type(partition[2]),
+                        _check_convert_range_bound_type(partition[3])
+                    )
+            if part._range_partition_splits:
+                for split in part._range_partition_splits:
+                    if not isinstance(split, PartialRow):
+                        split_row = schema.new_row(split)
+                    else:
+                        split_row = split
+                    split_row._own = 0
+                    c.add_range_partition_split(split_row.row)
 
     def delete_table(self, table_name):
         """
@@ -276,6 +419,22 @@ cdef class Client:
 
         check_status(self.cp.TableExists(c_name, &exists))
         return exists
+
+    def deserialize_token_into_scanner(self, serialized_token):
+        """
+        Deserializes a ScanToken using the client and returns a scanner.
+
+        Parameters
+        ----------
+        serialized_token : String
+          Serialized form of a ScanToken.
+
+        Returns
+        -------
+        scanner : Scanner
+        """
+        token = ScanToken()
+        return token.deserialize_into_scanner(self, serialized_token)
 
     def table(self, table_name):
         """
@@ -329,6 +488,28 @@ cdef class Client:
             result.append(frombytes(tables[i]))
         return result
 
+    def list_tablet_servers(self):
+        """
+        Retrieve a list of tablet servers currently running in the Kudu cluster
+
+        Returns
+        -------
+        tservers : list[TabletServer]
+          List of TabletServer objects
+        """
+        cdef:
+            vector[KuduTabletServer*] tservers
+            size_t i
+
+        check_status(self.cp.ListTabletServers(&tservers))
+
+        result = []
+        for i in range(tservers.size()):
+            ts = TabletServer()
+            ts._own = 1
+            result.append(ts._init(tservers[i]))
+        return result
+
     def new_session(self, flush_mode='manual', timeout_ms=5000):
         """
         Create a new KuduSession for applying write operations.
@@ -352,6 +533,28 @@ cdef class Client:
 
         return result
 
+    def new_table_alterer(self, Table table):
+        """
+        Create a TableAlterer object that can be used to apply a set of steps
+        to alter a table.
+
+        Parameters
+        ----------
+        table : Table
+          Table to alter. NOTE: The TableAlterer.alter() method will return
+          a new Table object with the updated information.
+
+        Examples
+        --------
+        table = client.table('example')
+        alterer = client.new_table_alterer(table)
+        table = alterer.rename('example2').alter()
+
+        Returns
+        -------
+        alterer : TableAlterer
+        """
+        return TableAlterer(table)
 
 
 #----------------------------------------------------------------------
@@ -453,7 +656,53 @@ cdef class StringVal(RawValue):
     def __dealloc__(self):
         del self.val
 
+cdef class UnixtimeMicrosVal(RawValue):
+    cdef:
+        int64_t val
+
+    def __cinit__(self, obj):
+        self.val = to_unixtime_micros(obj)
+        self.data = &self.val
+
 #----------------------------------------------------------------------
+cdef class TabletServer:
+    """
+    Represents a Kudu tablet server, containing the uuid, hostname and port.
+    Create a list of TabletServers by using the kudu.Client.list_tablet_servers
+    method after connecting to a cluster
+    """
+
+    cdef:
+        const KuduTabletServer* _tserver
+        public bint _own
+
+    cdef _init(self, const KuduTabletServer* tserver):
+        self._tserver = tserver
+        self._own = 0
+        return self
+
+    def __dealloc__(self):
+        if self._tserver != NULL and self._own:
+            del self._tserver
+
+    def __richcmp__(TabletServer self, TabletServer other, int op):
+        if op == 2: # ==
+            return ((self.uuid(), self.hostname(), self.port()) ==
+                    (other.uuid(), other.hostname(), other.port()))
+        elif op == 3: # !=
+            return ((self.uuid(), self.hostname(), self.port()) !=
+                    (other.uuid(), other.hostname(), other.port()))
+        else:
+            raise NotImplementedError
+
+    def uuid(self):
+        return frombytes(self._tserver.uuid())
+
+    def hostname(self):
+        return frombytes(self._tserver.hostname())
+
+    def port(self):
+        return self._tserver.port()
 
 
 cdef class Table:
@@ -462,14 +711,6 @@ cdef class Table:
     Represents a Kudu table, containing the schema and other tools. Create by
     using the kudu.Client.table method after connecting to a cluster.
     """
-
-    cdef:
-        shared_ptr[KuduTable] table
-
-    cdef readonly:
-        object _name
-        Schema schema
-        Client parent
 
     def __cinit__(self, name, Client client):
         self._name = name
@@ -483,6 +724,7 @@ cdef class Table:
         self.schema.schema = &self.ptr().schema()
         self.schema.own_schema = 0
         self.schema.parent = self
+        self.num_replicas = self.ptr().num_replicas()
 
     def __len__(self):
         # TODO: is this cheaply knowable?
@@ -490,16 +732,21 @@ cdef class Table:
 
     def __getitem__(self, key):
         spec = self.schema[key]
-        return Column(self, key, spec)
+        return Column(self, spec)
 
     property name:
-
+        """Name of the table."""
         def __get__(self):
             return frombytes(self.ptr().name())
 
+    property id:
+        """Identifier string for the table."""
+        def __get__(self):
+            return frombytes(self.ptr().id())
+
     # XXX: don't love this name
     property num_columns:
-
+        """Number of columns in the table's schema."""
         def __get__(self):
             return len(self.schema)
 
@@ -509,35 +756,77 @@ cdef class Table:
     def drop(self):
         raise NotImplementedError
 
-    def new_insert(self):
+    def new_insert(self, record=None):
         """
         Create a new Insert operation. Pass the completed Insert to a Session.
+        If a record is provided, a PartialRow will be initialized with values
+        from the input record. The record can be in the form of a tuple, dict,
+        or list. Dictionary keys can be either column names, indexes, or a
+        mix of both names and indexes.
+
+        Parameters
+        ----------
+        record : tuple/list/dict
 
         Returns
         -------
         insert : Insert
         """
-        return Insert(self)
+        return Insert(self, record)
 
-    def new_update(self):
+    def new_upsert(self, record=None):
+        """
+        Create a new Upsert operation. Pass the completed Upsert to a Session.
+        If a record is provided, a PartialRow will be initialized with values
+        from the input record. The record can be in the form of a tuple, dict,
+        or list. Dictionary keys can be either column names, indexes, or a
+        mix of both names and indexes.
+
+        Parameters
+        ----------
+        record : tuple/list/dict
+
+        Returns
+        -------
+        upsert : Upsert
+        """
+        return Upsert(self, record)
+
+    def new_update(self, record=None):
         """
         Create a new Update operation. Pass the completed Update to a Session.
+        If a record is provided, a PartialRow will be initialized with values
+        from the input record. The record can be in the form of a tuple, dict,
+        or list. Dictionary keys can be either column names, indexes, or a
+        mix of both names and indexes.
+
+        Parameters
+        ----------
+        record : tuple/list/dict
 
         Returns
         -------
         update : Update
         """
-        return Update(self)
+        return Update(self, record)
 
-    def new_delete(self):
+    def new_delete(self, record=None):
         """
         Create a new Delete operation. Pass the completed Update to a Session.
+        If a record is provided, a PartialRow will be initialized with values
+        from the input record. The record can be in the form of a tuple, dict,
+        or list. Dictionary keys can be either column names, indexes, or a
+        mix of both names and indexes.
+
+        Parameters
+        ----------
+        record : tuple/list/dict
 
         Returns
         -------
         delete : Delete
         """
-        return Delete(self)
+        return Delete(self, record)
 
     def scanner(self):
         """
@@ -560,8 +849,26 @@ cdef class Table:
         result.scanner = new KuduScanner(self.ptr())
         return result
 
-    cdef inline KuduTable* ptr(self):
-        return self.table.get()
+    def scan_token_builder(self):
+        """
+        Create a new ScanTokenBuilder for this table to build a series of
+        scan tokens.
+
+        Examples
+        --------
+        builder = table.scan_token_builder()
+        builder.set_fault_tolerant().add_predicate(table['key'] > 10)
+        tokens = builder.build()
+        for token in tokens:
+            scanner = token.into_kudu_scanner()
+            scanner.open()
+            tuples = scanner.read_all_tuples()
+
+        Returns
+        -------
+        builder : ScanTokenBuilder
+        """
+        return ScanTokenBuilder(self)
 
 
 cdef class Column:
@@ -578,75 +885,218 @@ cdef class Column:
     scanner.add_predicate(table[col_name] <= 10)
     """
     cdef readonly:
-        object name
         Table parent
         ColumnSchema spec
+        str name
 
-    def __cinit__(self, Table parent, object name, ColumnSchema spec):
-        self.name = tobytes(name)
+    def __cinit__(self, Table parent, ColumnSchema spec):
+        self.name = spec.name
         self.parent = parent
         self.spec = spec
 
     def __repr__(self):
         result = ('Column({0}, parent={1}, type={2})'
-                  .format(frombytes(self.name),
+                  .format(self.name,
                           self.parent.name,
                           self.spec.type.name))
         return result
 
-    cdef KuduValue* box_value(self, object obj) except NULL:
-        cdef:
-            KuduValue* val
-            Slice* slc
-
-        if isinstance(obj, unicode):
-            obj = obj.encode('utf8')
-
-        if isinstance(obj, bytes):
-            slc = new Slice(<char*> obj, len(obj))
-            val = KuduValue.CopyString(deref(slc))
-            del slc
-        elif isinstance(obj, int):
-            val = KuduValue.FromInt(obj)
-        elif isinstance(obj, float):
-            val = KuduValue.FromDouble(obj)
-        else:
-            raise TypeError(obj)
-
-        return val
-
     def __richcmp__(Column self, value, int op):
         cdef:
             KuduPredicate* pred
-            KuduValue* val
-            Slice* col_name_slice
+            KuduValue val
+            Slice col_name_slice
             ComparisonOp cmp_op
             Predicate result
+            object _name = tobytes(self.name)
 
-        col_name_slice = new Slice(<char*> self.name,
-                                   len(self.name))
+        col_name_slice = Slice(<char*> _name, len(_name))
+        if op == 0: # <
+            cmp_op = KUDU_LESS
+        elif op == 1: # <=
+            cmp_op = KUDU_LESS_EQUAL
+        elif op == 2: # ==
+            cmp_op = KUDU_EQUAL
+        elif op == 4: # >
+            cmp_op = KUDU_GREATER
+        elif op == 5: # >=
+            cmp_op = KUDU_GREATER_EQUAL
+        else:
+            raise NotImplementedError
 
-        try:
-            if op == 1: # <=
-                cmp_op = KUDU_LESS_EQUAL
-            elif op == 2: # ==
-                cmp_op = KUDU_EQUAL
-            elif op == 5: # >=
-                cmp_op = KUDU_GREATER_EQUAL
-            else:
-                raise NotImplementedError
-
-            val = self.box_value(value)
-            pred = (self.parent.ptr()
-                    .NewComparisonPredicate(deref(col_name_slice),
-                                            cmp_op, val))
-        finally:
-            del col_name_slice
+        val = self.spec.type.new_value(value)
+        pred = (self.parent.ptr()
+                .NewComparisonPredicate(col_name_slice,
+                                        cmp_op, val._value))
 
         result = Predicate()
         result.init(pred)
 
         return result
+
+    def in_list(Column self, values):
+        """
+        Creates a new InListPredicate for the Column. If a single value is
+        provided, then an equality comparison predicate is created.
+
+        Parameters
+        ----------
+        values : list
+
+        Examples
+        --------
+        scanner.add_predicate(table['key'].in_list([1, 2, 3])
+
+        Returns
+        -------
+        pred : Predicate
+        """
+        cdef:
+            KuduPredicate* pred
+            KuduValue kval
+            vector[C_KuduValue*] vals
+            Slice col_name_slice
+            Predicate result
+            object _name = tobytes(self.name)
+
+        col_name_slice = Slice(<char*> _name, len(_name))
+
+        try:
+            for val in values:
+                kval = self.spec.type.new_value(val)
+                vals.push_back(kval._value)
+        except TypeError:
+            while not vals.empty():
+                _val = vals.back()
+                del _val
+                vals.pop_back()
+            raise
+
+        pred = (self.parent.ptr()
+                .NewInListPredicate(col_name_slice, &vals))
+
+        result = Predicate()
+        result.init(pred)
+
+        return result
+
+
+class Partitioning(object):
+    """ Argument to Client.create_table(...) to describe table partitioning. """
+
+    def __init__(self):
+        self._hash_partitions = []
+        self._range_partition_cols = None
+        self._range_partitions = []
+        self._range_partition_splits = []
+
+    def add_hash_partitions(self, column_names, num_buckets, seed=None):
+        """
+        Adds a set of hash partitions to the table.
+
+        For each set of hash partitions added to the table, the total number of
+        table partitions is multiplied by the number of buckets. For example, if a
+        table is created with 3 split rows, and two hash partitions with 4 and 5
+        buckets respectively, the total number of table partitions will be 80
+        (4 range partitions * 4 hash buckets * 5 hash buckets). Optionally, a
+        seed can be used to randomize the mapping of rows to hash buckets.
+        Setting the seed may provide some amount of protection against denial
+        of service attacks when the hashed columns contain user provided values.
+
+        Parameters
+        ----------
+        column_names : list of string column names on which to partition
+        num_buckets : the number of buckets to create
+        seed : int - optional
+          Hash: seed for mapping rows to hash buckets.
+
+        Returns
+        -------
+        self: this object
+        """
+        if isinstance(column_names, str):
+            column_names = [column_names]
+        self._hash_partitions.append( (column_names, num_buckets, seed) )
+        return self
+
+    def set_range_partition_columns(self, column_names):
+        """
+        Sets the columns on which the table will be range-partitioned.
+
+        Every column must be a part of the table's primary key. If not set, the
+        table will be created with the primary-key columns as the range-partition
+        columns. If called with an empty vector, the table will be created without
+        range partitioning.
+
+        Parameters
+        ----------
+        column_names : list of string column names on which to partition
+
+        Returns
+        -------
+        self: this object
+        """
+        if isinstance(column_names, str):
+            column_names = [column_names]
+        self._range_partition_cols = column_names
+        return self
+
+    def add_range_partition(self, lower_bound=None,
+                                  upper_bound=None,
+                                  lower_bound_type='inclusive',
+                                  upper_bound_type='exclusive'):
+        """
+        Add a range partition to the table.
+
+        Multiple range partitions may be added, but they must not overlap.
+        All range splits specified by add_range_partition_split must fall
+        in a range partition. The lower bound must be less than or equal
+        to the upper bound.
+
+        If this method is not called, the table's range will be unbounded.
+
+        Parameters
+        ----------
+        lower_bound : PartialRow/list/tuple/dict
+        upper_bound : PartialRow/list/tuple/dict
+        lower_bound_type : {'inclusive', 'exclusive'} or constants
+          kudu.EXCLUSIVE_BOUND and kudu.INCLUSIVE_BOUND
+        upper_bound_type : {'inclusive', 'exclusive'} or constants
+          kudu.EXCLUSIVE_BOUND and kudu.INCLUSIVE_BOUND
+
+        Returns
+        -------
+        self : Partitioning
+        """
+        if self._range_partition_cols:
+            self._range_partitions.append(
+                (lower_bound, upper_bound, lower_bound_type, upper_bound_type)
+            )
+        else:
+            raise ValueError("Range Partition Columns must be set before " +
+                             "adding a range partition.")
+
+        return self
+
+    def add_range_partition_split(self, split_row):
+        """
+        Add a range partition split at the provided row.
+
+        Parameters
+        ----------
+        split_row : PartialRow/list/tuple/dict
+
+        Returns
+        -------
+        self : Partitioning
+        """
+        if self._range_partition_cols:
+            self._range_partition_splits.append(split_row)
+        else:
+            raise ValueError("Range Partition Columns must be set before " +
+                             "adding a range partition split.")
+
+        return self
 
 
 cdef class Predicate:
@@ -685,8 +1135,6 @@ cdef class Session:
     Wrapper for a client KuduSession to build up write operations to interact
     with the cluster.
     """
-    cdef:
-        shared_ptr[KuduSession] s
 
     def __cinit__(self):
         pass
@@ -855,6 +1303,17 @@ cdef class Row:
         return cpython.PyBytes_FromStringAndSize(<char*> val.mutable_data(),
                                                  val.size())
 
+    cdef inline get_binary(self, int i):
+        cdef Slice val
+        check_status(self.row.GetBinary(i, &val))
+        return cpython.PyBytes_FromStringAndSize(<char*> val.mutable_data(),
+                                                 val.size())
+
+    cdef inline get_unixtime_micros(self, int i):
+        cdef int64_t val
+        check_status(self.row.GetUnixTimeMicros(i, &val))
+        return val
+
     cdef inline get_slot(self, int i):
         cdef:
             Status s
@@ -876,8 +1335,13 @@ cdef class Row:
             return self.get_float(i)
         elif t == KUDU_STRING:
             return frombytes(self.get_string(i))
+        elif t == KUDU_BINARY:
+            return self.get_binary(i)
+        elif t == KUDU_UNIXTIME_MICROS:
+            return from_unixtime_micros(self.get_unixtime_micros(i))
         else:
-            raise TypeError(t)
+            raise TypeError("Cannot get kudu type <{0}>"
+                                .format(_type_names[t]))
 
     cdef inline bint is_null(self, int i):
         return self.row.IsNull(i)
@@ -936,7 +1400,7 @@ cdef class Scanner:
         KuduScanner* scanner
         bint is_open
 
-    def __cinit__(self, Table table):
+    def __cinit__(self, Table table = None):
         self.table = table
         self.scanner = NULL
         self.is_open = 0
@@ -953,7 +1417,8 @@ cdef class Scanner:
     def add_predicates(self, preds):
         """
         Add a list of scan predicates to the scanner. Select columns from the
-        parent table and make comparisons to create predicates.
+        parent table and make comparisons to create predicates. Returns a
+        reference to itself to facilitate chaining.
 
         Examples
         --------
@@ -964,14 +1429,21 @@ cdef class Scanner:
         Parameters
         ----------
         preds : list of Predicate
+
+        Returns
+        -------
+        self : scanner
         """
         for pred in preds:
             self.add_predicate(pred)
 
+        return self
+
     cpdef add_predicate(self, Predicate pred):
         """
         Add a scan predicates to the scanner. Select columns from the
-        parent table and make comparisons to create predicates.
+        parent table and make comparisons to create predicates. Returns
+        a reference to itself to facilitate chaining.
 
         Examples
         --------
@@ -981,6 +1453,10 @@ cdef class Scanner:
         Parameters
         ----------
         pred : kudu.Predicate
+
+        Returns
+        -------
+        self : scanner
         """
         cdef KuduPredicate* clone
 
@@ -988,6 +1464,8 @@ cdef class Scanner:
         # reused
         clone = pred.pred.Clone()
         check_status(self.scanner.AddConjunctPredicate(clone))
+
+        return self
 
     def set_projected_column_names(self, names):
         """
@@ -1001,10 +1479,132 @@ cdef class Scanner:
         -------
         self : Scanner
         """
+        if isinstance(names, str):
+            names = [names]
         cdef vector[string] v_names
         for name in names:
             v_names.push_back(tobytes(name))
         check_status(self.scanner.SetProjectedColumnNames(v_names))
+        return self
+
+    def set_selection(self, replica_selection):
+        """
+        Set the replica selection policy while scanning.
+
+        Parameters
+        ----------
+        replica_selection : {'leader', 'closest', 'first'}
+          You can also use the constants LEADER_ONLY, CLOSEST_REPLICA,
+          and FIRST_REPLICA
+
+        Returns
+        -------
+        self : Scanner
+        """
+        cdef ReplicaSelection selection
+
+        def invalid_selection_policy():
+            raise ValueError('Invalid replica selection policy: {0}'
+                             .format(replica_selection))
+
+        if isinstance(replica_selection, int):
+            if 0 <= replica_selection < len(_replica_selection_policies):
+                check_status(self.scanner.SetSelection(
+                             <ReplicaSelection> replica_selection))
+            else:
+                invalid_selection_policy()
+        else:
+            try:
+                check_status(self.scanner.SetSelection(
+                    _replica_selection_policies[replica_selection.lower()]))
+            except KeyError:
+                invalid_selection_policy()
+
+        return self
+
+    def set_projected_column_indexes(self, indexes):
+        """
+        Sets the columns to be scanned.
+
+        Parameters
+        ----------
+        indexes : list of integers representing column indexes
+
+        Returns
+        -------
+        self : Scanner
+        """
+        cdef vector[int] v_indexes = indexes
+        check_status(self.scanner.SetProjectedColumnIndexes(v_indexes))
+        return self
+
+    def set_read_mode(self, read_mode):
+        """
+        Set the read mode for scanning.
+
+        Parameters
+        ----------
+        read_mode : {'latest', 'snapshot'}
+          You can also use the constants READ_LATEST, READ_AT_SNAPSHOT
+
+        Returns
+        -------
+        self : Scanner
+        """
+        cdef ReadMode rmode
+
+        def invalid_selection_policy():
+            raise ValueError('Invalid read mode: {0}'
+                             .format(read_mode))
+
+        if isinstance(read_mode, int):
+            if 0 <= read_mode < len(_read_modes):
+                check_status(self.scanner.SetReadMode(
+                             <ReadMode> read_mode))
+            else:
+                invalid_selection_policy()
+        else:
+            try:
+                check_status(self.scanner.SetReadMode(
+                    _read_modes[read_mode.lower()]))
+            except KeyError:
+                invalid_selection_policy()
+
+        return self
+
+    def set_snapshot(self, timestamp, format=None):
+        """
+        Set the snapshot timestamp for this scanner.
+
+        Parameters
+        ---------
+        timestamp : datetime.datetime or string
+          If a string is provided, a format must be provided as well.
+          NOTE: This should be in UTC. If a timezone aware datetime
+          object is provided, it will be converted to UTC, otherwise,
+          all other input is assumed to be UTC.
+        format : Required if a string timestamp is provided
+          Uses the C strftime() function, see strftime(3) documentation.
+
+        Returns
+        -------
+        self : Scanner
+        """
+        # Confirm that a format is provided if timestamp is a string
+        if isinstance(timestamp, six.string_types) and not format:
+            raise ValueError(
+                "To use a string timestamp you must provide a format. " +
+                "See the strftime(3) documentation.")
+
+        snapshot_micros = to_unixtime_micros(timestamp, format)
+
+        if snapshot_micros >= 0:
+            check_status(self.scanner.SetSnapshotMicros(
+                         <uint64_t> snapshot_micros))
+        else:
+            raise ValueError(
+                "Snapshot Timestamps be greater than the unix epoch.")
+
         return self
 
     def set_fault_tolerant(self):
@@ -1021,38 +1621,94 @@ cdef class Scanner:
 
     def new_bound(self):
         """
-        Returns a new instance of a ScanBound (subclass of PartialRow) to be
-        later set with add_lower_bound()/add_exclusive_upper_bound().
+        Returns a new instance of a PartialRow to be later set with
+        add_lower_bound()/add_exclusive_upper_bound().
 
         Returns
         -------
-        bound : ScanBound
+        bound : PartialRow
         """
-        return ScanBound(self.table)
+        return self.table.schema.new_row()
 
-    def add_lower_bound(self, ScanBound bound):
+    def add_lower_bound(self, bound):
         """
         Sets the (inclusive) lower bound of the scan.
         Returns a reference to itself to facilitate chaining.
 
+        Parameters
+        ----------
+        bound : PartialRow/tuple/list/dictionary
+
         Returns
         -------
         self : Scanner
         """
-        check_status(self.scanner.AddLowerBound(deref(bound.row)))
+        cdef:
+            PartialRow row
+        # Convert record to bound
+        if not isinstance(bound, PartialRow):
+            row = self.table.schema.new_row(bound)
+        else:
+            row = bound
+
+        check_status(self.scanner.AddLowerBound(deref(row.row)))
         return self
 
-    def add_exclusive_upper_bound(self, ScanBound bound):
+    def add_exclusive_upper_bound(self, bound):
         """
         Sets the (exclusive) upper bound of the scan.
         Returns a reference to itself to facilitate chaining.
 
+        Parameters
+        ----------
+        bound : PartialRow/tuple/list/dictionary
+
         Returns
         -------
         self : Scanner
         """
-        check_status(self.scanner.AddExclusiveUpperBound(deref(bound.row)))
+        cdef:
+            PartialRow row
+        # Convert record to bound
+        if not isinstance(bound, PartialRow):
+            row = self.table.schema.new_row(bound)
+        else:
+            row = bound
+
+        check_status(self.scanner.AddExclusiveUpperBound(deref(row.row)))
         return self
+
+    def get_projection_schema(self):
+        """
+        Returns the schema of the projection being scanned
+
+        Returns
+        -------
+        schema : kudu.Schema
+        """
+        result = Schema()
+        # Had to instantiate a new schema to return a pointer since the
+        # GetProjectionSchema method does not
+        cdef KuduSchema* schema = new KuduSchema(self.scanner.
+                                                 GetProjectionSchema())
+        result.schema = schema
+        return result
+
+    def get_resource_metrics(self):
+        """
+        Return the cumulative resource metrics since the scan was started.
+
+        Returns
+        -------
+        metrics : Dictionary
+        """
+        _map = self.scanner.GetResourceMetrics().Get()
+
+        # Convert map to python dictionary
+        result = {}
+        for it in _map:
+            result[frombytes(it.first)] = it.second
+        return result
 
     def open(self):
         """
@@ -1108,6 +1764,549 @@ cdef class Scanner:
         check_status(self.scanner.NextBatch(&batch.batch))
         return batch
 
+    def set_cache_blocks(self, cache_blocks):
+        """
+        Sets the block caching policy.
+        Returns a reference to itself to facilitate chaining.
+
+        Parameters
+        ----------
+        cache_blocks : bool
+
+        Returns
+        -------
+        self : Scanner
+        """
+        check_status(self.scanner.SetCacheBlocks(cache_blocks))
+        return self
+
+    def keep_alive(self):
+        """
+        Keep the current remote scanner alive.
+
+        Keep the current remote scanner alive on the Tablet server for an
+        additional time-to-live (set by a configuration flag on the tablet
+        server). This is useful if the interval in between NextBatch() calls is
+        big enough that the remote scanner might be garbage collected (default
+        ttl is set to 60 secs.). This does not invalidate any previously
+        fetched results.
+
+        Returns
+        -------
+        self : Scanner
+        """
+        check_status(self.scanner.KeepAlive())
+        return self
+
+    def get_current_server(self):
+        """
+        Get the TabletServer that is currently handling the scan.
+
+        More concretely, this is the server that handled the most recent open()
+        or next_batch() RPC made by the server.
+
+        Returns
+        -------
+        tserver : TabletServer
+        """
+        cdef:
+            TabletServer tserver = TabletServer()
+            KuduTabletServer* tserver_p = NULL
+
+        check_status(self.scanner.GetCurrentServer(&tserver_p))
+        tserver._own = 1
+        tserver._init(tserver_p)
+        return tserver
+
+    def close(self):
+        """
+        Close the scanner.
+
+        Closing the scanner releases resources on the server. This call does
+        not block, and will not ever fail, even if the server cannot be
+        contacted.
+
+        Note: The scanner is reset to its initial state by this function.
+        You'll have to re-add any projection, predicates, etc if you want to
+        reuse this object.
+        Note: When the Scanner object is garbage collected, this method is run.
+        This method call is only needed if you want to explicitly release the
+        resources on the server.
+        """
+        self.scanner.Close()
+
+
+cdef class ScanToken:
+    """
+    A ScanToken describes a partial scan of a Kudu table limited to a single
+    contiguous physical location. Using the KuduScanTokenBuilder, clients
+    can describe the desired scan, including predicates, bounds, timestamps,
+    and caching, and receive back a collection of scan tokens.
+    """
+    cdef:
+        KuduScanToken* _token
+
+    def __cinit__(self):
+        self._token = NULL
+
+    def __dealloc__(self):
+        if self._token != NULL:
+            del self._token
+
+    cdef _init(self, KuduScanToken* token):
+        self._token = token
+        return self
+
+    def into_kudu_scanner(self):
+        """
+        Returns a scanner under the current client.
+
+        Returns
+        -------
+        scanner : Scanner
+        """
+        cdef:
+            Scanner result = Scanner()
+            KuduScanner* _scanner = NULL
+        check_status(self._token.IntoKuduScanner(&_scanner))
+        result.scanner = _scanner
+        return result
+
+
+    def tablet(self):
+        """
+        Returns the Tablet associated with this ScanToken
+
+        Returns
+        -------
+        tablet : Tablet
+        """
+        tablet = Tablet()
+        return tablet._init(&self._token.tablet())
+
+    def serialize(self):
+        """
+        Serialize token into a string.
+
+        Returns
+        -------
+        serialized_token : string
+        """
+        cdef string buf
+        check_status(self._token.Serialize(&buf))
+        return buf
+
+    def deserialize_into_scanner(self, Client client, serialized_token):
+        """
+        Returns a new scanner from the serialized token created under
+        the provided Client.
+
+        Parameters
+        ----------
+        client : Client
+        serialized_token : string
+
+        Returns
+        -------
+        scanner : Scanner
+        """
+        cdef:
+            Scanner result = Scanner()
+            KuduScanner* _scanner
+        check_status(self._token.DeserializeIntoScanner(client.cp, serialized_token, &_scanner))
+        result.scanner = _scanner
+        return result
+
+
+cdef class ScanTokenBuilder:
+    """
+    This class builds ScanTokens for a Table.
+    """
+    cdef:
+        KuduScanTokenBuilder* _builder
+        Table _table
+
+    def __cinit__(self, Table table):
+        self._table = table
+        self._builder = new KuduScanTokenBuilder(table.ptr())
+
+    def __dealloc__(self):
+        if self._builder != NULL:
+            del self._builder
+
+    def set_projected_column_names(self, names):
+        """
+        Sets the columns to be scanned.
+        Returns a reference to itself to facilitate chaining.
+
+        Parameters
+        ----------
+        names : list of strings
+
+        Returns
+        -------
+        self : ScanTokenBuilder
+        """
+        if isinstance(names, str):
+            names = [names]
+        cdef vector[string] v_names
+        for name in names:
+            v_names.push_back(tobytes(name))
+        check_status(self._builder.SetProjectedColumnNames(v_names))
+        return self
+
+    def set_projected_column_indexes(self, indexes):
+        """
+        Sets the columns to be scanned.
+        Returns a reference to itself to facilitate chaining.
+
+        Parameters
+        ----------
+        indexes : list of integers representing column indexes
+
+        Returns
+        -------
+        self : ScanTokenBuilder
+        """
+        cdef vector[int] v_indexes = indexes
+        check_status(self._builder.SetProjectedColumnIndexes(v_indexes))
+        return self
+
+    def set_batch_size_bytes(self, batch_size):
+        """
+        Sets the batch size in bytes.
+        Returns a reference to itself to facilitate chaining.
+
+        Parameters
+        ----------
+        batch_size : Size of batch in bytes
+
+        Returns
+        -------
+        self : ScanTokenBuilder
+        """
+        check_status(self._builder.SetBatchSizeBytes(batch_size))
+        return self
+
+    def set_read_mode(self, read_mode):
+        """
+        Set the read mode for scanning.
+
+        Parameters
+        ----------
+        read_mode : {'latest', 'snapshot'}
+          You can also use the constants READ_LATEST, READ_AT_SNAPSHOT
+
+        Returns
+        -------
+        self : ScanTokenBuilder
+        """
+        cdef ReadMode rmode
+
+        def invalid_selection_policy():
+            raise ValueError('Invalid read mode: {0}'
+                             .format(read_mode))
+
+        if isinstance(read_mode, int):
+            if 0 <= read_mode < len(_read_modes):
+                check_status(self._builder.SetReadMode(
+                             <ReadMode> read_mode))
+            else:
+                invalid_selection_policy()
+        else:
+            try:
+                check_status(self._builder.SetReadMode(
+                    _read_modes[read_mode.lower()]))
+            except KeyError:
+                invalid_selection_policy()
+
+        return self
+
+    def set_snapshot(self, timestamp, format=None):
+        """
+        Set the snapshot timestamp for this ScanTokenBuilder.
+
+        Parameters
+        ---------
+        timestamp : datetime.datetime or string
+          If a string is provided, a format must be provided as well.
+          NOTE: This should be in UTC. If a timezone aware datetime
+          object is provided, it will be converted to UTC, otherwise,
+          all other input is assumed to be UTC.
+        format : Required if a string timestamp is provided
+          Uses the C strftime() function, see strftime(3) documentation.
+
+        Returns
+        -------
+        self : ScanTokenBuilder
+        """
+        # Confirm that a format is provided if timestamp is a string
+        if isinstance(timestamp, six.string_types) and not format:
+            raise ValueError(
+                "To use a string timestamp you must provide a format. " +
+                "See the strftime(3) documentation.")
+
+        snapshot_micros = to_unixtime_micros(timestamp, format)
+
+        if snapshot_micros >= 0:
+            check_status(self._builder.SetSnapshotMicros(
+                         <uint64_t> snapshot_micros))
+        else:
+            raise ValueError(
+                "Snapshot Timestamps be greater than the unix epoch.")
+
+        return self
+
+    def set_timout_millis(self, millis):
+        """
+        Sets the timeout in milliseconds.
+        Returns a reference to itself to facilitate chaining.
+
+        Parameters
+        ----------
+        millis : int64_t
+          timeout in milliseconds
+
+        Returns
+        -------
+        self : ScanTokenBuilder
+        """
+        check_status(self._builder.SetTimeoutMillis(millis))
+        return self
+
+    def set_fault_tolerant(self):
+        """
+        Makes the underlying KuduScanner fault tolerant.
+        Returns a reference to itself to facilitate chaining.
+
+        Returns
+        -------
+        self : ScanTokenBuilder
+        """
+        check_status(self._builder.SetFaultTolerant())
+        return self
+
+    def set_selection(self, replica_selection):
+        """
+        Set the replica selection policy while scanning.
+
+        Parameters
+        ----------
+        replica_selection : {'leader', 'closest', 'first'}
+          You can also use the constants LEADER_ONLY, CLOSEST_REPLICA,
+          and FIRST_REPLICA
+
+        Returns
+        -------
+        self : ScanTokenBuilder
+        """
+        cdef ReplicaSelection selection
+
+        def invalid_selection_policy():
+            raise ValueError('Invalid replica selection policy: {0}'
+                             .format(replica_selection))
+
+        if isinstance(replica_selection, int):
+            if 0 <= replica_selection < len(_replica_selection_policies):
+                check_status(self._builder.SetSelection(
+                             <ReplicaSelection> replica_selection))
+            else:
+                invalid_selection_policy()
+        else:
+            try:
+                check_status(self._builder.SetSelection(
+                    _replica_selection_policies[replica_selection.lower()]))
+            except KeyError:
+                invalid_selection_policy()
+
+        return self
+
+    def add_predicates(self, preds):
+        """
+        Add a list of scan predicates to the ScanTokenBuilder. Select columns
+        from the parent table and make comparisons to create predicates.
+
+        Examples
+        --------
+        c = table[col_name]
+        preds = [c >= 0, c <= 10]
+        builder.add_predicates(preds)
+
+        Parameters
+        ----------
+        preds : list of Predicate
+        """
+        for pred in preds:
+            self.add_predicate(pred)
+
+    cpdef add_predicate(self, Predicate pred):
+        """
+        Add a scan predicates to the scan token. Select columns from the
+        parent table and make comparisons to create predicates.
+
+        Examples
+        --------
+        pred = table[col_name] <= 10
+        builder.add_predicate(pred)
+
+        Parameters
+        ----------
+        pred : kudu.Predicate
+
+        Returns
+        -------
+        self : ScanTokenBuilder
+        """
+        cdef KuduPredicate* clone
+
+        # We clone the KuduPredicate so that the Predicate wrapper class can be
+        # reused
+        clone = pred.pred.Clone()
+        check_status(self._builder.AddConjunctPredicate(clone))
+
+    def new_bound(self):
+        """
+        Returns a new instance of a PartialRow to be later set with
+        add_lower_bound()/add_upper_bound().
+
+        Returns
+        -------
+        bound : PartialRow
+        """
+        return self._table.schema.new_row()
+
+    def add_lower_bound(self, bound):
+        """
+        Sets the lower bound of the scan.
+        Returns a reference to itself to facilitate chaining.
+
+        Parameters
+        ----------
+        bound : PartialRow/list/tuple/dict
+
+        Returns
+        -------
+        self : ScanTokenBuilder
+        """
+        cdef:
+            PartialRow row
+        # Convert record to bound
+        if not isinstance(bound, PartialRow):
+            row = self._table.schema.new_row(bound)
+        else:
+            row = bound
+
+        check_status(self._builder.AddLowerBound(deref(row.row)))
+        return self
+
+    def add_upper_bound(self, bound):
+        """
+        Sets the upper bound of the scan.
+        Returns a reference to itself to facilitate chaining.
+
+        Parameters
+        ----------
+        bound : PartialRow/list/tuple/dict
+
+        Returns
+        -------
+        self : ScanTokenBuilder
+        """
+        cdef:
+            PartialRow row
+        # Convert record to bound
+        if not isinstance(bound, PartialRow):
+            row = self._table.schema.new_row(bound)
+        else:
+            row = bound
+
+        check_status(self._builder.AddUpperBound(deref(row.row)))
+        return self
+
+    def set_cache_blocks(self, cache_blocks):
+        """
+        Sets the block caching policy.
+        Returns a reference to itself to facilitate chaining.
+
+        Parameters
+        ----------
+        cache_blocks : bool
+
+        Returns
+        -------
+        self : ScanTokenBuilder
+        """
+        check_status(self._builder.SetCacheBlocks(cache_blocks))
+        return self
+
+    def build(self):
+        """
+        Build the set of scan tokens. The builder may be reused after
+        this call. Returns a list of ScanTokens to be serialized and
+        executed in parallel with seperate client instances.
+
+        Returns
+        -------
+        tokens : List[ScanToken]
+        """
+
+        cdef:
+            vector[KuduScanToken*] tokens
+            size_t i
+
+        check_status(self._builder.Build(&tokens))
+
+        result = []
+        for i in range(tokens.size()):
+            token = ScanToken()
+            result.append(token._init(tokens[i]))
+        return result
+
+
+cdef class Tablet:
+    """
+    Represents a remote Tablet. Contains the tablet id and Replicas associated
+    with the Kudu Tablet. Retrieved by the ScanToken.tablet() method.
+    """
+    cdef:
+        const KuduTablet* _tablet
+        vector[KuduReplica*] _replicas
+
+    cdef _init(self, const KuduTablet* tablet):
+        self._tablet = tablet
+        return self
+
+    def id(self):
+        return frombytes(self._tablet.id())
+
+    def replicas(self):
+        cdef size_t i
+
+        result = []
+        _replicas = self._tablet.replicas()
+        for i in range(_replicas.size()):
+            replica = Replica()
+            result.append(replica._init(_replicas[i]))
+        return result
+
+cdef class Replica:
+    """
+    Represents a remote Tablet's replica. Retrieve a list of Replicas with the
+    Tablet.replicas() method. Contains the boolean is_leader and its
+    respective TabletServer object.
+    """
+    cdef const KuduReplica* _replica
+
+    cdef _init(self, const KuduReplica* replica):
+        self._replica = replica
+        return self
+
+    def is_leader(self):
+        return self._replica.is_leader()
+
+    def ts(self):
+        ts = TabletServer()
+        return ts._init(&self._replica.ts())
 
 cdef class KuduError:
 
@@ -1128,67 +2327,132 @@ cdef class KuduError:
             del self.error
 
     def failed_op(self):
-        raise NotImplementedError
+        """
+        Get debug string representation of the failed operation.
+
+        Returns
+        -------
+        op : str
+        """
+        return frombytes(self.error.failed_op().ToString())
+
+    def was_possibly_successful(self):
+        """
+        Check if there is a chance that the requested operation was successful.
+
+        In some cases, it is possible that the server did receive and
+        successfully perform the requested operation, but the client can't
+        tell whether or not it was successful. For example, if the call times
+        out, the server may still succeed in processing at a later time.
+
+        Returns
+        -------
+        result : bool
+        """
+        return self.error.was_possibly_successful()
 
     def __repr__(self):
         return "KuduError('%s')" % (self.error.status().ToString())
 
 
 cdef class PartialRow:
-    cdef:
-        Table table
-        KuduPartialRow* row
 
-    def __cinit__(self, Table table):
+    def __cinit__(self, Schema schema):
         # This gets called before any subclass cinit methods
-        self.table = table
+        self.schema = schema
+        self._own = 1
+
+    def __dealloc__(self):
+        if self._own and self.row != NULL:
+            del self.row
 
     def __setitem__(self, key, value):
         if isinstance(key, basestring):
             self.set_field(key, value)
         else:
-            self.set_loc(key, value)
+            if 0 <= key < len(self.schema):
+                self.set_loc(key, value)
+            else:
+                raise IndexError("Column index {0} is out of bounds."
+                                 .format(key))
+
+    def from_record(self, record):
+        """
+        Initializes PartialRow with values from an input record. The record
+        can be in the form of a tuple, dict, or list. Dictionary keys can
+        be either column names or indexes.
+
+        Parameters
+        ----------
+        record : tuple/list/dict
+
+        Returns
+        -------
+        self : PartialRow
+        """
+        if isinstance(record, (tuple, list)):
+            for indx, val in enumerate(record):
+                self[indx] = val
+        elif isinstance(record, dict):
+            for key, val in dict_iter(record):
+                self[key] = val
+        else:
+            raise TypeError("Invalid record type <{0}> for " +
+                            "PartialRow.from_record."
+                            .format(type(record).__name__))
+
+        return self
 
     cpdef set_field(self, key, value):
         cdef:
-            int i = self.table.schema.get_loc(key)
-            DataType t = self.table.schema.loc_type(i)
-            cdef Slice* slc
+            int i = self.schema.get_loc(key)
+
+        self.set_loc(i, value)
+
+    cpdef set_loc(self, int i, value):
+        cdef:
+            DataType t = self.schema.loc_type(i)
+            Slice slc
 
         if value is None:
-            self.row.SetNull(i)
+            check_status(self.row.SetNull(i))
             return
 
         # Leave it to Cython to do the coercion and complain if it doesn't
         # work. Cython will catch many casting problems but we should verify
         # with unit tests.
         if t == KUDU_BOOL:
-            self.row.SetBool(i, <c_bool> value)
+            check_status(self.row.SetBool(i, <c_bool> value))
         elif t == KUDU_INT8:
-            self.row.SetInt8(i, <int8_t> value)
+            check_status(self.row.SetInt8(i, <int8_t> value))
         elif t == KUDU_INT16:
-            self.row.SetInt16(i, <int16_t> value)
+            check_status(self.row.SetInt16(i, <int16_t> value))
         elif t == KUDU_INT32:
-            self.row.SetInt32(i, <int32_t> value)
+            check_status(self.row.SetInt32(i, <int32_t> value))
         elif t == KUDU_INT64:
-            self.row.SetInt64(i, <int64_t> value)
+            check_status(self.row.SetInt64(i, <int64_t> value))
         elif t == KUDU_FLOAT:
-            self.row.SetFloat(i, <float> value)
+            check_status(self.row.SetFloat(i, <float> value))
         elif t == KUDU_DOUBLE:
-            self.row.SetDouble(i, <double> value)
+            check_status(self.row.SetDouble(i, <double> value))
         elif t == KUDU_STRING:
-            if not cpython.PyBytes_Check(value):
+            if isinstance(value, unicode):
                 value = value.encode('utf8')
 
-            # TODO: It would be much better not to heap-allocate a Slice object
-            slc = new Slice(cpython.PyBytes_AsString(value))
+            slc = Slice(<char*> value, len(value))
+            check_status(self.row.SetStringCopy(i, slc))
+        elif t == KUDU_BINARY:
+            if isinstance(value, unicode):
+                raise TypeError("Unicode objects must be explicitly encoded " +
+                                "before storing in a Binary field.")
 
-            # Not safe to take a reference to PyBytes data for now
-            self.row.SetStringCopy(i, deref(slc))
-            del slc
-
-    cpdef set_loc(self, int i, value):
-        pass
+            slc = Slice(<char*> value, len(value))
+            check_status(self.row.SetBinaryCopy(i, slc))
+        elif t == KUDU_UNIXTIME_MICROS:
+            check_status(self.row.SetUnixTimeMicros(i, <int64_t>
+                to_unixtime_micros(value)))
+        else:
+            raise TypeError("Cannot set kudu type <{0}>.".format(_type_names[t]))
 
     cpdef set_field_null(self, key):
         pass
@@ -1199,78 +2463,77 @@ cdef class PartialRow:
     cdef add_to_session(self, Session s):
         pass
 
-cdef class ScanBound(PartialRow):
-    def __cinit__(self, Table table):
-        self.row = self.table.schema.new_row()
 
-    def __dealloc__(self):
-        del self.row
-
-cdef class WriteOperation(PartialRow):
+cdef class WriteOperation:
     cdef:
         # Whether the WriteOperation has been applied.
         # Set by subclasses.
         bint applied
+        KuduWriteOperation* op
+        PartialRow py_row
 
-    def __cinit__(self, Table table):
+    def __cinit__(self, Table table, record=None):
         self.applied = 0
+        self.py_row = PartialRow(table.schema)
+        self.py_row._own = 0
+
+    cdef add_to_session(self, Session s):
+        if self.applied:
+            raise Exception
+
+        check_status(s.s.get().Apply(self.op))
+        self.op = NULL
+        self.applied = 1
+
+    def __setitem__(self, key, value):
+        # Since the write operation is no longer a sub-class of the PartialRow
+        # we need to explicitly retain the item setting functionality and API
+        # style.
+        self.py_row[key] = value
 
 
 cdef class Insert(WriteOperation):
-    cdef:
-        KuduInsert* op
-
-    def __cinit__(self, Table table):
-        self.op = self.table.ptr().NewInsert()
-        self.row = self.op.mutable_row()
+    def __cinit__(self, Table table, record=None):
+        self.op = table.ptr().NewInsert()
+        self.py_row.row = self.op.mutable_row()
+        if record:
+            self.py_row.from_record(record)
 
     def __dealloc__(self):
         del self.op
 
-    cdef add_to_session(self, Session s):
-        if self.applied:
-            raise Exception
 
-        check_status(s.s.get().Apply(self.op))
-        self.op = NULL
-        self.applied = 1
+cdef class Upsert(WriteOperation):
+    def __cinit__(self, Table table, record=None):
+        self.op = table.ptr().NewUpsert()
+        self.py_row.row = self.op.mutable_row()
+        if record:
+            self.py_row.from_record(record)
+    def __dealloc__(self):
+        del self.op
 
 
 cdef class Update(WriteOperation):
-    cdef:
-        KuduUpdate* op
-
-    def __cinit__(self, Table table):
-        self.table = table
+    def __cinit__(self, Table table, record=None):
         self.op = table.ptr().NewUpdate()
-        self.row = self.op.mutable_row()
+        self.py_row.row = self.op.mutable_row()
+        if record:
+            self.py_row.from_record(record)
 
     def __dealloc__(self):
         del self.op
-
-    cdef add_to_session(self, Session s):
-        pass
 
 
 cdef class Delete(WriteOperation):
-    cdef:
-        KuduDelete* op
-
-    def __cinit__(self, Table table):
-        self.table = table
+    def __cinit__(self, Table table, record=None):
         self.op = table.ptr().NewDelete()
-        self.row = self.op.mutable_row()
+        self.py_row.row = self.op.mutable_row()
+        if record:
+            self.py_row.from_record(record)
 
     def __dealloc__(self):
         del self.op
 
-    cdef add_to_session(self, Session s):
-        if self.applied:
-            raise Exception
-
-        check_status(s.s.get().Apply(self.op))
-        self.applied = 1
-        self.op = NULL
 
 
 cdef inline cast_pyvalue(DataType t, object o):
@@ -1290,5 +2553,244 @@ cdef inline cast_pyvalue(DataType t, object o):
         return FloatVal(o)
     elif t == KUDU_STRING:
         return StringVal(o)
+    elif t == KUDU_UNIXTIME_MICROS:
+        return UnixtimeMicrosVal(o)
+    elif t == KUDU_BINARY:
+        return StringVal(o)
     else:
-        raise TypeError(t)
+        raise TypeError("Cannot cast kudu type <{0}>".format(_type_names[t]))
+
+
+cdef class TableAlterer:
+    """
+    Alters an existing table based on the provided steps.
+    """
+
+    def __cinit__(self, Table table):
+        self._table = table
+        self._new_name = None
+        self._init(self._table.parent.cp
+                   .NewTableAlterer(tobytes(self._table.name)))
+
+    def __dealloc__(self):
+        if self._alterer != NULL:
+            del self._alterer
+
+    cdef _init(self, KuduTableAlterer* alterer):
+        self._alterer = alterer
+
+    def rename(self, table_name):
+        """
+        Rename the table. Returns a reference to itself to facilitate chaining.
+
+        Parameters
+        ----------
+        table_name : str
+          The new name for the table.
+
+        Return
+        ------
+        self : TableAlterer
+        """
+        self._alterer.RenameTo(tobytes(table_name))
+        self._new_name = table_name
+        return self
+
+    def add_column(self, name, type_=None, nullable=None, compression=None,
+                   encoding=None, default=None):
+        """
+        Add a new column to the table.
+
+        When adding a column, you must specify the default value of the new
+        column using ColumnSpec.default(...) or the default parameter in this
+        method.
+
+        Parameters
+        ----------
+        name : string
+        type_ : string or KuduType
+          Data type e.g. 'int32' or kudu.int32
+        nullable : boolean, default None
+          New columns are nullable by default. Set boolean value for explicit
+          nullable / not-nullable
+        compression : string or int
+          One of kudu.COMPRESSION_* constants or their string equivalent.
+        encoding : string or int
+          One of kudu.ENCODING_* constants or their string equivalent.
+        default : obj
+          Use this to set the column default value
+
+        Returns
+        -------
+        spec : ColumnSpec
+        """
+        cdef:
+            ColumnSpec result = ColumnSpec()
+
+        result.spec = self._alterer.AddColumn(tobytes(name))
+
+        if type_ is not None:
+            result.type(type_)
+
+        if nullable is not None:
+            result.nullable(nullable)
+
+        if compression is not None:
+            result.compression(compression)
+
+        if encoding is not None:
+            result.encoding(encoding)
+
+        if default:
+            result.default(default)
+
+        return result
+
+    def alter_column(self, name, rename_to=None):
+        """
+        Alter an existing column.
+
+        Parameters
+        ----------
+        name : string
+        rename_to : str
+          If set, the column will be renamed to this
+
+        Returns
+        -------
+        spec : ColumnSpec
+        """
+        cdef:
+            ColumnSpec result = ColumnSpec()
+
+        result.spec = self._alterer.AlterColumn(tobytes(name))
+
+        if rename_to:
+            result.rename(rename_to)
+
+        return result
+
+    def drop_column(self, name):
+        """
+        Drops an existing column from the table.
+
+        Parameters
+        ----------
+        name : str
+          The name of the column to drop.
+
+        Returns
+        -------
+        self : TableAlterer
+        """
+        self._alterer.DropColumn(tobytes(name))
+        return self
+
+    def add_range_partition(self, lower_bound=None,
+                            upper_bound=None,
+                            lower_bound_type='inclusive',
+                            upper_bound_type='exclusive'):
+        """
+        Add a range partition to the table with the specified lower bound and
+        upper bound.
+
+        Multiple range partitions may be added as part of a single alter table
+        transaction by calling this method multiple times on the table alterer.
+
+        This client may immediately write and scan the new tablets when Alter()
+        returns success, however other existing clients may have to wait for a
+        timeout period to elapse before the tablets become visible. This period
+        is configured by the master's 'table_locations_ttl_ms' flag, and
+        defaults to 5 minutes.
+
+        Parameters
+        ----------
+        lower_bound : PartialRow/list/tuple/dict
+        upper_bound : PartialRow/list/tuple/dict
+        lower_bound_type : {'inclusive', 'exclusive'} or constants
+          kudu.EXCLUSIVE_BOUND and kudu.INCLUSIVE_BOUND
+        upper_bound_type : {'inclusive', 'exclusive'} or constants
+          kudu.EXCLUSIVE_BOUND and kudu.INCLUSIVE_BOUND
+
+        Returns
+        -------
+        self : TableAlterer
+        """
+        cdef:
+            PartialRow lbound
+            PartialRow ubound
+
+        if not isinstance(lower_bound, PartialRow):
+            lbound = self._table.schema.new_row(lower_bound)
+        else:
+            lbound = lower_bound
+        lbound._own = 0
+        if not isinstance(upper_bound, PartialRow):
+            ubound = self._table.schema.new_row(upper_bound)
+        else:
+            ubound = upper_bound
+        ubound._own = 0
+        self._alterer.AddRangePartition(
+            lbound.row,
+            ubound.row,
+            _check_convert_range_bound_type(lower_bound_type),
+            _check_convert_range_bound_type(upper_bound_type)
+        )
+
+    def drop_range_partition(self, lower_bound=None,
+                             upper_bound=None,
+                             lower_bound_type='inclusive',
+                             upper_bound_type='exclusive'):
+        """
+        Drop the range partition from the table with the specified lower bound
+        and upper bound. The bounds must match an existing range partition
+        exactly, and may not span multiple range partitions.
+
+        Multiple range partitions may be dropped as part of a single alter
+        table transaction by calling this method multiple times on the
+        table alterer.
+
+        Parameters
+        ----------
+        lower_bound : PartialRow/list/tuple/dict
+        upper_bound : PartialRow/list/tuple/dict
+        lower_bound_type : {'inclusive', 'exclusive'} or constants
+          kudu.EXCLUSIVE_BOUND and kudu.INCLUSIVE_BOUND
+        upper_bound_type : {'inclusive', 'exclusive'} or constants
+          kudu.EXCLUSIVE_BOUND and kudu.INCLUSIVE_BOUND
+
+        Returns
+        -------
+        self : TableAlterer
+        """
+        cdef:
+            PartialRow lbound
+            PartialRow ubound
+
+        if not isinstance(lower_bound, PartialRow):
+            lbound = self._table.schema.new_row(lower_bound)
+        else:
+            lbound = lower_bound
+        lbound._own = 0
+        if not isinstance(upper_bound, PartialRow):
+            ubound = self._table.schema.new_row(upper_bound)
+        else:
+            ubound = upper_bound
+        ubound._own = 0
+        self._alterer.DropRangePartition(
+            lbound.row,
+            ubound.row,
+            _check_convert_range_bound_type(lower_bound_type),
+            _check_convert_range_bound_type(upper_bound_type)
+        )
+
+    def alter(self):
+        """
+        Alter table. Returns a new table object upon completion of the alter.
+
+        Returns
+        -------
+        table :Table
+        """
+        check_status(self._alterer.Alter())
+        return self._table.parent.table(self._new_name or self._table.name)

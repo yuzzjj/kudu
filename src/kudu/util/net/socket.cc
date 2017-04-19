@@ -81,16 +81,16 @@ Socket::~Socket() {
 }
 
 Status Socket::Close() {
-  if (fd_ < 0)
+  if (fd_ < 0) {
     return Status::OK();
-  int err, fd = fd_;
-  fd_ = -1;
+  }
+  int fd = fd_;
   if (::close(fd) < 0) {
-    err = errno;
+    int err = errno;
     return Status::NetworkError(std::string("close error: ") +
                                 ErrnoToString(err), Slice(), err);
   }
-  fd = -1;
+  fd_ = -1;
   return Status::OK();
 }
 
@@ -166,6 +166,19 @@ Status Socket::SetNoDelay(bool enabled) {
     return Status::NetworkError(std::string("failed to set TCP_NODELAY: ") +
                                 ErrnoToString(err), Slice(), err);
   }
+  return Status::OK();
+}
+
+Status Socket::SetTcpCork(bool enabled) {
+#if defined(__linux__)
+  int flag = enabled ? 1 : 0;
+  if (setsockopt(fd_, IPPROTO_TCP, TCP_CORK, &flag, sizeof(flag)) == -1) {
+    int err = errno;
+    return Status::NetworkError(std::string("failed to set TCP_CORK: ") +
+                                ErrnoToString(err), Slice(), err);
+  }
+#endif // defined(__linux__)
+  // TODO: Use TCP_NOPUSH for OSX if perf becomes an issue.
   return Status::OK();
 }
 
@@ -281,6 +294,17 @@ Status Socket::GetPeerAddress(Sockaddr *cur_addr) const {
   }
   *cur_addr = sin;
   return Status::OK();
+}
+
+bool Socket::IsLoopbackConnection() const {
+  Sockaddr local, remote;
+  if (!GetSocketAddress(&local).ok()) return false;
+  if (!GetPeerAddress(&remote).ok()) return false;
+
+  // Compare without comparing ports.
+  local.set_port(0);
+  remote.set_port(0);
+  return local == remote;
 }
 
 Status Socket::Bind(const Sockaddr& bind_addr) {
@@ -434,7 +458,7 @@ Status Socket::BlockingWrite(const uint8_t *buf, size_t buflen, size_t *nwritten
   while (tot_written < buflen) {
     int32_t inc_num_written = 0;
     int32_t num_to_write = buflen - tot_written;
-    MonoDelta timeout = deadline.GetDeltaSince(MonoTime::Now(MonoTime::FINE));
+    MonoDelta timeout = deadline - MonoTime::Now();
     if (PREDICT_FALSE(timeout.ToNanoseconds() <= 0)) {
       return Status::TimedOut("BlockingWrite timed out");
     }
@@ -505,7 +529,7 @@ Status Socket::BlockingRecv(uint8_t *buf, size_t amt, size_t *nread, const MonoT
   while (tot_read < amt) {
     int32_t inc_num_read = 0;
     int32_t num_to_read = amt - tot_read;
-    MonoDelta timeout = deadline.GetDeltaSince(MonoTime::Now(MonoTime::FINE));
+    MonoDelta timeout = deadline - MonoTime::Now();
     if (PREDICT_FALSE(timeout.ToNanoseconds() <= 0)) {
       return Status::TimedOut("");
     }

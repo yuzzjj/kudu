@@ -33,6 +33,10 @@ class HostPort {
   HostPort(std::string host, uint16_t port);
   explicit HostPort(const Sockaddr& addr);
 
+  bool Initialized() const {
+    return !host_.empty();
+  }
+
   // Parse a "host:port" pair into this object.
   // If there is no port specified in the string, then 'default_port' is used.
   Status ParseString(const std::string& str, uint16_t default_port);
@@ -52,6 +56,8 @@ class HostPort {
   uint16_t port() const { return port_; }
   void set_port(uint16_t port) { port_ = port; }
 
+  size_t HashCode() const;
+
   // Parse a comma separated list of "host:port" pairs into a vector
   // HostPort objects. If no port is specified for an entry in the
   // comma separated list, 'default_port' is used for that entry's
@@ -67,6 +73,22 @@ class HostPort {
  private:
   std::string host_;
   uint16_t port_;
+};
+
+bool operator==(const HostPort& hp1, const HostPort& hp2);
+
+// Hasher of HostPort objects for UnorderedAssociativeContainers.
+struct HostPortHasher {
+  size_t operator()(const HostPort& hp) const {
+    return hp.HashCode();
+  }
+};
+
+// Equality BinaryPredicate of HostPort objects for UnorderedAssociativeContainers.
+struct HostPortEqualityPredicate {
+  bool operator()(const HostPort& hp1, const HostPort& hp2) const {
+    return hp1 == hp2;
+  }
 };
 
 // Parse and resolve the given comma-separated list of addresses.

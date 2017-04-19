@@ -16,7 +16,7 @@
 // under the License.
 package kudu;
 
-option java_package = "org.kududb";
+option java_package = "org.apache.kudu";
 
 import "google/protobuf/descriptor.proto";
 
@@ -37,4 +37,8 @@ message ContainerSupHeaderPB {
   // The PB message type expected in each data entry in this container. Must
   // be fully qualified (i.e. kudu.tablet.TabletSuperBlockPB).
   required string pb_type = 2;
+}
+
+extend google.protobuf.FieldOptions {
+  optional bool REDACT = 50001 [default=false];
 }

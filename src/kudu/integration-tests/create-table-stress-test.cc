@@ -15,16 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <boost/bind.hpp>
-#include <boost/thread/thread.hpp>
 #include <glog/stl_logging.h>
 #include <gtest/gtest.h>
 #include <memory>
+#include <thread>
 
 #include "kudu/client/client.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/fs/fs_manager.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/mini_cluster.h"
 #include "kudu/master/master.proxy.h"
@@ -33,6 +33,7 @@
 #include "kudu/rpc/messenger.h"
 #include "kudu/tserver/mini_tablet_server.h"
 #include "kudu/tserver/tablet_server.h"
+#include "kudu/util/pb_util.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/test_util.h"
 
@@ -51,8 +52,11 @@ using kudu::rpc::RpcController;
 
 DECLARE_int32(heartbeat_interval_ms);
 DECLARE_bool(log_preallocate_segments);
-DECLARE_bool(enable_remote_bootstrap);
 DEFINE_int32(num_test_tablets, 60, "Number of tablets for stress test");
+
+using std::thread;
+using std::unique_ptr;
+using strings::Substitute;
 
 namespace kudu {
 
@@ -80,14 +84,10 @@ class CreateTableStressTest : public KuduTest {
     // this won't be necessary.
     FLAGS_log_preallocate_segments = false;
 
-    // Workaround KUDU-941: without this, it's likely that while shutting
-    // down tablets, they'll get resuscitated by their existing leaders.
-    FLAGS_enable_remote_bootstrap = false;
-
     KuduTest::SetUp();
     MiniClusterOptions opts;
     opts.num_tablet_servers = 3;
-    cluster_.reset(new MiniCluster(env_.get(), opts));
+    cluster_.reset(new MiniCluster(env_, opts));
     ASSERT_OK(cluster_->Start());
 
     ASSERT_OK(KuduClientBuilder()
@@ -96,7 +96,7 @@ class CreateTableStressTest : public KuduTest {
 
     ASSERT_OK(MessengerBuilder("stress-test-msgr")
               .set_num_reactors(1)
-              .set_negotiation_threads(1)
+              .set_max_negotiation_threads(1)
               .Build(&messenger_));
     master_proxy_.reset(new MasterServiceProxy(messenger_,
                                                cluster_->mini_master()->bound_rpc_addr()));
@@ -112,10 +112,10 @@ class CreateTableStressTest : public KuduTest {
 
  protected:
   client::sp::shared_ptr<KuduClient> client_;
-  gscoped_ptr<MiniCluster> cluster_;
+  unique_ptr<MiniCluster> cluster_;
   KuduSchema schema_;
   std::shared_ptr<Messenger> messenger_;
-  gscoped_ptr<MasterServiceProxy> master_proxy_;
+  unique_ptr<MasterServiceProxy> master_proxy_;
   TabletServerMap ts_map_;
 };
 
@@ -129,9 +129,10 @@ void CreateTableStressTest::CreateBigTable(const string& table_name, int num_tab
     split_rows.push_back(row);
   }
 
-  gscoped_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+  unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
   ASSERT_OK(table_creator->table_name(table_name)
             .schema(&schema_)
+            .set_range_partition_columns({ "key" })
             .split_rows(split_rows)
             .num_replicas(3)
             .wait(false)
@@ -151,7 +152,7 @@ TEST_F(CreateTableStressTest, CreateAndDeleteBigTable) {
   LOG(INFO) << "Created table successfully!";
   // Use std::cout instead of log, since these responses are large and log
   // messages have a max size.
-  std::cout << "Response:\n" << resp.DebugString();
+  std::cout << "Response:\n" << SecureDebugString(resp);
   std::cout << "CatalogManager state:\n";
   cluster_->mini_master()->master()->catalog_manager()->DumpState(&std::cerr);
 
@@ -184,6 +185,7 @@ TEST_F(CreateTableStressTest, RestartMasterDuringCreation) {
   for (int i = 0; i < 3; i++) {
     SleepFor(MonoDelta::FromMicroseconds(500));
     LOG(INFO) << "Restarting master...";
+    cluster_->mini_master()->Shutdown();
     ASSERT_OK(cluster_->mini_master()->Restart());
     ASSERT_OK(cluster_->mini_master()->master()->
         WaitUntilCatalogManagerIsLeaderAndReadyForTests(MonoDelta::FromSeconds(5)));
@@ -222,6 +224,11 @@ TEST_F(CreateTableStressTest, TestGetTableLocationsOptions) {
                                        FLAGS_num_test_tablets, &resp));
   }
 
+  master::CatalogManager* catalog =
+      cluster_->mini_master()->master()->catalog_manager();
+  master::CatalogManager::ScopedLeaderSharedLock l(catalog);
+  ASSERT_OK(l.first_failed_status());
+
   // Test asking for 0 tablets, should fail
   LOG(INFO) << CURRENT_TEST_NAME() << ": Step 3. Asking for zero tablets...";
   LOG_TIMING(INFO, "asking for zero tablets") {
@@ -229,7 +236,7 @@ TEST_F(CreateTableStressTest, TestGetTableLocationsOptions) {
     resp.Clear();
     req.mutable_table()->set_table_name(table_name);
     req.set_max_returned_locations(0);
-    Status s = cluster_->mini_master()->master()->catalog_manager()->GetTableLocations(&req, &resp);
+    Status s = catalog->GetTableLocations(&req, &resp);
     ASSERT_STR_CONTAINS(s.ToString(), "must be greater than 0");
   }
 
@@ -240,7 +247,7 @@ TEST_F(CreateTableStressTest, TestGetTableLocationsOptions) {
     resp.Clear();
     req.mutable_table()->set_table_name(table_name);
     req.set_max_returned_locations(1);
-    ASSERT_OK(cluster_->mini_master()->master()->catalog_manager()->GetTableLocations(&req, &resp));
+    ASSERT_OK(catalog->GetTableLocations(&req, &resp));
     ASSERT_EQ(resp.tablet_locations_size(), 1);
     // empty since it's the first
     ASSERT_EQ(resp.tablet_locations(0).partition().partition_key_start(), "");
@@ -255,7 +262,7 @@ TEST_F(CreateTableStressTest, TestGetTableLocationsOptions) {
     resp.Clear();
     req.mutable_table()->set_table_name(table_name);
     req.set_max_returned_locations(half_tablets);
-    ASSERT_OK(cluster_->mini_master()->master()->catalog_manager()->GetTableLocations(&req, &resp));
+    ASSERT_OK(catalog->GetTableLocations(&req, &resp));
     ASSERT_EQ(half_tablets, resp.tablet_locations_size());
   }
 
@@ -266,7 +273,7 @@ TEST_F(CreateTableStressTest, TestGetTableLocationsOptions) {
     resp.Clear();
     req.mutable_table()->set_table_name(table_name);
     req.set_max_returned_locations(FLAGS_num_test_tablets);
-    ASSERT_OK(cluster_->mini_master()->master()->catalog_manager()->GetTableLocations(&req, &resp));
+    ASSERT_OK(catalog->GetTableLocations(&req, &resp));
     ASSERT_EQ(FLAGS_num_test_tablets, resp.tablet_locations_size());
   }
 
@@ -274,7 +281,7 @@ TEST_F(CreateTableStressTest, TestGetTableLocationsOptions) {
   LOG(INFO) << "Tables and tablets:";
   LOG(INFO) << "========================================================";
   std::vector<scoped_refptr<master::TableInfo> > tables;
-  cluster_->mini_master()->master()->catalog_manager()->GetAllTables(&tables);
+  catalog->GetAllTables(&tables);
   for (const scoped_refptr<master::TableInfo>& table_info : tables) {
     LOG(INFO) << "Table: " << table_info->ToString();
     std::vector<scoped_refptr<master::TabletInfo> > tablets;
@@ -297,7 +304,7 @@ TEST_F(CreateTableStressTest, TestGetTableLocationsOptions) {
 
   // Get a single tablet in the middle, make sure we get that one back
 
-  gscoped_ptr<KuduPartialRow> row(schema_.NewRow());
+  unique_ptr<KuduPartialRow> row(schema_.NewRow());
   ASSERT_OK(row->SetInt32(0, half_tablets - 1));
   string start_key_middle;
   ASSERT_OK(row->EncodeRowKey(&start_key_middle));
@@ -310,10 +317,60 @@ TEST_F(CreateTableStressTest, TestGetTableLocationsOptions) {
     req.mutable_table()->set_table_name(table_name);
     req.set_max_returned_locations(1);
     req.set_partition_key_start(start_key_middle);
-    ASSERT_OK(cluster_->mini_master()->master()->catalog_manager()->GetTableLocations(&req, &resp));
-    ASSERT_EQ(1, resp.tablet_locations_size()) << "Response: [" << resp.DebugString() << "]";
+    ASSERT_OK(catalog->GetTableLocations(&req, &resp));
+    ASSERT_EQ(1, resp.tablet_locations_size()) << "Response: [" << SecureDebugString(resp) << "]";
     ASSERT_EQ(start_key_middle, resp.tablet_locations(0).partition().partition_key_start());
   }
+}
+
+// Creates tables and reloads on-disk metadata concurrently to test for races
+// between the two operations.
+TEST_F(CreateTableStressTest, TestConcurrentCreateTableAndReloadMetadata) {
+  AtomicBool stop(false);
+
+  thread reload_metadata_thread([&]() {
+    while (!stop.Load()) {
+      CHECK_OK(cluster_->mini_master()->master()->catalog_manager()->
+          VisitTablesAndTablets());
+
+      // Give table creation a chance to run.
+      SleepFor(MonoDelta::FromMilliseconds(1 + rand() % 10));
+    }
+  });
+
+  for (int num_tables_created = 0; num_tables_created < 20;) {
+    string table_name = Substitute("test-$0", num_tables_created);
+    LOG(INFO) << "Creating table " << table_name;
+    unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+    Status s = table_creator->table_name(table_name)
+                  .schema(&schema_)
+                  .set_range_partition_columns({ "key" })
+                  .num_replicas(3)
+                  .wait(false)
+                  .Create();
+    if (s.IsTimedOut()) {
+      // The master was busy reloading its metadata, replying with
+      // ServiceUnavailable on CreateTable() requests. The client transparently
+      // retried (randomized exponential back-off) until the timeout elapsed.
+      //
+      // It's hard to find some universal constant for timeout which would work
+      // in any testing environment instead of simply retrying here. That's
+      // because the client uses exponential-with-random back-off strategy
+      // while the metadata is being reloaded very often. So, from one side
+      // we want to have more or less random interaction between the metadata
+      // reloading and the simultaneous table creations, but from the other side
+      // it's hard do deduce the universal timeout constant and we prefer to
+      // not introduce test flakiness.
+      //
+      // TODO(aserbin): update the test keeping its racy essence but making it
+      //                cleaner regarding this timeout&retry workaround.
+      continue;
+    }
+    ASSERT_OK(s);
+    num_tables_created++;
+  }
+  stop.Store(true);
+  reload_metadata_thread.join();
 }
 
 } // namespace kudu

@@ -17,7 +17,7 @@
 #
 # Sets COMPILER_FAMILY to 'clang' or 'gcc'
 # Sets COMPILER_VERSION to the version
-execute_process(COMMAND "${CMAKE_CXX_COMPILER}" -v
+execute_process(COMMAND env LANG=C "${CMAKE_CXX_COMPILER}" -v
                 ERROR_VARIABLE COMPILER_VERSION_FULL)
 message(INFO " ${COMPILER_VERSION_FULL}")
 
@@ -33,9 +33,14 @@ elseif("${COMPILER_VERSION_FULL}" MATCHES ".*based on LLVM.*")
     COMPILER_VERSION "${COMPILER_VERSION_FULL}")
 
 # clang on Mac OS X, XCode 7.
-elseif("${COMPILER_VERSION_FULL}" MATCHES ".*clang-700\\..*")
+elseif("${COMPILER_VERSION_FULL}" MATCHES ".*clang-7")
   set(COMPILER_FAMILY "clang")
   set(COMPILER_VERSION "3.7.0svn")
+
+# clang on Mac OS X, XCode 8.
+elseif("${COMPILER_VERSION_FULL}" MATCHES ".*clang-8")
+  set(COMPILER_FAMILY "clang")
+  set(COMPILER_VERSION "3.8.0svn")
 
 # gcc
 elseif("${COMPILER_VERSION_FULL}" MATCHES ".*gcc version.*")

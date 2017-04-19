@@ -23,6 +23,7 @@
 
 #include "kudu/gutil/port.h"
 #include "kudu/cfile/block_encodings.h"
+#include "kudu/cfile/cfile_util.h"
 #include "kudu/common/columnblock.h"
 #include "kudu/util/coding.h"
 #include "kudu/util/coding-inl.h"
@@ -45,10 +46,11 @@ enum {
 // RLE encoder for the BOOL datatype: uses an RLE-encoded bitmap to
 // represent a bool column.
 //
-class RleBitMapBlockBuilder : public BlockBuilder {
+class RleBitMapBlockBuilder final : public BlockBuilder {
  public:
-  RleBitMapBlockBuilder()
-      : encoder_(&buf_, 1) {
+  explicit RleBitMapBlockBuilder(const WriterOptions* options)
+      : encoder_(&buf_, 1),
+        options_(options) {
     Reset();
   }
 
@@ -64,8 +66,8 @@ class RleBitMapBlockBuilder : public BlockBuilder {
     return count;
   }
 
-  virtual bool IsBlockFull(size_t limit) const OVERRIDE {
-    return encoder_.len() > limit;
+  virtual bool IsBlockFull() const override {
+    return encoder_.len() > options_->storage_attributes.cfile_block_size;
   }
 
   virtual Slice Finish(rowid_t ordinal_pos) OVERRIDE {
@@ -90,16 +92,22 @@ class RleBitMapBlockBuilder : public BlockBuilder {
     return Status::NotSupported("BOOL keys not supported");
   }
 
+  // TODO Implement this method
+  virtual Status GetLastKey(void* key) const OVERRIDE {
+    return Status::NotSupported("BOOL keys not supported");
+  }
+
  private:
   faststring buf_;
   RleEncoder<bool> encoder_;
+  const WriterOptions* const options_;
   size_t count_;
 };
 
 //
 // RLE decoder for bool datatype
 //
-class RleBitMapBlockDecoder : public BlockDecoder {
+class RleBitMapBlockDecoder final : public BlockDecoder {
  public:
   explicit RleBitMapBlockDecoder(Slice slice)
       : data_(std::move(slice)),
@@ -205,15 +213,16 @@ class RleBitMapBlockDecoder : public BlockDecoder {
 // TODO : consider if this can also be used for BOOL with only minor
 //        alterations
 template <DataType IntType>
-class RleIntBlockBuilder : public BlockBuilder {
+class RleIntBlockBuilder final : public BlockBuilder {
  public:
-  explicit RleIntBlockBuilder(const WriterOptions* opts = NULL)
-      : rle_encoder_(&buf_, kCppTypeSize * 8) {
+  explicit RleIntBlockBuilder(const WriterOptions* options)
+      : rle_encoder_(&buf_, kCppTypeSize * 8),
+        options_(options) {
     Reset();
   }
 
-  virtual bool IsBlockFull(size_t limit) const OVERRIDE {
-    return rle_encoder_.len() > limit;
+  virtual bool IsBlockFull() const OVERRIDE {
+    return rle_encoder_.len() > options_->storage_attributes.cfile_block_size;
   }
 
   virtual int Add(const uint8_t* vals_void, size_t count) OVERRIDE {
@@ -225,6 +234,9 @@ class RleIntBlockBuilder : public BlockBuilder {
       rle_encoder_.Put(vals[i], 1);
     }
     count_ += count;
+    if (count > 0) {
+      last_key_ = vals[count - 1];
+    }
     return count;
   }
 
@@ -246,11 +258,19 @@ class RleIntBlockBuilder : public BlockBuilder {
   }
 
   virtual Status GetFirstKey(void* key) const OVERRIDE {
-    if (count_ > 0) {
-      *reinterpret_cast<CppType*>(key) = first_key_;
-      return Status::OK();
+    if (PREDICT_FALSE(count_ == 0)) {
+      return Status::NotFound("No keys in the block");
     }
-    return Status::NotFound("No keys in the block");
+    *reinterpret_cast<CppType*>(key) = first_key_;
+    return Status::OK();
+  }
+
+  virtual Status GetLastKey(void* key) const OVERRIDE {
+    if (PREDICT_FALSE(count_ == 0)) {
+      return Status::NotFound("No keys in the block");
+    }
+    *reinterpret_cast<CppType*>(key) = last_key_;
+    return Status::OK();
   }
 
  private:
@@ -261,9 +281,11 @@ class RleIntBlockBuilder : public BlockBuilder {
   };
 
   CppType first_key_;
+  CppType last_key_;
   faststring buf_;
   size_t count_;
   RleEncoder<CppType> rle_encoder_;
+  const WriterOptions* const options_;
 };
 
 //
@@ -274,7 +296,7 @@ class RleIntBlockBuilder : public BlockBuilder {
 //        code here for the BOOL type.
 //
 template <DataType IntType>
-class RleIntBlockDecoder : public BlockDecoder {
+class RleIntBlockDecoder final : public BlockDecoder {
  public:
   explicit RleIntBlockDecoder(Slice slice)
       : data_(std::move(slice)),
@@ -308,6 +330,10 @@ class RleIntBlockDecoder : public BlockDecoder {
 
   virtual void SeekToPositionInBlock(uint pos) OVERRIDE {
     CHECK(parsed_) << "Must call ParseHeader()";
+    // If the block is empty (e.g. the column is filled with nulls), there is no data to seek.
+    if (PREDICT_FALSE(num_elems_ == 0)) {
+      return;
+    }
     CHECK_LT(pos, num_elems_)
         << "Tried to seek to " << pos << " which is >= number of elements ("
         << num_elems_ << ") in the block!.";

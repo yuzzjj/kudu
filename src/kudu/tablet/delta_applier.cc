@@ -20,19 +20,21 @@
 #include <string>
 #include <vector>
 
+#include "kudu/common/column_materialization_context.h"
 #include "kudu/common/iterator.h"
 #include "kudu/tablet/delta_store.h"
 #include "kudu/util/status.h"
 
 using std::shared_ptr;
 using std::string;
+using std::unique_ptr;
 
 namespace kudu {
 namespace tablet {
 
   // Construct. The base_iter and delta_iter should not be Initted.
 DeltaApplier::DeltaApplier(shared_ptr<CFileSet::Iterator> base_iter,
-                           shared_ptr<DeltaIterator> delta_iter)
+                           unique_ptr<DeltaIterator> delta_iter)
     : base_iter_(std::move(base_iter)),
       delta_iter_(std::move(delta_iter)),
       first_prepare_(true) {}
@@ -92,14 +94,17 @@ Status DeltaApplier::InitializeSelectionVector(SelectionVector *sel_vec) {
   return delta_iter_->ApplyDeletes(sel_vec);
 }
 
-Status DeltaApplier::MaterializeColumn(size_t col_idx, ColumnBlock *dst) {
+Status DeltaApplier::MaterializeColumn(ColumnMaterializationContext *ctx) {
   DCHECK(!first_prepare_) << "PrepareBatch() must be called at least once";
+  // Data with updates cannot be evaluated at the decoder-level.
+  if (delta_iter_->MayHaveDeltas()) {
+    ctx->SetDecoderEvalNotSupported();
+    RETURN_NOT_OK(base_iter_->MaterializeColumn(ctx));
+    RETURN_NOT_OK(delta_iter_->ApplyUpdates(ctx->col_idx(), ctx->block()));
+  } else {
+    RETURN_NOT_OK(base_iter_->MaterializeColumn(ctx));
+  }
 
-  // Copy the base data.
-  RETURN_NOT_OK(base_iter_->MaterializeColumn(col_idx, dst));
-
-  // Apply all the updates for this column.
-  RETURN_NOT_OK(delta_iter_->ApplyUpdates(col_idx, dst));
   return Status::OK();
 }
 

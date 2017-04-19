@@ -23,9 +23,12 @@
 
 #include "kudu/gutil/map-util.h"
 #include "kudu/rpc/rpc_context.h"
+#include "kudu/rpc/remote_user.h"
 #include "kudu/server/clock.h"
 #include "kudu/server/hybrid_clock.h"
 #include "kudu/server/server_base.h"
+#include "kudu/util/debug-util.h"
+#include "kudu/util/debug/leak_annotations.h"
 #include "kudu/util/flag_tags.h"
 
 DECLARE_bool(use_mock_wall_clock);
@@ -34,21 +37,29 @@ DECLARE_bool(use_hybrid_clock);
 using std::string;
 using std::unordered_set;
 
-#ifdef COVERAGE_BUILD
-extern "C" void __gcov_flush(void);
-#endif
-
-
 namespace kudu {
 namespace server {
 
 GenericServiceImpl::GenericServiceImpl(ServerBase* server)
-  : GenericServiceIf(server->metric_entity()),
+  : GenericServiceIf(server->metric_entity(), server->result_tracker()),
     server_(server) {
 }
 
 GenericServiceImpl::~GenericServiceImpl() {
 }
+
+bool GenericServiceImpl::AuthorizeSuperUser(const google::protobuf::Message* /*req*/,
+                                            google::protobuf::Message* /*resp*/,
+                                            rpc::RpcContext* rpc) {
+  return server_->Authorize(rpc, ServerBase::SUPER_USER);
+}
+
+bool GenericServiceImpl::AuthorizeClient(const google::protobuf::Message* /*req*/,
+                                         google::protobuf::Message* /*resp*/,
+                                         rpc::RpcContext* rpc) {
+  return server_->Authorize(rpc, ServerBase::SUPER_USER | ServerBase::USER);
+}
+
 
 void GenericServiceImpl::SetFlag(const SetFlagRequestPB* req,
                                  SetFlagResponsePB* resp,
@@ -98,18 +109,39 @@ void GenericServiceImpl::SetFlag(const SetFlagRequestPB* req,
   rpc->RespondSuccess();
 }
 
-void GenericServiceImpl::FlushCoverage(const FlushCoverageRequestPB* req,
+void GenericServiceImpl::CheckLeaks(const CheckLeaksRequestPB* /*req*/,
+                                    CheckLeaksResponsePB* resp,
+                                    rpc::RpcContext* rpc) {
+  // We have to use these nested #if statements rather than an && to avoid
+  // a preprocessor error with GCC which doesn't know about __has_feature.
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define LSAN_ENABLED
+#  endif
+#endif
+#ifndef LSAN_ENABLED
+  resp->set_success(false);
+#else
+  LOG(INFO) << "Checking for leaks (request via RPC)";
+  resp->set_success(true);
+  resp->set_found_leaks(__lsan_do_recoverable_leak_check());
+#endif
+#undef LSAN_ENABLED
+  rpc->RespondSuccess();
+}
+
+void GenericServiceImpl::FlushCoverage(const FlushCoverageRequestPB* /*req*/,
                                        FlushCoverageResponsePB* resp,
                                        rpc::RpcContext* rpc) {
-#ifdef COVERAGE_BUILD
-  __gcov_flush();
-  LOG(INFO) << "Flushed coverage info. (request from " << rpc->requestor_string() << ")";
-  resp->set_success(true);
-#else
-  LOG(WARNING) << "Non-coverage build cannot flush coverage (request from "
-               << rpc->requestor_string() << ")";
-  resp->set_success(false);
-#endif
+  if (IsCoverageBuild()) {
+    TryFlushCoverage();
+    LOG(INFO) << "Flushed coverage info. (request from " << rpc->requestor_string() << ")";
+    resp->set_success(true);
+  } else {
+    LOG(WARNING) << "Non-coverage build cannot flush coverage (request from "
+                 << rpc->requestor_string() << ")";
+    resp->set_success(false);
+  }
   rpc->RespondSuccess();
 }
 

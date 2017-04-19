@@ -60,6 +60,10 @@ class HybridClock : public Clock {
   // HybridClock supports all external consistency modes.
   virtual bool SupportsExternalConsistencyMode(ExternalConsistencyMode mode) OVERRIDE;
 
+  virtual bool HasPhysicalComponent() const OVERRIDE;
+
+  MonoDelta GetPhysicalComponentDifference(Timestamp lhs, Timestamp rhs) const OVERRIDE;
+
   // Blocks the caller thread until the true time is after 'then'.
   // In other words, waits until the HybridClock::Now() on _all_ nodes
   // will return a value greater than 'then'.
@@ -136,7 +140,7 @@ class HybridClock : public Clock {
                                                             uint64_t logical_value);
 
   // Creates a new timestamp whose physical time is GetPhysicalValue(original) +
-  // 'micros_to_add' and which retains the same logical value.
+  // 'to_add' and which retains the same logical value.
   static Timestamp AddPhysicalTimeToTimestamp(const Timestamp& original,
                                               const MonoDelta& to_add);
 
@@ -145,7 +149,7 @@ class HybridClock : public Clock {
   static std::string StringifyTimestamp(const Timestamp& timestamp);
 
   // Sets the time to be returned by a mock call to the system clock, for tests.
-  // Requires that 'FLAGS_use_mock_wall_clock' is set to true and that 'now_usec' is less
+  // Requires that 'FLAGS_use_mock_wall_clock' is set to true and that 'now_usec' is higher
   // than the previously set time.
   // NOTE: This refers to the time returned by the system clock, not the time returned
   // by HybridClock, i.e. 'now_usec' is not a HybridTime timestmap and shouldn't have
@@ -188,10 +192,9 @@ class HybridClock : public Clock {
 
   mutable simple_spinlock lock_;
 
-  // the last clock read/update, in microseconds.
-  uint64_t last_usec_;
-  // the next logical value to be assigned to a timestamp
-  uint64_t next_logical_;
+  // The next timestamp to be generated from this clock, assuming that
+  // the physical clock hasn't advanced beyond the value stored here.
+  uint64_t next_timestamp_;
 
   // How many bits to left shift a microseconds clock read. The remainder
   // of the timestamp will be reserved for logical values.

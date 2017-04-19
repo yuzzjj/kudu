@@ -15,40 +15,58 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <vector>
+
+#include <boost/optional.hpp>
 #include <gtest/gtest.h>
+#include "kudu/common/column_predicate.h"
 #include "kudu/common/row.h"
 #include "kudu/common/rowblock.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.h"
+#include "kudu/util/pb_util.h"
 #include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
+
+using std::vector;
 
 namespace kudu {
 
 class WireProtocolTest : public KuduTest {
  public:
   WireProtocolTest()
-    : schema_({ ColumnSchema("col1", STRING),
-                ColumnSchema("col2", STRING),
-                ColumnSchema("col3", UINT32, true /* nullable */) },
-              1) {
+      : schema_({ ColumnSchema("col1", STRING),
+              ColumnSchema("col2", STRING),
+              ColumnSchema("col3", UINT32, true /* nullable */) },
+        1),
+        test_data_arena_(4096, 256 * 1024) {
   }
 
   void FillRowBlockWithTestRows(RowBlock* block) {
+    test_data_arena_.Reset();
     block->selection_vector()->SetAllTrue();
 
     for (int i = 0; i < block->nrows(); i++) {
       RowBlockRow row = block->row(i);
-      *reinterpret_cast<Slice*>(row.mutable_cell_ptr(0)) = Slice("hello world col1");
-      *reinterpret_cast<Slice*>(row.mutable_cell_ptr(1)) = Slice("hello world col2");
+
+      // We make new copies of these strings into the Arena for each row so that
+      // the workload is more realistic. If we just re-use the same Slice object
+      // for each row, the memory accesses fit entirely into a smaller number of
+      // cache lines and we may micro-optimize for the wrong thing.
+      Slice col1, col2;
+      CHECK(test_data_arena_.RelocateSlice("hello world col1", &col1));
+      CHECK(test_data_arena_.RelocateSlice("hello world col2", &col2));
+      *reinterpret_cast<Slice*>(row.mutable_cell_ptr(0)) = col1;
+      *reinterpret_cast<Slice*>(row.mutable_cell_ptr(1)) = col2;
       *reinterpret_cast<uint32_t*>(row.mutable_cell_ptr(2)) = i;
       row.cell(2).set_null(false);
     }
   }
  protected:
   Schema schema_;
+  Arena test_data_arena_;
 };
 
 TEST_F(WireProtocolTest, TestOKStatus) {
@@ -191,7 +209,7 @@ TEST_F(WireProtocolTest, TestColumnarRowBlockToPB) {
   RowwiseRowBlockPB pb;
   faststring direct, indirect;
   SerializeRowBlock(block, &pb, nullptr, &direct, &indirect);
-  SCOPED_TRACE(pb.DebugString());
+  SCOPED_TRACE(SecureDebugString(pb));
   SCOPED_TRACE("Row data: " + direct.ToString());
   SCOPED_TRACE("Indirect data: " + indirect.ToString());
 
@@ -319,4 +337,61 @@ TEST_F(WireProtocolTest, TestColumnDefaultValue) {
   ASSERT_EQ(write_default_u32, *static_cast<const uint32_t *>(col5fpb.write_default_value()));
 }
 
+TEST_F(WireProtocolTest, TestColumnPredicateInList) {
+  ColumnSchema col1("col1", INT32);
+  vector<ColumnSchema> cols = { col1 };
+  Schema schema(cols, 1);
+  Arena arena(1024,1024*1024);
+  boost::optional<ColumnPredicate> predicate;
+
+  { // col1 IN (5, 6, 10)
+    int five = 5;
+    int six = 6;
+    int ten = 10;
+    vector<const void*> values { &five, &six, &ten };
+
+    kudu::ColumnPredicate cp = kudu::ColumnPredicate::InList(col1, &values);
+    ColumnPredicatePB pb;
+    ASSERT_NO_FATAL_FAILURE(ColumnPredicateToPB(cp, &pb));
+
+    ASSERT_OK(ColumnPredicateFromPB(schema, &arena, pb, &predicate));
+    ASSERT_EQ(predicate->predicate_type(), PredicateType::InList);
+    ASSERT_EQ(3, predicate->raw_values().size());
+  }
+
+  { // col1 IN (0, 0)
+    // We can't construct a single element IN list directly since it would be
+    // simplified to an equality predicate, so we hack around it by directly
+    // constructing it as a protobuf message.
+    ColumnPredicatePB pb;
+    pb.set_column("col1");
+    *pb.mutable_in_list()->mutable_values()->Add() = string("\0\0\0\0", 4);
+    *pb.mutable_in_list()->mutable_values()->Add() = string("\0\0\0\0", 4);
+
+    ASSERT_OK(ColumnPredicateFromPB(schema, &arena, pb, &predicate));
+    ASSERT_EQ(PredicateType::Equality, predicate->predicate_type());
+  }
+
+  { // col1 IN ()
+    ColumnPredicatePB pb;
+    pb.set_column("col1");
+    pb.mutable_in_list();
+
+    Arena arena(1024,1024*1024);
+    boost::optional<ColumnPredicate> predicate;
+    ASSERT_OK(ColumnPredicateFromPB(schema, &arena, pb, &predicate));
+    ASSERT_EQ(PredicateType::None, predicate->predicate_type());
+  }
+
+  { // IN list corruption
+    ColumnPredicatePB pb;
+    pb.set_column("col1");
+    pb.mutable_in_list();
+    *pb.mutable_in_list()->mutable_values()->Add() = string("\0", 1);
+
+    Arena arena(1024,1024*1024);
+    boost::optional<ColumnPredicate> predicate;
+    ASSERT_TRUE(ColumnPredicateFromPB(schema, &arena, pb, &predicate).IsInvalidArgument());
+  }
+}
 } // namespace kudu

@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "kudu/common/wire_protocol.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/master/master_options.h"
@@ -36,19 +37,24 @@ namespace kudu {
 class MaintenanceManager;
 class RpcServer;
 struct RpcServerOptions;
-class ServerEntryPB;
 class ThreadPool;
 
 namespace rpc {
 class Messenger;
 class ServicePool;
-}
+} // namespace rpc
+
+namespace security {
+class TokenSigner;
+} // namespace security
 
 namespace master {
 
+class AuthnTokenManager;
 class CatalogManager;
-class TSManager;
+class MasterCertAuthority;
 class MasterPathHandlers;
+class TSManager;
 
 class Master : public server::ServerBase {
  public:
@@ -62,7 +68,7 @@ class Master : public server::ServerBase {
   Status Start();
 
   Status StartAsync();
-  Status WaitForCatalogManagerInit();
+  Status WaitForCatalogManagerInit() const;
 
   // Wait until this Master's catalog manager instance is the leader and is ready.
   // This method is intended for use by unit tests.
@@ -73,6 +79,10 @@ class Master : public server::ServerBase {
   void Shutdown();
 
   std::string ToString() const;
+
+  MasterCertAuthority* cert_authority() { return cert_authority_.get(); }
+
+  security::TokenSigner* token_signer() { return token_signer_.get(); }
 
   TSManager* ts_manager() { return ts_manager_.get(); }
 
@@ -118,6 +128,8 @@ class Master : public server::ServerBase {
 
   MasterState state_;
 
+  std::unique_ptr<MasterCertAuthority> cert_authority_;
+  std::unique_ptr<security::TokenSigner> token_signer_;
   gscoped_ptr<TSManager> ts_manager_;
   gscoped_ptr<CatalogManager> catalog_manager_;
   gscoped_ptr<MasterPathHandlers> path_handlers_;

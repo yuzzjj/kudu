@@ -21,6 +21,7 @@
 
 #include "kudu/client/schema.h"
 #include "kudu/client/schema-internal.h"
+#include "kudu/common/row_operations.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/master/master.pb.h"
 
@@ -35,7 +36,8 @@ using master::AlterTableRequestPB_AlterColumn;
 KuduTableAlterer::Data::Data(KuduClient* client, string name)
     : client_(client),
       table_name_(std::move(name)),
-      wait_(true) {
+      wait_(true),
+      schema_(nullptr) {
 }
 
 KuduTableAlterer::Data::~Data() {
@@ -49,8 +51,7 @@ Status KuduTableAlterer::Data::ToRequest(AlterTableRequestPB* req) {
     return status_;
   }
 
-  if (!rename_to_.is_initialized() &&
-      steps_.empty()) {
+  if (!rename_to_.is_initialized() && steps_.empty()) {
     return Status::InvalidArgument("No alter steps provided");
   }
 
@@ -58,6 +59,11 @@ Status KuduTableAlterer::Data::ToRequest(AlterTableRequestPB* req) {
   req->mutable_table()->set_table_name(table_name_);
   if (rename_to_.is_initialized()) {
     req->set_new_table_name(rename_to_.get());
+  }
+
+  if (schema_ != nullptr) {
+    RETURN_NOT_OK(SchemaToPB(*schema_, req->mutable_schema(),
+                             SCHEMA_PB_WITHOUT_IDS | SCHEMA_PB_WITHOUT_WRITE_DEFAULT));
   }
 
   for (const Step& s : steps_) {
@@ -70,7 +76,8 @@ Status KuduTableAlterer::Data::ToRequest(AlterTableRequestPB* req) {
         KuduColumnSchema col;
         RETURN_NOT_OK(s.spec->ToColumnSchema(&col));
         ColumnSchemaToPB(*col.col_,
-                         pb_step->mutable_add_column()->mutable_schema());
+                         pb_step->mutable_add_column()->mutable_schema(),
+                         SCHEMA_PB_WITHOUT_WRITE_DEFAULT);
         break;
       }
       case AlterTableRequestPB::DROP_COLUMN:
@@ -90,7 +97,7 @@ Status KuduTableAlterer::Data::ToRequest(AlterTableRequestPB* req) {
             s.spec->data_->has_default ||
             s.spec->data_->default_val ||
             s.spec->data_->remove_default) {
-          return Status::NotSupported("cannot support AlterColumn of this type",
+          return Status::NotSupported("cannot alter attributes for column",
                                       s.spec->data_->name);
         }
         // We only support rename column
@@ -102,11 +109,46 @@ Status KuduTableAlterer::Data::ToRequest(AlterTableRequestPB* req) {
         pb_step->mutable_rename_column()->set_new_name(s.spec->data_->rename_to);
         pb_step->set_type(AlterTableRequestPB::RENAME_COLUMN);
         break;
+      case AlterTableRequestPB::ADD_RANGE_PARTITION:
+      {
+        RowOperationsPBEncoder encoder(pb_step->mutable_add_range_partition()
+                                              ->mutable_range_bounds());
+        RowOperationsPB_Type lower_bound_type =
+          s.lower_bound_type == KuduTableCreator::INCLUSIVE_BOUND ?
+          RowOperationsPB::RANGE_LOWER_BOUND :
+          RowOperationsPB::EXCLUSIVE_RANGE_LOWER_BOUND;
+
+        RowOperationsPB_Type upper_bound_type =
+          s.upper_bound_type == KuduTableCreator::EXCLUSIVE_BOUND ?
+          RowOperationsPB::RANGE_UPPER_BOUND :
+          RowOperationsPB::INCLUSIVE_RANGE_UPPER_BOUND;
+
+        encoder.Add(lower_bound_type, *s.lower_bound);
+        encoder.Add(upper_bound_type, *s.upper_bound);
+        break;
+      }
+      case AlterTableRequestPB::DROP_RANGE_PARTITION:
+      {
+        RowOperationsPBEncoder encoder(pb_step->mutable_drop_range_partition()
+                                              ->mutable_range_bounds());
+        RowOperationsPB_Type lower_bound_type =
+          s.lower_bound_type == KuduTableCreator::INCLUSIVE_BOUND ?
+          RowOperationsPB::RANGE_LOWER_BOUND :
+          RowOperationsPB::EXCLUSIVE_RANGE_LOWER_BOUND;
+
+        RowOperationsPB_Type upper_bound_type =
+          s.upper_bound_type == KuduTableCreator::EXCLUSIVE_BOUND ?
+          RowOperationsPB::RANGE_UPPER_BOUND :
+          RowOperationsPB::INCLUSIVE_RANGE_UPPER_BOUND;
+
+        encoder.Add(lower_bound_type, *s.lower_bound);
+        encoder.Add(upper_bound_type, *s.upper_bound);
+        break;
+      }
       default:
-        LOG(FATAL) << "unknown step type " << s.step_type;
+        LOG(FATAL) << "unknown step type " << AlterTableRequestPB::StepType_Name(s.step_type);
     }
   }
-
   return Status::OK();
 }
 

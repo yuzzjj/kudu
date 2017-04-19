@@ -51,15 +51,28 @@ DEFINE_bool(webserver_enable_doc_root, true,
     "If true, webserver may serve static files from the webserver_doc_root");
 TAG_FLAG(webserver_enable_doc_root, advanced);
 
+// SSL configuration.
 DEFINE_string(webserver_certificate_file, "",
-    "The location of the debug webserver's SSL certificate file, in .pem format. If "
+    "The location of the debug webserver's SSL certificate file, in PEM format. If "
     "empty, webserver SSL support is not enabled");
+DEFINE_string(webserver_private_key_file, "", "The full path to the private key used as a"
+    " counterpart to the public key contained in --ssl_server_certificate. If "
+    "--ssl_server_certificate is set, this option must be set as well.");
+DEFINE_string(webserver_private_key_password_cmd, "", "A Unix command whose output "
+    "returns the password used to decrypt the Webserver's certificate private key file "
+    "specified in --webserver_private_key_file. If the PEM key file is not "
+    "password-protected, this command will not be invoked. The output of the command "
+    "will be truncated to 1024 bytes, and then all trailing whitespace will be trimmed "
+    "before it is used to decrypt the private key");
+TAG_FLAG(webserver_certificate_file, stable);
+TAG_FLAG(webserver_private_key_file, stable);
+TAG_FLAG(webserver_private_key_password_cmd, stable);
+
 DEFINE_string(webserver_authentication_domain, "",
     "Domain used for debug webserver authentication");
 DEFINE_string(webserver_password_file, "",
     "(Optional) Location of .htpasswd file containing user names and hashed passwords for"
     " debug webserver authentication");
-
 
 DEFINE_int32(webserver_num_worker_threads, 50,
              "Maximum number of threads to start for handling web server requests");
@@ -70,6 +83,26 @@ DEFINE_int32(webserver_port, 0,
 TAG_FLAG(webserver_port, stable);
 
 namespace kudu {
+
+static bool ValidateTlsFlags(const char* /*flag_name*/, const string& /*flag_value*/) {
+  bool has_cert = !FLAGS_webserver_certificate_file.empty();
+  bool has_key = !FLAGS_webserver_private_key_file.empty();
+  bool has_passwd = !FLAGS_webserver_private_key_password_cmd.empty();
+
+  if (has_key != has_cert) {
+    LOG(ERROR) << "--webserver_certificate_file and --webserver_private_key_file "
+                  "must be set as a group";
+    return false;
+  }
+  if (has_passwd && !has_key) {
+    LOG(ERROR) << "--webserver_private_key_password_cmd may not be set without "
+                  "--webserver_private_key_file";
+    return false;
+  }
+
+  return true;
+}
+DEFINE_validator(webserver_private_key_file, &ValidateTlsFlags);
 
 // Returns KUDU_HOME if set, otherwise we won't serve any static files.
 static string GetDefaultDocumentRoot() {
@@ -84,6 +117,8 @@ WebserverOptions::WebserverOptions()
     doc_root(FLAGS_webserver_doc_root),
     enable_doc_root(FLAGS_webserver_enable_doc_root),
     certificate_file(FLAGS_webserver_certificate_file),
+    private_key_file(FLAGS_webserver_private_key_file),
+    private_key_password_cmd(FLAGS_webserver_private_key_password_cmd),
     authentication_domain(FLAGS_webserver_authentication_domain),
     password_file(FLAGS_webserver_password_file),
     num_worker_threads(FLAGS_webserver_num_worker_threads) {

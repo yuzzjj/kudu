@@ -71,25 +71,34 @@ string DuplicatingRowSet::ToString() const {
 
 Status DuplicatingRowSet::NewRowIterator(const Schema *projection,
                                          const MvccSnapshot &snap,
+                                         OrderMode order,
                                          gscoped_ptr<RowwiseIterator>* out) const {
   // Use the original rowset.
   if (old_rowsets_.size() == 1) {
-    return old_rowsets_[0]->NewRowIterator(projection, snap, out);
-  } else {
-    // Union between them
-
-    vector<shared_ptr<RowwiseIterator> > iters;
-    for (const shared_ptr<RowSet> &rowset : old_rowsets_) {
-      gscoped_ptr<RowwiseIterator> iter;
-      RETURN_NOT_OK_PREPEND(rowset->NewRowIterator(projection, snap, &iter),
-                            Substitute("Could not create iterator for rowset $0",
-                                       rowset->ToString()));
-      iters.push_back(shared_ptr<RowwiseIterator>(iter.release()));
-    }
-
-    out->reset(new UnionIterator(iters));
-    return Status::OK();
+    return old_rowsets_[0]->NewRowIterator(projection, snap, order, out);
   }
+  // Union or merge between them
+
+  vector<shared_ptr<RowwiseIterator> > iters;
+  for (const shared_ptr<RowSet> &rowset : old_rowsets_) {
+    gscoped_ptr<RowwiseIterator> iter;
+    RETURN_NOT_OK_PREPEND(rowset->NewRowIterator(projection, snap, order, &iter),
+                          Substitute("Could not create iterator for rowset $0",
+                                     rowset->ToString()));
+    iters.push_back(shared_ptr<RowwiseIterator>(iter.release()));
+  }
+
+  switch (order) {
+    case ORDERED:
+      out->reset(new MergeIterator(*projection, std::move(iters)));
+      break;
+    case UNORDERED:
+      out->reset(new UnionIterator(std::move(iters)));
+      break;
+    default:
+      LOG(FATAL) << "unknown order: " << order;
+  }
+  return Status::OK();
 }
 
 Status DuplicatingRowSet::NewCompactionInput(const Schema* projection,
@@ -186,13 +195,13 @@ Status DuplicatingRowSet::CountRows(rowid_t *count) const {
   return Status::OK();
 }
 
-Status DuplicatingRowSet::GetBounds(Slice *min_encoded_key,
-                                    Slice *max_encoded_key) const {
+Status DuplicatingRowSet::GetBounds(string* min_encoded_key,
+                                    string* max_encoded_key) const {
   // The range out of the output rowset always spans the full range
   // of the input rowsets, since no new rows can be inserted.
   // The output rowsets are in ascending order, so their total range
   // spans the range [front().min, back().max].
-  Slice junk;
+  string junk;
   RETURN_NOT_OK(new_rowsets_.front()->GetBounds(min_encoded_key, &junk));
   RETURN_NOT_OK(new_rowsets_.back()->GetBounds(&junk, max_encoded_key));
   return Status::OK();

@@ -18,55 +18,36 @@
 // under the License.
 //
 
-#include "kudu/util/alignment.h"
-#include "kudu/util/flag_tags.h"
 #include "kudu/util/memory/memory.h"
-#include "kudu/util/mem_tracker.h"
 
-#include <gflags/gflags.h>
 #include <string.h>
 
 #include <algorithm>
-using std::copy;
-using std::max;
-using std::min;
-using std::reverse;
-using std::sort;
-using std::swap;
 #include <cstdlib>
 
+#include <gflags/gflags.h>
+
+#include "kudu/util/alignment.h"
+#include "kudu/util/flag_tags.h"
+#include "kudu/util/memory/overwrite.h"
+#include "kudu/util/mem_tracker.h"
+
+using std::copy;
+using std::min;
+
+// TODO(onufry) - test whether the code still tests OK if we set this to true,
+// or remove this code and add a test that Google allocator does not change it's
+// contract - 16-aligned in -c opt and %16 == 8 in debug.
+DEFINE_bool(allocator_aligned_mode, false,
+            "Use 16-byte alignment instead of 8-byte, "
+            "unless explicitly specified otherwise - to boost SIMD");
+TAG_FLAG(allocator_aligned_mode, hidden);
 
 namespace kudu {
 
 namespace {
 static char dummy_buffer[0] = {};
 }
-
-// This function is micro-optimized a bit, since it helps debug
-// mode tests run much faster.
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC push_options
-#pragma GCC optimize("-O3")
-#endif
-void OverwriteWithPattern(char* p, size_t len, StringPiece pattern) {
-  size_t pat_len = pattern.size();
-  CHECK_LT(0, pat_len);
-  size_t rem = len;
-  const char *pat_ptr = pattern.data();
-
-  while (rem >= pat_len) {
-    memcpy(p, pat_ptr, pat_len);
-    p += pat_len;
-    rem -= pat_len;
-  }
-
-  while (rem-- > 0) {
-    *p++ = *pat_ptr++;
-  }
-}
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC pop_options
-#endif
 
 Buffer::~Buffer() {
 #if !defined(NDEBUG) && !defined(ADDRESS_SANITIZER)
@@ -100,14 +81,6 @@ void BufferAllocator::LogAllocation(size_t requested,
                  << ", and actually allocated: " << buffer->size();
   }
 }
-
-// TODO(onufry) - test whether the code still tests OK if we set this to true,
-// or remove this code and add a test that Google allocator does not change it's
-// contract - 16-aligned in -c opt and %16 == 8 in debug.
-DEFINE_bool(allocator_aligned_mode, false,
-            "Use 16-byte alignment instead of 8-byte, "
-            "unless explicitly specified otherwise - to boost SIMD");
-TAG_FLAG(allocator_aligned_mode, hidden);
 
 HeapBufferAllocator::HeapBufferAllocator()
   : aligned_mode_(FLAGS_allocator_aligned_mode) {

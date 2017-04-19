@@ -18,7 +18,10 @@
 #ifndef KUDU_TABLET_TABLET_MM_OPS_H_
 #define KUDU_TABLET_TABLET_MM_OPS_H_
 
-#include "kudu/tablet/maintenance_manager.h"
+#include <string>
+
+#include "kudu/util/locks.h"
+#include "kudu/util/maintenance_manager.h"
 
 namespace kudu {
 
@@ -28,6 +31,17 @@ class AtomicGauge;
 
 namespace tablet {
 
+class Tablet;
+
+class TabletOpBase : public MaintenanceOp {
+ public:
+  TabletOpBase(std::string name, IOUsage io_usage, Tablet* tablet);
+  std::string LogPrefix() const;
+
+ protected:
+  Tablet* const tablet_;
+};
+
 // MaintenanceOp for rowset compaction.
 //
 // This periodically invokes the tablet's CompactionPolicy to select a compaction.  The
@@ -35,7 +49,7 @@ namespace tablet {
 // is exposed back to the maintenance manager. As compactions become more fruitful (i.e.
 // more overlapping rowsets), the perf_improvement score goes up, increasing priority
 // with which a compaction on this tablet will be selected by the maintenance manager.
-class CompactRowSetsOp : public MaintenanceOp {
+class CompactRowSetsOp : public TabletOpBase {
  public:
   explicit CompactRowSetsOp(Tablet* tablet);
 
@@ -54,7 +68,6 @@ class CompactRowSetsOp : public MaintenanceOp {
   MaintenanceOpStats prev_stats_;
   uint64_t last_num_mrs_flushed_;
   uint64_t last_num_rs_compacted_;
-  Tablet* const tablet_;
 };
 
 // MaintenanceOp to run minor compaction on delta stores.
@@ -62,7 +75,7 @@ class CompactRowSetsOp : public MaintenanceOp {
 // There is only one MinorDeltaCompactionOp per tablet, so it picks the RowSet that needs the most
 // work. The RS we end up compacting in Perform() can be different than the one reported in
 // UpdateStats, we just pick the worst each time.
-class MinorDeltaCompactionOp : public MaintenanceOp {
+class MinorDeltaCompactionOp : public TabletOpBase {
  public:
   explicit MinorDeltaCompactionOp(Tablet* tablet);
 
@@ -83,13 +96,12 @@ class MinorDeltaCompactionOp : public MaintenanceOp {
   uint64_t last_num_dms_flushed_;
   uint64_t last_num_rs_compacted_;
   uint64_t last_num_rs_minor_delta_compacted_;
-  Tablet* const tablet_;
 };
 
 // MaintenanceOp to run major compaction on delta stores.
 //
 // It functions just like MinorDeltaCompactionOp does, except it runs major compactions.
-class MajorDeltaCompactionOp : public MaintenanceOp {
+class MajorDeltaCompactionOp : public TabletOpBase {
  public:
   explicit MajorDeltaCompactionOp(Tablet* tablet);
 
@@ -111,8 +123,37 @@ class MajorDeltaCompactionOp : public MaintenanceOp {
   uint64_t last_num_rs_compacted_;
   uint64_t last_num_rs_minor_delta_compacted_;
   uint64_t last_num_rs_major_delta_compacted_;
-  Tablet* const tablet_;
 };
+
+// MaintenanceOp to garbage-collect undo delta blocks that are older than the
+// ancient history mark.
+class UndoDeltaBlockGCOp : public TabletOpBase {
+ public:
+  explicit UndoDeltaBlockGCOp(Tablet* tablet);
+
+  // Estimates the number of bytes that may potentially be in ancient delta
+  // undo blocks. Over time, as Perform() is invoked, this estimate gets more
+  // accurate.
+  void UpdateStats(MaintenanceOpStats* stats) override;
+
+  bool Prepare() override;
+
+  // Deletes ancient history data from disk. This also initializes undo delta
+  // blocks greedily (in a budgeted manner controlled by the
+  // --undo_delta_block_gc_init_budget_millis gflag) that makes the estimate
+  // performed in UpdateStats() more accurate.
+  void Perform() override;
+
+  scoped_refptr<Histogram> DurationHistogram() const override;
+
+  scoped_refptr<AtomicGauge<uint32_t> > RunningGauge() const override;
+
+ private:
+  std::string LogPrefix() const;
+
+  DISALLOW_COPY_AND_ASSIGN(UndoDeltaBlockGCOp);
+};
+
 
 } // namespace tablet
 } // namespace kudu

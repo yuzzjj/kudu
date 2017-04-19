@@ -25,7 +25,6 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/strings/util.h"
 #include "kudu/util/env.h"
-#include "kudu/util/memenv/memenv.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/test_util.h"
 
@@ -69,7 +68,7 @@ class RollingLogTest : public KuduTest {
 
 // Test with compression off.
 TEST_F(RollingLogTest, TestLog) {
-  RollingLog log(env_.get(), log_dir_, "mylog");
+  RollingLog log(env_, log_dir_, "mylog");
   log.SetCompressionEnabled(false);
   log.SetSizeLimitBytes(100);
 
@@ -88,7 +87,7 @@ TEST_F(RollingLogTest, TestLog) {
 
   faststring data;
   string path = JoinPathSegments(log_dir_, children[0]);
-  ASSERT_OK(ReadFileToString(env_.get(), path, &data));
+  ASSERT_OK(ReadFileToString(env_, path, &data));
   ASSERT_TRUE(HasPrefixString(data.ToString(), "Hello world\n"))
     << "Data missing";
   ASSERT_LE(data.size(), 100) << "Size limit not respected";
@@ -96,7 +95,7 @@ TEST_F(RollingLogTest, TestLog) {
 
 // Test with compression on.
 TEST_F(RollingLogTest, TestCompression) {
-  RollingLog log(env_.get(), log_dir_, "mylog");
+  RollingLog log(env_, log_dir_, "mylog");
   ASSERT_OK(log.Open());
 
   StringPiece data = "Hello world\n";

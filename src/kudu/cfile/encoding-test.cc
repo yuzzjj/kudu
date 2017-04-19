@@ -15,17 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <boost/ptr_container/ptr_vector.hpp>
-#include <boost/utility/binary.hpp>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
-#include <stdlib.h>
+#include <memory>
 #include <limits>
+#include <stdlib.h>
+#include <vector>
 
 #include "kudu/cfile/block_encodings.h"
 #include "kudu/cfile/bshuf_block.h"
 #include "kudu/cfile/cfile_writer.h"
-#include "kudu/cfile/gvint_block.h"
 #include "kudu/cfile/plain_bitmap_block.h"
 #include "kudu/cfile/plain_block.h"
 #include "kudu/cfile/rle_block.h"
@@ -37,22 +36,27 @@
 #include "kudu/util/group_varint-inl.h"
 #include "kudu/util/hexdump.h"
 #include "kudu/util/memory/arena.h"
-#include "kudu/util/test_macros.h"
+#include "kudu/util/random.h"
 #include "kudu/util/stopwatch.h"
+#include "kudu/util/test_macros.h"
+#include "kudu/util/test_util.h"
 
-namespace kudu { namespace cfile {
+using std::unique_ptr;
+using std::vector;
 
-extern void DumpSSETable();
+namespace kudu {
 
-class TestEncoding : public ::testing::Test {
+namespace cfile {
+
+class TestEncoding : public KuduTest {
  public:
   TestEncoding()
-    : ::testing::Test(),
-      arena_(1024, 1024*1024) {
+    : arena_(1024, 1024*1024) {
   }
 
  protected:
   virtual void SetUp() OVERRIDE {
+    KuduTest::SetUp();
     arena_.Reset();
   }
 
@@ -72,15 +76,12 @@ class TestEncoding : public ::testing::Test {
   static Slice CreateBinaryBlock(BuilderType *sbb,
                                  int num_items,
                                  const char *fmt_str) {
-    boost::ptr_vector<string> to_insert;
+    vector<unique_ptr<string>> to_insert;
     std::vector<Slice> slices;
-
     for (uint i = 0; i < num_items; i++) {
-      string *val = new string(StringPrintf(fmt_str, i));
-      to_insert.push_back(val);
-      slices.push_back(Slice(*val));
+      to_insert.emplace_back(new string(StringPrintf(fmt_str, i)));
+      slices.push_back(Slice(to_insert.back()->data()));
     }
-
 
     int rem = slices.size();
     Slice *ptr = &slices[0];
@@ -245,6 +246,13 @@ class TestEncoding : public ::testing::Test {
     // the slice should take at least a few bytes per entry
     ASSERT_GT(s.size(), kCount * 2u);
 
+    // Check first/last keys
+    Slice key;
+    ASSERT_OK(sbb.GetFirstKey(&key));
+    ASSERT_EQ("hello 0", key);
+    ASSERT_OK(sbb.GetLastKey(&key));
+    ASSERT_EQ(StringPrintf("hello %d", kCount - 1), key);
+
     DecoderType sbd(s);
     ASSERT_OK(sbd.ParseHeader());
     ASSERT_EQ(kCount, sbd.Count());
@@ -289,17 +297,20 @@ class TestEncoding : public ::testing::Test {
     // TODO : handle and verify seeking inside a run for testing RLE
     typedef typename TypeTraits<IntType>::cpp_type CppType;
 
-    const CppType kBase = 6;
+    const CppType kBase =
+        std::numeric_limits<CppType>::is_signed ? -6 : 6;
 
     CppType data[num_ints];
     for (CppType i = 0; i < num_ints; i++) {
       data[i] = kBase + i * 2;
     }
+    const CppType max_seek_target = data[num_ints - 1] + 1;
 
     CHECK_EQ(num_ints, ibb->Add(reinterpret_cast<uint8_t *>(&data[0]),
                                num_ints));
-
     Slice s = ibb->Finish(0);
+    LOG(INFO) << "Created " << TypeTraits<IntType>::name() << " block with " << num_ints << " ints"
+              << " (" << s.size() << " bytes)";
     BlockDecoderType ibd(s);
     ASSERT_OK(ibd.ParseHeader());
 
@@ -307,12 +318,16 @@ class TestEncoding : public ::testing::Test {
     LOG_TIMING(INFO, strings::Substitute("Seeking in $0 block", TypeTraits<IntType>::name())) {
       for (int i = 0; i < num_queries; i++) {
         bool exact = false;
-        CppType target = random() % (num_ints * 2 + kBase);
+        // Seek to a random value which falls between data[0] and max_seek_target
+        CppType target = kBase + random() % (max_seek_target - kBase);
         Status s = ibd.SeekAtOrAfterValue(&target, &exact);
         if (verify) {
           SCOPED_TRACE(target);
           if (s.IsNotFound()) {
-            ASSERT_EQ(kBase + num_ints * 2 - 1, target);
+            // If we didn't find a match 'at or after' the given value, then the
+            // only case that could happen is if we seeked to max_seek_target,
+            // which is larger than the largest int in the block.
+            ASSERT_EQ(max_seek_target, target);
             continue;
           }
           ASSERT_OK_FAST(s);
@@ -450,13 +465,35 @@ class TestEncoding : public ::testing::Test {
     srand(123);
 
     std::vector<CppType> to_insert;
+    Random rd(SeedRandom());
     for (int i = 0; i < 10003; i++) {
-      to_insert.push_back(random() % std::numeric_limits<CppType>::max());
+      int64_t val = rd.Next64() % std::numeric_limits<CppType>::max();
+
+      // For signed types, randomly use both negative and positive values.
+      if (std::numeric_limits<CppType>::is_signed && (random() % 2) == 1) {
+        val *= -1;
+      }
+      to_insert.push_back(val);
+
+      // Occasionally insert a run of 40 identical values to exercise
+      // RLE code paths.
+      if (random() % 100 == 1) {
+        for (int run = 0; run < 40; run++) {
+          to_insert.push_back(val);
+        }
+      }
     }
 
     ibb->Add(reinterpret_cast<const uint8_t *>(&to_insert[0]),
              to_insert.size());
     Slice s = ibb->Finish(kOrdinalPosBase);
+
+    // Check GetFirstKey() and GetLastKey().
+    CppType key;
+    ASSERT_OK(ibb->GetFirstKey(&key));
+    ASSERT_EQ(to_insert.front(), key);
+    ASSERT_OK(ibb->GetLastKey(&key));
+    ASSERT_EQ(to_insert.back(), key);
 
     DecoderType ibd(s);
     ASSERT_OK(ibd.ParseHeader());
@@ -504,14 +541,23 @@ class TestEncoding : public ::testing::Test {
       CopyOne<IntType>(&ibd, &ret);
       EXPECT_EQ(decoded[seek_off], ret);
     }
+
+    // Test Seek forward within block.
+    ibd.SeekToPositionInBlock(0);
+    int skip_step = 7;
+    EXPECT_EQ((uint32_t) 0, ibd.GetCurrentIndex());
+    for (uint32_t i = 0; i < decoded.size()/skip_step; i++) {
+      // Skip just before the end of the step.
+      int skip = skip_step-1;
+      ibd.SeekForward(&skip);
+      EXPECT_EQ((uint32_t) i*skip_step+skip, ibd.GetCurrentIndex());
+      CppType ret;
+      // CopyOne will move the decoder forward by one.
+      CopyOne<IntType>(&ibd, &ret);
+      EXPECT_EQ(decoded[i*skip_step + skip], ret);
+    }
   }
 
-  template <DataType IntType>
-  void TestRleIntBlockRoundTrip() {
-    gscoped_ptr<RleIntBlockBuilder<IntType> > ibb(new RleIntBlockBuilder<IntType>());
-    TestIntBlockRoundTrip<RleIntBlockBuilder<IntType>, RleIntBlockDecoder<IntType>, IntType>(
-        ibb.get());
-  }
 
   // Test encoding and decoding BOOL datatypes
   template <class BuilderType, class DecoderType>
@@ -530,7 +576,8 @@ class TestEncoding : public ::testing::Test {
       i += run_size;
     }
 
-    BuilderType bb;
+    unique_ptr<WriterOptions> opts(NewWriterOptions());
+    BuilderType bb(opts.get());
     bb.Add(reinterpret_cast<const uint8_t *>(&to_insert[0]),
            to_insert.size());
     Slice s = bb.Finish(kOrdinalPosBase);
@@ -636,29 +683,9 @@ TEST_F(TestEncoding, TestBShufDoubleBlockEncoder) {
                                     BShufBlockDecoder<DOUBLE> >(doubles.get(), kSize);
 }
 
-TEST_F(TestEncoding, TestIntBlockEncoder) {
-  gscoped_ptr<WriterOptions> opts(NewWriterOptions());
-  GVIntBlockBuilder ibb(opts.get());
-
-  auto ints = new int[10000];
-  for (int i = 0; i < 10000; i++) {
-    ints[i] = random();
-  }
-  ibb.Add(reinterpret_cast<const uint8_t *>(ints), 10000);
-  delete[] ints;
-
-  Slice s = ibb.Finish(12345);
-  LOG(INFO) << "Encoded size for 10k ints: " << s.size();
-
-  // Test empty case -- should be 5 bytes for just the
-  // header word (all zeros)
-  ibb.Reset();
-  s = ibb.Finish(0);
-  ASSERT_EQ(5UL, s.size());
-}
-
 TEST_F(TestEncoding, TestRleIntBlockEncoder) {
-  RleIntBlockBuilder<UINT32> ibb;
+  unique_ptr<WriterOptions> opts(NewWriterOptions());
+  RleIntBlockBuilder<UINT32> ibb(opts.get());
   gscoped_ptr<int[]> ints(new int[10000]);
   for (int i = 0; i < 10000; i++) {
     ints[i] = random();
@@ -684,28 +711,6 @@ TEST_F(TestEncoding, TestPlainBitMapRoundTrip) {
 
 TEST_F(TestEncoding, TestRleBitMapRoundTrip) {
   TestBoolBlockRoundTrip<RleBitMapBlockBuilder, RleBitMapBlockDecoder>();
-}
-
-TEST_F(TestEncoding, TestGVIntBlockRoundTrip) {
-  gscoped_ptr<WriterOptions> opts(NewWriterOptions());
-  gscoped_ptr<GVIntBlockBuilder> ibb(new GVIntBlockBuilder(opts.get()));
-  TestIntBlockRoundTrip<GVIntBlockBuilder, GVIntBlockDecoder, UINT32>(ibb.get());
-}
-
-TEST_F(TestEncoding, TestRleIntBlockRoundTripAllTypes) {
-  LOG(INFO) << "Testing all integer types with RLE block encoding";
-
-  TestRleIntBlockRoundTrip<UINT8>();
-  TestRleIntBlockRoundTrip<INT8>();
-  TestRleIntBlockRoundTrip<UINT16>();
-  TestRleIntBlockRoundTrip<INT16>();
-  TestRleIntBlockRoundTrip<UINT32>();
-  TestRleIntBlockRoundTrip<INT32>();
-}
-
-
-TEST_F(TestEncoding, TestGVIntEmptyBlockEncodeDecode) {
-  TestEmptyBlockEncodeDecode<GVIntBlockBuilder, GVIntBlockDecoder>();
 }
 
 // Test seeking to a value in a small block.
@@ -755,29 +760,6 @@ TEST_F(TestEncoding, TestBinaryPlainBlockBuilderTruncation) {
 TEST_F(TestEncoding, TestBinaryPrefixBlockBuilderTruncation) {
   TestBinaryBlockTruncation<BinaryPrefixBlockBuilder, BinaryPrefixBlockDecoder>();
 }
-
-#ifdef NDEBUG
-TEST_F(TestEncoding, GVIntSeekBenchmark) {
-  gscoped_ptr<WriterOptions> opts(NewWriterOptions());
-  gscoped_ptr<GVIntBlockBuilder> ibb(new GVIntBlockBuilder(opts.get()));
-  DoSeekTest<GVIntBlockBuilder, GVIntBlockDecoder, UINT32>(ibb.get(), 32768, 100000, false);
-}
-#endif
-
-TEST_F(TestEncoding, GVIntSeekTest) {
-  gscoped_ptr<WriterOptions> opts(NewWriterOptions());
-  gscoped_ptr<GVIntBlockBuilder> ibb(new GVIntBlockBuilder(opts.get()));
-  DoSeekTest<GVIntBlockBuilder, GVIntBlockDecoder, UINT32>(ibb.get(), 64, 1000, true);
-}
-
-TEST_F(TestEncoding, GVIntSeekTestTinyBlock) {
-  gscoped_ptr<WriterOptions> opts(NewWriterOptions());
-  for (int block_size = 1; block_size < 16; block_size++) {
-    gscoped_ptr<GVIntBlockBuilder> ibb(new GVIntBlockBuilder(opts.get()));
-    DoSeekTest<GVIntBlockBuilder, GVIntBlockDecoder, UINT32>(ibb.get(), block_size, 1000, true);
-  }
-}
-
 
 // We have several different encodings for INT blocks.
 // The following tests use GTest's TypedTest functionality to run the tests
@@ -843,12 +825,14 @@ class IntEncodingTest : public TestEncoding {
 
 
 TYPED_TEST(IntEncodingTest, TestSeekAllTypes) {
-  this->template DoIntSeekTest<UINT8>(32, 1000, true);
-  this->template DoIntSeekTest<INT8>(32, 1000, true);
-  this->template DoIntSeekTest<UINT16>(64, 1000, true);
-  this->template DoIntSeekTest<INT16>(64, 1000, true);
-  this->template DoIntSeekTest<UINT32>(64, 1000, true);
-  this->template DoIntSeekTest<INT32>(64, 1000, true);
+  this->template DoIntSeekTest<UINT8>(100, 1000, true);
+  this->template DoIntSeekTest<INT8>(100, 1000, true);
+  this->template DoIntSeekTest<UINT16>(10000, 1000, true);
+  this->template DoIntSeekTest<INT16>(10000, 1000, true);
+  this->template DoIntSeekTest<UINT32>(10000, 1000, true);
+  this->template DoIntSeekTest<INT32>(10000, 1000, true);
+  this->template DoIntSeekTest<UINT64>(10000, 1000, true);
+  this->template DoIntSeekTest<INT64>(10000, 1000, true);
 }
 
 TYPED_TEST(IntEncodingTest, IntSeekTestTinyBlockAllTypes) {
@@ -858,6 +842,8 @@ TYPED_TEST(IntEncodingTest, IntSeekTestTinyBlockAllTypes) {
   this->template DoIntSeekTestTinyBlock<INT16>();
   this->template DoIntSeekTestTinyBlock<UINT32>();
   this->template DoIntSeekTestTinyBlock<INT32>();
+  this->template DoIntSeekTestTinyBlock<UINT64>();
+  this->template DoIntSeekTestTinyBlock<INT64>();
 }
 
 TYPED_TEST(IntEncodingTest, TestRoundTrip) {
@@ -867,6 +853,8 @@ TYPED_TEST(IntEncodingTest, TestRoundTrip) {
   this->template DoIntRoundTripTest<INT16>();
   this->template DoIntRoundTripTest<UINT32>();
   this->template DoIntRoundTripTest<INT32>();
+  this->template DoIntRoundTripTest<UINT64>();
+  this->template DoIntRoundTripTest<INT64>();
 }
 
 #ifdef NDEBUG

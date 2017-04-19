@@ -30,7 +30,11 @@ set(LINK_LIBS
 )
 
 add_library(kudu_tools_util
-  data_gen_util.cc)
+  color.cc
+  data_gen_util.cc
+  tool_action.cc
+  tool_action_common.cc
+)
 target_link_libraries(kudu_tools_util
   ${LINK_LIBS})
 
@@ -38,42 +42,13 @@ add_executable(create-demo-table create-demo-table.cc)
 target_link_libraries(create-demo-table
   ${LINK_LIBS})
 
-add_executable(insert-generated-rows insert-generated-rows.cc)
-target_link_libraries(insert-generated-rows
-  kudu_tools_util
-  ${LINK_LIBS})
-
-add_executable(kudu-admin kudu-admin.cc)
-target_link_libraries(kudu-admin
-  ${LINK_LIBS})
-
-add_executable(kudu-ts-cli ts-cli.cc)
-target_link_libraries(kudu-ts-cli
-  ${LINK_LIBS})
-
-add_library(fs_tool fs_tool.cc)
-target_link_libraries(fs_tool
-  gutil
-  kudu_common
-  server_common
-  consensus
-  tablet)
-
-add_executable(kudu-fs_list fs_list-tool.cc)
-target_link_libraries(kudu-fs_list
-  ${LINK_LIBS}
-  fs_tool)
-
-add_executable(kudu-fs_dump fs_dump-tool.cc)
-target_link_libraries(kudu-fs_dump
-  ${LINK_LIBS}
-  fs_tool)
-
 add_library(ksck
     ksck.cc
     ksck_remote.cc
 )
 target_link_libraries(ksck
+  consensus
+  kudu_tools_util
   master_proto
   server_base_proto
   tserver_proto
@@ -81,27 +56,60 @@ target_link_libraries(ksck
   ${KUDU_BASE_LIBS}
 )
 
-add_executable(kudu-ksck kudu-ksck.cc)
-target_link_libraries(kudu-ksck
+add_executable(kudu
+  tool_action_cluster.cc
+  tool_action_fs.cc
+  tool_action_local_replica.cc
+  tool_action_master.cc
+  tool_action_pbc.cc
+  tool_action_remote_replica.cc
+  tool_action_table.cc
+  tool_action_tablet.cc
+  tool_action_test.cc
+  tool_action_tserver.cc
+  tool_action_wal.cc
+  tool_main.cc
+)
+target_link_libraries(kudu
+  ${KRB5_REALM_OVERRIDE}
+  consensus
+  gutil
+  krpc
   ksck
+  kudu_client
+  kudu_common
+  kudu_fs
+  kudu_util
+  log
+  master
+  server_common
+  tablet
+  tserver
+  ${KUDU_BASE_LIBS}
 )
 
-add_executable(kudu-pbc-dump pbc-dump.cc)
-target_link_libraries(kudu-pbc-dump
-  ${LINK_LIBS}
+add_library(kudu_tools_test_util
+  tool_test_util.cc
+)
+target_link_libraries(kudu_tools_test_util
+  kudu_util
 )
 
 set(KUDU_TEST_LINK_LIBS
   ksck
   kudu_tools_util
+  kudu_tools_test_util
   integration-tests
   ${KUDU_MIN_TEST_LIBS})
 ADD_KUDU_TEST(ksck-test)
-ADD_KUDU_TEST(ksck_remote-test)
+ADD_KUDU_TEST(ksck_remote-test RESOURCE_LOCK "master-rpc-ports")
 ADD_KUDU_TEST(kudu-admin-test)
 ADD_KUDU_TEST_DEPENDENCIES(kudu-admin-test
-  kudu-admin)
+  kudu)
+ADD_KUDU_TEST(kudu-tool-test)
+ADD_KUDU_TEST_DEPENDENCIES(kudu-tool-test
+  kudu)
 ADD_KUDU_TEST(kudu-ts-cli-test)
 ADD_KUDU_TEST_DEPENDENCIES(kudu-ts-cli-test
-  kudu-ts-cli)
-
+  kudu)
+ADD_KUDU_TEST(tool_action-test)

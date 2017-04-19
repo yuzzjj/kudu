@@ -17,12 +17,22 @@
 
 #include "kudu/rpc/constants.h"
 
+using std::set;
+
 namespace kudu {
 namespace rpc {
 
 const char* const kMagicNumber = "hrpc";
-const char* const kSaslAppName = "Kudu";
+const char* const kSaslAppName = "kudu";
 const char* const kSaslProtoName = "kudu";
+
+// NOTE: the TLS flag is dynamically added based on the local encryption
+// configuration.
+//
+// NOTE: the TLS_AUTHENTICATION_ONLY flag is dynamically added on both
+// sides based on the remote peer's address.
+set<RpcFeatureFlag> kSupportedServerRpcFeatureFlags = { APPLICATION_FEATURE_FLAGS };
+set<RpcFeatureFlag> kSupportedClientRpcFeatureFlags = { APPLICATION_FEATURE_FLAGS };
 
 } // namespace rpc
 } // namespace kudu

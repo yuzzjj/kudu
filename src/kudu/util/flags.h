@@ -17,9 +17,17 @@
 #ifndef KUDU_UTIL_FLAGS_H
 #define KUDU_UTIL_FLAGS_H
 
+#include <gflags/gflags.h>
+#include <string>
+#include <unordered_map>
+
 #include "kudu/gutil/macros.h"
 
 namespace kudu {
+
+// The umask of the process, set based on the --umask flag during
+// HandleCommonFlags().
+extern uint32_t g_parsed_umask;
 
 // Looks for flags in argv and parses them.  Rearranges argv to put
 // flags first, or removes them entirely if remove_flags is true.
@@ -34,6 +42,33 @@ namespace kudu {
 //
 // See gflags.h for more information.
 int ParseCommandLineFlags(int* argc, char*** argv, bool remove_flags);
+
+// Handle common flags such as -version, -disable_core_dumps, etc.
+// This includes the GFlags common flags such as "-help".
+//
+// Requires that flags have already been parsed using
+// google::ParseCommandLineNonHelpFlags().
+void HandleCommonFlags();
+
+enum class EscapeMode {
+  HTML,
+  NONE
+};
+
+// Stick the flags into a string. If --redact is set with 'flag',
+// the values of flags tagged as sensitive will be redacted. Otherwise,
+// the values will be written to the string as-is. The values will
+// be HTML escaped if EscapeMode is HTML.
+std::string CommandlineFlagsIntoString(EscapeMode mode);
+
+typedef std::unordered_map<std::string, google::CommandLineFlagInfo> GFlagsMap;
+
+// Get all the flags different from their defaults. The output is a nicely
+// formatted string with --flag=value pairs per line. Redact any flags that
+// are tagged as sensitive, if --redact is set with 'flag'.
+std::string GetNonDefaultFlags(const GFlagsMap& default_flags);
+
+GFlagsMap GetFlagsMap();
 
 } // namespace kudu
 #endif /* KUDU_UTIL_FLAGS_H */

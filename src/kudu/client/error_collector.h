@@ -28,6 +28,7 @@
 namespace kudu {
 namespace client {
 
+class ClientUnitTest_TestErrorCollector_Test;
 class KuduError;
 class KuduInsert;
 
@@ -35,22 +36,33 @@ namespace internal {
 
 class ErrorCollector : public RefCountedThreadSafe<ErrorCollector> {
  public:
+  static const size_t kMemSizeNoLimit = 0;
+
   ErrorCollector();
 
-  void AddError(gscoped_ptr<KuduError> error);
+  // See KuduSession::SetErrorBufferSpace() for details.
+  Status SetMaxMemSize(size_t size_bytes);
+
+  virtual void AddError(gscoped_ptr<KuduError> error);
 
   // See KuduSession for details.
-  int CountErrors() const;
+  size_t CountErrors() const;
 
   // See KuduSession for details.
   void GetErrors(std::vector<KuduError*>* errors, bool* overflowed);
 
- private:
-  friend class RefCountedThreadSafe<ErrorCollector>;
+ protected:
   virtual ~ErrorCollector();
+
+ private:
+  friend class ::kudu::client::ClientUnitTest_TestErrorCollector_Test;
+  friend class RefCountedThreadSafe<ErrorCollector>;
 
   mutable simple_spinlock lock_;
   std::vector<KuduError*> errors_;
+  size_t max_mem_size_bytes_;
+  size_t mem_size_bytes_;
+  size_t dropped_errors_cnt_;
 
   DISALLOW_COPY_AND_ASSIGN(ErrorCollector);
 };

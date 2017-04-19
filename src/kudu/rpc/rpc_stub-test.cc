@@ -15,19 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <atomic>
+#include <memory>
+#include <thread>
 #include <vector>
 
+#include <glog/logging.h>
+#include <glog/stl_logging.h>
 #include <gtest/gtest.h>
 #include <boost/bind.hpp>
-#include <boost/ptr_container/ptr_vector.hpp>
 
 #include "kudu/gutil/stl_util.h"
 #include "kudu/rpc/rpc_introspection.pb.h"
+#include "kudu/rpc/rpcz_store.h"
 #include "kudu/rpc/rtest.proxy.h"
 #include "kudu/rpc/rtest.service.h"
 #include "kudu/rpc/rpc-test-base.h"
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/pb_util.h"
 #include "kudu/util/subprocess.h"
 #include "kudu/util/test_util.h"
 #include "kudu/util/user.h"
@@ -35,8 +41,8 @@
 DEFINE_bool(is_panic_test_child, false, "Used by TestRpcPanic");
 DECLARE_bool(socket_inject_short_recvs);
 
-using boost::ptr_vector;
 using std::shared_ptr;
+using std::unique_ptr;
 using std::vector;
 
 namespace kudu {
@@ -46,6 +52,9 @@ class RpcStubTest : public RpcTestBase {
  public:
   virtual void SetUp() OVERRIDE {
     RpcTestBase::SetUp();
+    // Use a shorter queue length since some tests below need to start enough
+    // threads to saturate the queue.
+    service_queue_length_ = 10;
     StartTestServerWithGeneratedCode(&server_addr_);
     client_messenger_ = CreateMessenger("Client");
   }
@@ -98,24 +107,22 @@ TEST_F(RpcStubTest, TestBigCallData) {
   EchoRequestPB req;
   req.set_data(data);
 
-  ptr_vector<EchoResponsePB> resps;
-  ptr_vector<RpcController> controllers;
+  vector<unique_ptr<EchoResponsePB>> resps;
+  vector<unique_ptr<RpcController>> controllers;
 
   CountDownLatch latch(kNumSentAtOnce);
   for (int i = 0; i < kNumSentAtOnce; i++) {
-    auto resp = new EchoResponsePB;
-    resps.push_back(resp);
-    auto controller = new RpcController;
-    controllers.push_back(controller);
+    resps.emplace_back(new EchoResponsePB);
+    controllers.emplace_back(new RpcController);
 
-    p.EchoAsync(req, resp, controller,
+    p.EchoAsync(req, resps.back().get(), controllers.back().get(),
                 boost::bind(&CountDownLatch::CountDown, boost::ref(latch)));
   }
 
   latch.Wait();
 
-  for (RpcController &c : controllers) {
-    ASSERT_OK(c.status());
+  for (const auto& c : controllers) {
+    ASSERT_OK(c->status());
   }
 }
 
@@ -162,6 +169,52 @@ TEST_F(RpcStubTest, TestCustomCredentialsPropagated) {
   ASSERT_FALSE(resp.credentials().has_effective_user());
 }
 
+TEST_F(RpcStubTest, TestAuthorization) {
+  // First test calling WhoAmI() as user "alice", who is disallowed.
+  {
+    CalculatorServiceProxy p(client_messenger_, server_addr_);
+    UserCredentials creds;
+    creds.set_real_user("alice");
+    p.set_user_credentials(creds);
+
+    // Alice is disallowed by all RPCs.
+    RpcController controller;
+    WhoAmIRequestPB req;
+    WhoAmIResponsePB resp;
+    Status s = p.WhoAmI(req, &resp, &controller);
+    ASSERT_FALSE(s.ok());
+    ASSERT_EQ(s.ToString(),
+              "Remote error: Not authorized: alice is not allowed to call this method");
+  }
+
+  // Try some calls as "bob".
+  {
+    CalculatorServiceProxy p(client_messenger_, server_addr_);
+    UserCredentials creds;
+    creds.set_real_user("bob");
+    p.set_user_credentials(creds);
+
+    // "bob" is allowed to call WhoAmI().
+    {
+      RpcController controller;
+      WhoAmIRequestPB req;
+      WhoAmIResponsePB resp;
+      ASSERT_OK(p.WhoAmI(req, &resp, &controller));
+    }
+
+    // "bob" is not allowed to call "Sleep".
+    {
+      RpcController controller;
+      SleepRequestPB req;
+      req.set_sleep_micros(10);
+      SleepResponsePB resp;
+      Status s = p.Sleep(req, &resp, &controller);
+      ASSERT_EQ(s.ToString(),
+                "Remote error: Not authorized: bob is not allowed to call this method");
+    }
+  }
+}
+
 // Test that the user's remote address is accessible to the server.
 TEST_F(RpcStubTest, TestRemoteAddress) {
   CalculatorServiceProxy p(client_messenger_, server_addr_);
@@ -190,8 +243,9 @@ TEST_F(RpcStubTest, TestCallWithInvalidParam) {
   Status s = p.SyncRequest("Add", req, &resp, &controller);
   ASSERT_TRUE(s.IsRemoteError()) << "Bad status: " << s.ToString();
   ASSERT_STR_CONTAINS(s.ToString(),
-                      "Invalid argument: Invalid parameter for call "
-                      "kudu.rpc_test.CalculatorService.Add: y");
+                      "Invalid argument: invalid parameter for call "
+                      "kudu.rpc_test.CalculatorService.Add: "
+                      "missing fields: y");
 }
 
 // Wrapper around AtomicIncrement, since AtomicIncrement returns the 'old'
@@ -219,7 +273,34 @@ TEST_F(RpcStubTest, TestCallWithMissingPBFieldClientSide) {
   SleepFor(MonoDelta::FromMicroseconds(100));
   ASSERT_EQ(1, NoBarrier_Load(&callback_count));
   ASSERT_STR_CONTAINS(controller.status().ToString(),
-                      "Invalid argument: RPC argument missing required fields: y");
+                      "Invalid argument: invalid parameter for call "
+                      "kudu.rpc_test.CalculatorService.Add: missing fields: y");
+}
+
+TEST_F(RpcStubTest, TestResponseWithMissingField) {
+  CalculatorServiceProxy p(client_messenger_, server_addr_);
+
+  RpcController rpc;
+  TestInvalidResponseRequestPB req;
+  TestInvalidResponseResponsePB resp;
+  req.set_error_type(rpc_test::TestInvalidResponseRequestPB_ErrorType_MISSING_REQUIRED_FIELD);
+  Status s = p.TestInvalidResponse(req, &resp, &rpc);
+  ASSERT_STR_CONTAINS(s.ToString(),
+                      "invalid RPC response, missing fields: response");
+}
+
+// Test case where the server responds with a message which is larger than the maximum
+// configured RPC message size. The server should send the response, but the client
+// will reject it.
+TEST_F(RpcStubTest, TestResponseLargerThanFrameSize) {
+  CalculatorServiceProxy p(client_messenger_, server_addr_);
+
+  RpcController rpc;
+  TestInvalidResponseRequestPB req;
+  TestInvalidResponseResponsePB resp;
+  req.set_error_type(rpc_test::TestInvalidResponseRequestPB_ErrorType_RESPONSE_TOO_LARGE);
+  Status s = p.TestInvalidResponse(req, &resp, &rpc);
+  ASSERT_STR_CONTAINS(s.ToString(), "Network error: RPC frame had a length of");
 }
 
 // Test sending a call which isn't implemented by the server.
@@ -245,7 +326,8 @@ TEST_F(RpcStubTest, TestApplicationError) {
   EXPECT_EQ("message: \"Got some error\"\n"
             "[kudu.rpc_test.CalculatorError.app_error_ext] {\n"
             "  extra_error_data: \"some application-specific error data\"\n"
-            "}\n", controller.error_response()->DebugString());
+            "}\n",
+            SecureDebugString(*controller.error_response()));
 }
 
 TEST_F(RpcStubTest, TestRpcPanic) {
@@ -293,7 +375,7 @@ TEST_F(RpcStubTest, TestRpcPanic) {
   } else {
     // Before forcing the panic, explicitly remove the test directory. This
     // should be safe; this test doesn't generate any data.
-    CHECK_OK(env_->DeleteRecursively(GetTestDataDirectory()));
+    CHECK_OK(env_->DeleteRecursively(test_dir_));
 
     // Make an RPC which causes the server to abort.
     CalculatorServiceProxy p(client_messenger_, server_addr_);
@@ -328,6 +410,16 @@ TEST_F(RpcStubTest, TestDontHandleTimedOutCalls) {
     sleeps.push_back(sleep.release());
   }
 
+  // We asynchronously sent the RPCs above, but the RPCs might still
+  // be in the queue. Because the RPC we send next has a lower timeout,
+  // it would take priority over the long-timeout RPCs. So, we have to
+  // wait until the above RPCs are being processed before we continue
+  // the test.
+  const Histogram* queue_time_metric = service_pool_->IncomingQueueTimeMetricForTests();
+  while (queue_time_metric->TotalCount() < n_worker_threads_) {
+    SleepFor(MonoDelta::FromMilliseconds(1));
+  }
+
   // Send another call with a short timeout. This shouldn't get processed, because
   // it'll get stuck in the queue for longer than its timeout.
   RpcController rpc;
@@ -347,6 +439,84 @@ TEST_F(RpcStubTest, TestDontHandleTimedOutCalls) {
   ASSERT_EQ(1, timed_out_in_queue->value());
 }
 
+// Test which ensures that the RPC queue accepts requests with the earliest
+// deadline first (EDF), and upon overflow rejects requests with the latest deadlines.
+//
+// In particular, this simulates a workload experienced with Impala where the local
+// impalad would spawn more scanner threads than the total number of handlers plus queue
+// slots, guaranteeing that some of those clients would see SERVER_TOO_BUSY rejections on
+// scan requests and be forced to back off and retry.  Without EDF scheduling, we saw that
+// the "unlucky" threads that got rejected would likely continue to get rejected upon
+// retries, and some would be starved continually until they missed their overall deadline
+// and failed the query.
+//
+// With EDF scheduling, the retries take priority over the original requests (because
+// they retain their original deadlines). This prevents starvation of unlucky threads.
+TEST_F(RpcStubTest, TestEarliestDeadlineFirstQueue) {
+  const int num_client_threads = service_queue_length_ + n_worker_threads_ + 5;
+  vector<std::thread> threads;
+  vector<int> successes(num_client_threads);
+  std::atomic<bool> done(false);
+  for (int thread_id = 0; thread_id < num_client_threads; thread_id++) {
+    threads.emplace_back([&, thread_id] {
+        Random rng(thread_id);
+        CalculatorServiceProxy p(client_messenger_, server_addr_);
+        while (!done.load()) {
+          // Set a deadline in the future. We'll keep using this same deadline
+          // on each of our retries.
+          MonoTime deadline = MonoTime::Now() + MonoDelta::FromSeconds(8);
+
+          for (int attempt = 1; !done.load(); attempt++) {
+            RpcController controller;
+            SleepRequestPB req;
+            SleepResponsePB resp;
+            controller.set_deadline(deadline);
+            req.set_sleep_micros(100000);
+            Status s = p.Sleep(req, &resp, &controller);
+            if (s.ok()) {
+              successes[thread_id]++;
+              break;
+            }
+            // We expect to get SERVER_TOO_BUSY errors because we have more clients than the
+            // server has handlers and queue slots. No other errors are expected.
+            CHECK(s.IsRemoteError() &&
+                  controller.error_response()->code() == rpc::ErrorStatusPB::ERROR_SERVER_TOO_BUSY)
+                << "Unexpected RPC failure: " << s.ToString();
+            // Randomized exponential backoff (similar to that done by the scanners in the Kudu
+            // client.).
+            int backoff = (0.5 + rng.NextDoubleFraction() * 0.5) * (std::min(1 << attempt, 1000));
+            VLOG(1) << "backoff " << backoff << "ms";
+            SleepFor(MonoDelta::FromMilliseconds(backoff));
+          }
+        }
+      });
+  }
+  // Let the threads run for 5 seconds before stopping them.
+  SleepFor(MonoDelta::FromSeconds(5));
+  done.store(true);
+  for (auto& t : threads) {
+    t.join();
+  }
+
+  // Before switching to earliest-deadline-first scheduling, the results
+  // here would typically look something like:
+  //  1 1 0 1 10 17 6 1 12 12 17 10 8 7 12 9 16 15
+  // With the fix, we see something like:
+  //  9 9 9 8 9 9 9 9 9 9 9 9 9 9 9 9 9
+  LOG(INFO) << "thread RPC success counts: " << successes;
+
+  int sum = 0;
+  int min = std::numeric_limits<int>::max();
+  for (int x : successes) {
+    sum += x;
+    min = std::min(min, x);
+  }
+  int avg = sum / successes.size();
+  ASSERT_GT(min, avg / 2)
+      << "expected the least lucky thread to have at least half as many successes "
+      << "as the average thread: min=" << min << " avg=" << avg;
+}
+
 TEST_F(RpcStubTest, TestDumpCallsInFlight) {
   CalculatorServiceProxy p(client_messenger_, server_addr_);
   AsyncSleep sleep;
@@ -360,7 +530,7 @@ TEST_F(RpcStubTest, TestDumpCallsInFlight) {
   dump_req.set_include_traces(true);
 
   ASSERT_OK(client_messenger_->DumpRunningRpcs(dump_req, &dump_resp));
-  LOG(INFO) << "client messenger: " << dump_resp.DebugString();
+  LOG(INFO) << "client messenger: " << SecureDebugString(dump_resp);
   ASSERT_EQ(1, dump_resp.outbound_connections_size());
   ASSERT_EQ(1, dump_resp.outbound_connections(0).calls_in_flight_size());
   ASSERT_EQ("Sleep", dump_resp.outbound_connections(0).calls_in_flight(0).
@@ -380,7 +550,7 @@ TEST_F(RpcStubTest, TestDumpCallsInFlight) {
     SleepFor(MonoDelta::FromMilliseconds(1));
   }
 
-  LOG(INFO) << "server messenger: " << dump_resp.DebugString();
+  LOG(INFO) << "server messenger: " << SecureDebugString(dump_resp);
   ASSERT_EQ(1, dump_resp.inbound_connections_size());
   ASSERT_EQ(1, dump_resp.inbound_connections(0).calls_in_flight_size());
   ASSERT_EQ("Sleep", dump_resp.inbound_connections(0).calls_in_flight(0).
@@ -389,6 +559,48 @@ TEST_F(RpcStubTest, TestDumpCallsInFlight) {
   ASSERT_STR_CONTAINS(dump_resp.inbound_connections(0).calls_in_flight(0).trace_buffer(),
                       "Inserting onto call queue");
   sleep.latch.Wait();
+}
+
+TEST_F(RpcStubTest, TestDumpSampledCalls) {
+  CalculatorServiceProxy p(client_messenger_, server_addr_);
+
+  // Issue two calls that fall into different latency buckets.
+  AsyncSleep sleeps[2];
+  sleeps[0].req.set_sleep_micros(150 * 1000); // 150ms
+  sleeps[1].req.set_sleep_micros(1500 * 1000); // 1500ms
+
+  for (auto& sleep : sleeps) {
+    p.SleepAsync(sleep.req, &sleep.resp, &sleep.rpc,
+                 boost::bind(&CountDownLatch::CountDown, &sleep.latch));
+  }
+  for (auto& sleep : sleeps) {
+    sleep.latch.Wait();
+  }
+
+  // Dump the sampled RPCs and expect to see the calls
+  // above.
+
+  DumpRpczStoreResponsePB sampled_rpcs;
+  server_messenger_->rpcz_store()->DumpPB(DumpRpczStoreRequestPB(), &sampled_rpcs);
+  EXPECT_EQ(sampled_rpcs.methods_size(), 1);
+  ASSERT_STR_CONTAINS(SecureDebugString(sampled_rpcs),
+                      "    metrics {\n"
+                      "      key: \"test_sleep_us\"\n"
+                      "      value: 150000\n"
+                      "    }\n");
+  ASSERT_STR_CONTAINS(SecureDebugString(sampled_rpcs),
+                      "    metrics {\n"
+                      "      key: \"test_sleep_us\"\n"
+                      "      value: 1500000\n"
+                      "    }\n");
+  ASSERT_STR_CONTAINS(SecureDebugString(sampled_rpcs),
+                      "    metrics {\n"
+                      "      child_path: \"test_child\"\n"
+                      "      key: \"related_trace_metric\"\n"
+                      "      value: 1\n"
+                      "    }");
+  ASSERT_STR_CONTAINS(SecureDebugString(sampled_rpcs), "SleepRequestPB");
+  ASSERT_STR_CONTAINS(SecureDebugString(sampled_rpcs), "duration_ms");
 }
 
 namespace {
@@ -427,6 +639,41 @@ TEST_F(RpcStubTest, TestCallbackClearedAfterRunning) {
     SleepFor(MonoDelta::FromMilliseconds(1));
   }
   ASSERT_TRUE(my_refptr->HasOneRef());
+}
+
+// Regression test for KUDU-1409: if the client reactor thread is blocked (e.g due to a
+// process-wide pause or a slow callback) then we should not cause RPC calls to time out.
+TEST_F(RpcStubTest, DontTimeOutWhenReactorIsBlocked) {
+  CHECK_EQ(client_messenger_->num_reactors(), 1)
+      << "This test requires only a single reactor. Otherwise the injected sleep might "
+      << "be scheduled on a different reactor than the RPC call.";
+
+  CalculatorServiceProxy p(client_messenger_, server_addr_);
+
+  // Schedule a 1-second sleep on the reactor thread.
+  //
+  // This will cause us the reactor to be blocked while the call response is received, and
+  // still be blocked when the timeout would normally occur. Despite this, the call should
+  // not time out.
+  //
+  //  0s         0.5s          1.2s     1.5s
+  //  RPC call running
+  //  |---------------------|
+  //              Reactor blocked in sleep
+  //             |----------------------|
+  //                            \_ RPC would normally time out
+
+  client_messenger_->ScheduleOnReactor([](const Status& s) {
+      ThreadRestrictions::ScopedAllowWait allow_wait;
+      SleepFor(MonoDelta::FromSeconds(1));
+    }, MonoDelta::FromSeconds(0.5));
+
+  RpcController controller;
+  SleepRequestPB req;
+  SleepResponsePB resp;
+  req.set_sleep_micros(800 * 1000);
+  controller.set_timeout(MonoDelta::FromMilliseconds(1200));
+  ASSERT_OK(p.Sleep(req, &resp, &controller));
 }
 
 } // namespace rpc

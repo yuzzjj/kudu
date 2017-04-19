@@ -18,14 +18,16 @@
 #include "kudu/client/batcher.h"
 
 #include <algorithm>
-#include <boost/bind.hpp>
-#include <glog/logging.h>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include <boost/bind.hpp>
+#include <glog/logging.h>
 
 #include "kudu/client/callbacks.h"
 #include "kudu/client/client.h"
@@ -44,14 +46,18 @@
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/messenger.h"
+#include "kudu/rpc/request_tracker.h"
+#include "kudu/rpc/retriable_rpc.h"
 #include "kudu/rpc/rpc.h"
 #include "kudu/tserver/tserver_service.proxy.h"
 #include "kudu/util/debug-util.h"
 #include "kudu/util/logging.h"
+#include "kudu/util/pb_util.h"
 
 using std::pair;
 using std::set;
 using std::shared_ptr;
+using std::unique_ptr;
 using std::unordered_map;
 using strings::Substitute;
 
@@ -59,8 +65,13 @@ namespace kudu {
 
 using rpc::ErrorStatusPB;
 using rpc::Messenger;
+using rpc::RequestTracker;
+using rpc::ResponseCallback;
+using rpc::RetriableRpc;
+using rpc::RetriableRpcStatus;
 using rpc::Rpc;
 using rpc::RpcController;
+using rpc::ServerPicker;
 using tserver::WriteRequestPB;
 using tserver::WriteResponsePB;
 using tserver::WriteResponsePB_PerRowErrorPB;
@@ -157,8 +168,6 @@ struct InFlightOp {
   // The actual operation.
   gscoped_ptr<KuduWriteOperation> write_op;
 
-  string partition_key;
-
   // The tablet the operation is destined for.
   // This is only filled in after passing through the kLookingUpTablet state.
   scoped_refptr<RemoteTablet> tablet;
@@ -167,9 +176,14 @@ struct InFlightOp {
   // order of operations. This is important when multiple operations act on the same row.
   int sequence_number_;
 
+  // Stringifies the InFlightOp.
+  //
+  // This should be used in log messages instead of KuduWriteOperation::ToString
+  // because it handles redaction.
   string ToString() const {
     return strings::Substitute("op[state=$0, write_op=$1]",
-                               state, write_op->ToString());
+                               state,
+                               KUDU_REDACT(write_op->ToString()));
   }
 };
 
@@ -178,79 +192,61 @@ struct InFlightOp {
 // leader fails.
 //
 // Keeps a reference on the owning batcher while alive.
-class WriteRpc : public Rpc {
+class WriteRpc : public RetriableRpc<RemoteTabletServer, WriteRequestPB, WriteResponsePB> {
  public:
   WriteRpc(const scoped_refptr<Batcher>& batcher,
-           RemoteTablet* const tablet,
+           const scoped_refptr<MetaCacheServerPicker>& replica_picker,
+           const scoped_refptr<RequestTracker>& request_tracker,
            vector<InFlightOp*> ops,
            const MonoTime& deadline,
-           const shared_ptr<Messenger>& messenger);
+           shared_ptr<Messenger> messenger,
+           const string& tablet_id,
+           uint64_t propagated_timestamp);
   virtual ~WriteRpc();
-  virtual void SendRpc() OVERRIDE;
-  virtual string ToString() const OVERRIDE;
+  string ToString() const override;
 
   const KuduTable* table() const {
     // All of the ops for a given tablet obviously correspond to the same table,
     // so we'll just grab the table from the first.
     return ops_[0]->write_op->table();
   }
-  const RemoteTablet* tablet() const { return tablet_; }
   const vector<InFlightOp*>& ops() const { return ops_; }
   const WriteResponsePB& resp() const { return resp_; }
+  const string& tablet_id() const { return tablet_id_; }
+
+ protected:
+  void Try(RemoteTabletServer* replica, const ResponseCallback& callback) override;
+  RetriableRpcStatus AnalyzeResponse(const Status& rpc_cb_status) override;
+  void Finish(const Status& status) override;
 
  private:
-  // Called when we finish a lookup (to find the new consensus leader). Retries
-  // the rpc after a short delay.
-  void LookupTabletCb(const Status& status);
-
-  // Called when we finish initializing a TS proxy.
-  // Sends the RPC, provided there was no error.
-  void InitTSProxyCb(const Status& status);
-
-  // Marks all replicas on current_ts_ as failed and retries the write on a
-  // new replica.
-  void FailToNewReplica(const Status& reason);
-
-  virtual void SendRpcCb(const Status& status) OVERRIDE;
-
   // Pointer back to the batcher. Processes the write response when it
   // completes, regardless of success or failure.
   scoped_refptr<Batcher> batcher_;
 
-  // The tablet that should receive this write.
-  RemoteTablet* const tablet_;
-
-  // The TS receiving the write. May change if the write is retried.
-  RemoteTabletServer* current_ts_;
-
-  // TSes that refused the write because they were followers at the time.
-  // Cleared when new consensus configuration information arrives from the master.
-  set<RemoteTabletServer*> followers_;
-
-  // Request body.
-  WriteRequestPB req_;
-
-  // Response body.
-  WriteResponsePB resp_;
-
   // Operations which were batched into this RPC.
   // These operations are in kRequestSent state.
   vector<InFlightOp*> ops_;
+
+  // The id of the tablet being written to.
+  string tablet_id_;
 };
 
 WriteRpc::WriteRpc(const scoped_refptr<Batcher>& batcher,
-                   RemoteTablet* const tablet,
+                   const scoped_refptr<MetaCacheServerPicker>& replica_picker,
+                   const scoped_refptr<RequestTracker>& request_tracker,
                    vector<InFlightOp*> ops,
                    const MonoTime& deadline,
-                   const shared_ptr<Messenger>& messenger)
-    : Rpc(deadline, messenger),
+                   shared_ptr<Messenger> messenger,
+                   const string& tablet_id,
+                   uint64_t propagated_timestamp)
+    : RetriableRpc(replica_picker, request_tracker, deadline, std::move(messenger)),
       batcher_(batcher),
-      tablet_(tablet),
-      current_ts_(NULL),
-      ops_(std::move(ops)) {
+      ops_(std::move(ops)),
+      tablet_id_(tablet_id) {
   const Schema* schema = table()->schema().schema_;
 
-  req_.set_tablet_id(tablet->tablet_id());
+  req_.set_tablet_id(tablet_id_);
   switch (batcher->external_consistency_mode()) {
     case kudu::client::KuduSession::CLIENT_PROPAGATED:
       req_.set_external_consistency_mode(kudu::CLIENT_PROPAGATED);
@@ -261,6 +257,10 @@ WriteRpc::WriteRpc(const scoped_refptr<Batcher>& batcher,
     default:
       LOG(FATAL) << "Unsupported consistency mode: " << batcher->external_consistency_mode();
 
+  }
+  // If set, propagate the latest observed timestamp.
+  if (PREDICT_TRUE(propagated_timestamp != KuduClient::kNoTimestamp)) {
+    req_.set_propagated_timestamp(propagated_timestamp);
   }
 
   // Set up schema
@@ -273,16 +273,15 @@ WriteRpc::WriteRpc(const scoped_refptr<Batcher>& batcher,
   int ctr = 0;
   RowOperationsPBEncoder enc(requested);
   for (InFlightOp* op : ops_) {
+#ifndef NDEBUG
     const Partition& partition = op->tablet->partition();
     const PartitionSchema& partition_schema = table()->partition_schema();
     const KuduPartialRow& row = op->write_op->row();
-
-#ifndef NDEBUG
     bool partition_contains_row;
     CHECK(partition_schema.PartitionContainsRow(partition, row, &partition_contains_row).ok());
     CHECK(partition_contains_row)
-        << "Row " << partition_schema.RowDebugString(row)
-        << "not in partition " << partition_schema.PartitionDebugString(partition, *schema);
+        << "Row " << partition_schema.PartitionKeyDebugString(row)
+        << " not in partition " << partition_schema.PartitionDebugString(partition, *schema);
 #endif
 
     enc.Add(ToInternalWriteType(op->write_op->type()), op->write_op->row());
@@ -292,12 +291,11 @@ WriteRpc::WriteRpc(const scoped_refptr<Batcher>& batcher,
     // until after we sent it, the RPC callback could fire before we got a chance
     // to change its state to 'sent'.
     op->state = InFlightOp::kRequestSent;
-    VLOG(4) << ++ctr << ". Encoded row " << op->write_op->ToString();
+    VLOG(4) << ++ctr << ". Encoded row " << op->ToString();
   }
 
   if (VLOG_IS_ON(3)) {
-    VLOG(3) << "Created batch for " << tablet->tablet_id() << ":\n"
-        << req_.ShortDebugString();
+    VLOG(3) << "Created batch for " << tablet_id << ":\n" << SecureShortDebugString(req_);
   }
 }
 
@@ -305,202 +303,116 @@ WriteRpc::~WriteRpc() {
   STLDeleteElements(&ops_);
 }
 
-void WriteRpc::SendRpc() {
-  // Choose a destination TS according to the following algorithm:
-  // 1. Select the leader, provided:
-  //    a. One exists, and
-  //    b. It hasn't failed, and
-  //    c. It isn't currently marked as a follower.
-  // 2. If there's no good leader select another replica, provided:
-  //    a. It hasn't failed, and
-  //    b. It hasn't rejected our write due to being a follower.
-  // 3. Preemptively mark the replica we selected in step 2 as "leader" in the
-  //    meta cache, so that our selection remains sticky until the next Master
-  //    metadata refresh.
-  // 4. If we're out of appropriate replicas, force a lookup to the master
-  //    to fetch new consensus configuration information.
-  // 5. When the lookup finishes, forget which replicas were followers and
-  //    retry the write (i.e. goto 1).
-  // 6. If we issue the write and it fails because the destination was a
-  //    follower, remember that fact and retry the write (i.e. goto 1).
-  // 7. Repeat steps 1-6 until the write succeeds, fails for other reasons,
-  //    or the write's deadline expires.
-  current_ts_ = tablet_->LeaderTServer();
-  if (current_ts_ && ContainsKey(followers_, current_ts_)) {
-    VLOG(2) << "Tablet " << tablet_->tablet_id() << ": We have a follower for a leader: "
-            << current_ts_->ToString();
-
-    // Mark the node as a follower in the cache so that on the next go-round,
-    // LeaderTServer() will not return it as a leader unless a full metadata
-    // refresh has occurred. This also avoids LookupTabletByKey() going into
-    // "fast path" mode and not actually performing a metadata refresh from the
-    // Master when it needs to.
-    tablet_->MarkTServerAsFollower(current_ts_);
-    current_ts_ = NULL;
-  }
-  if (!current_ts_) {
-    // Try to "guess" the next leader.
-    vector<RemoteTabletServer*> replicas;
-    tablet_->GetRemoteTabletServers(&replicas);
-    for (RemoteTabletServer* ts : replicas) {
-      if (!ContainsKey(followers_, ts)) {
-        current_ts_ = ts;
-        break;
-      }
-    }
-    if (current_ts_) {
-      // Mark this next replica "preemptively" as the leader in the meta cache,
-      // so we go to it first on the next write if writing was successful.
-      VLOG(1) << "Tablet " << tablet_->tablet_id() << ": Previous leader failed. "
-              << "Preemptively marking tserver " << current_ts_->ToString()
-              << " as leader in the meta cache.";
-      tablet_->MarkTServerAsLeader(current_ts_);
-    }
-  }
-
-  // If we've tried all replicas, force a lookup to the master to find the
-  // new leader. This relies on some properties of LookupTabletByKey():
-  // 1. The fast path only works when there's a non-failed leader (which we
-  //    know is untrue here).
-  // 2. The slow path always fetches consensus configuration information and updates the
-  //    looked-up tablet.
-  // Put another way, we don't care about the lookup results at all; we're
-  // just using it to fetch the latest consensus configuration information.
-  //
-  // TODO: When we support tablet splits, we should let the lookup shift
-  // the write to another tablet (i.e. if it's since been split).
-  if (!current_ts_) {
-    batcher_->client_->data_->meta_cache_->LookupTabletByKey(table(),
-                                                             tablet_->partition()
-                                                                     .partition_key_start(),
-                                                             retrier().deadline(),
-                                                             NULL,
-                                                             Bind(&WriteRpc::LookupTabletCb,
-                                                                  Unretained(this)));
-    return;
-  }
-
-  // Make sure we have a working proxy before sending out the RPC.
-  current_ts_->InitProxy(batcher_->client_,
-                         Bind(&WriteRpc::InitTSProxyCb, Unretained(this)));
-}
-
 string WriteRpc::ToString() const {
   return Substitute("Write(tablet: $0, num_ops: $1, num_attempts: $2)",
-                    tablet_->tablet_id(), ops_.size(), num_attempts());
+                    tablet_id_, ops_.size(), num_attempts());
 }
 
-void WriteRpc::LookupTabletCb(const Status& status) {
-  // We should retry the RPC regardless of the outcome of the lookup, as
-  // leader election doesn't depend on the existence of a master at all.
-  //
-  // Retry() imposes a slight delay, which is desirable in a lookup loop,
-  // but unnecessary the first time through. Seeing as leader failures are
-  // rare, perhaps this doesn't matter.
-  followers_.clear();
-  mutable_retrier()->DelayedRetry(this, status);
+void WriteRpc::Try(RemoteTabletServer* replica, const ResponseCallback& callback) {
+  VLOG(2) << "Tablet " << tablet_id_ << ": Writing batch to replica " << replica->ToString();
+  replica->proxy()->WriteAsync(req_, &resp_,
+                               mutable_retrier()->mutable_controller(),
+                               callback);
 }
 
-void WriteRpc::InitTSProxyCb(const Status& status) {
-  // Fail to a replica in the event of a DNS resolution failure.
-  if (!status.ok()) {
-    FailToNewReplica(status);
-    return;
+void WriteRpc::Finish(const Status& status) {
+  unique_ptr<WriteRpc> this_instance(this);
+  Status final_status = status;
+  if (!final_status.ok()) {
+    final_status = final_status.CloneAndPrepend(
+        Substitute("Failed to write batch of $0 ops to tablet $1 after $2 attempt(s)",
+                   ops_.size(), tablet_id_, num_attempts()));
+    KLOG_EVERY_N_SECS(WARNING, 1) << final_status.ToString();
+  }
+  batcher_->ProcessWriteResponse(*this, final_status);
+}
+
+RetriableRpcStatus WriteRpc::AnalyzeResponse(const Status& rpc_cb_status) {
+  RetriableRpcStatus result;
+  result.status = rpc_cb_status;
+
+  // If we didn't fail on tablet lookup/proxy initialization, check if we failed actually performing
+  // the write.
+  if (rpc_cb_status.ok()) {
+    result.status = mutable_retrier()->controller().status();
   }
 
-  VLOG(2) << "Tablet " << tablet_->tablet_id() << ": Writing batch to replica "
-          << current_ts_->ToString();
-  current_ts_->proxy()->WriteAsync(req_, &resp_,
-                                   mutable_retrier()->mutable_controller(),
-                                   boost::bind(&WriteRpc::SendRpcCb, this, Status::OK()));
-}
-
-void WriteRpc::FailToNewReplica(const Status& reason) {
-  VLOG(1) << "Failing " << ToString() << " to a new replica: "
-          << reason.ToString();
-  bool found = tablet_->MarkReplicaFailed(current_ts_, reason);
-  DCHECK(found)
-      << "Tablet " << tablet_->tablet_id() << ": Unable to mark replica " << current_ts_->ToString()
-      << " as failed. Replicas: " << tablet_->ReplicasAsString();
-
-  mutable_retrier()->DelayedRetry(this, reason);
-}
-
-void WriteRpc::SendRpcCb(const Status& status) {
-  // Prefer early failures over controller failures.
-  Status new_status = status;
-  if (new_status.ok() && mutable_retrier()->HandleResponse(this, &new_status)) {
-    return;
+  if (result.status.IsRemoteError()) {
+    const ErrorStatusPB* err = mutable_retrier()->controller().error_response();
+    if (err &&
+        err->has_code() &&
+        err->code() == ErrorStatusPB::ERROR_SERVER_TOO_BUSY) {
+      result.result = RetriableRpcStatus::SERVER_BUSY;
+      return result;
+    }
   }
 
-  // Failover to a replica in the event of any network failure.
+  // Failover to a replica in the event of any network failure or of a DNS resolution problem.
   //
   // TODO: This is probably too harsh; some network failures should be
   // retried on the current replica.
-  if (new_status.IsNetworkError()) {
-    FailToNewReplica(new_status);
-    return;
+  if (result.status.IsNetworkError()) {
+    result.result = RetriableRpcStatus::SERVER_NOT_ACCESSIBLE;
+    return result;
   }
 
   // Prefer controller failures over response failures.
-  if (new_status.ok() && resp_.has_error()) {
-    new_status = StatusFromPB(resp_.error().status());
+  if (result.status.ok() && resp_.has_error()) {
+    result.status = StatusFromPB(resp_.error().status());
   }
 
-  // Oops, we failed over to a replica that wasn't a LEADER. Unlikely as
-  // we're using consensus configuration information from the master, but still possible
-  // (e.g. leader restarted and became a FOLLOWER). Try again.
+  // If we get TABLET_NOT_FOUND, the replica we thought was leader has been deleted.
+  if (resp_.has_error() && resp_.error().code() == tserver::TabletServerErrorPB::TABLET_NOT_FOUND) {
+    result.result = RetriableRpcStatus::RESOURCE_NOT_FOUND;
+    return result;
+  }
+
+  // Alternatively, when we get a status code of IllegalState or Aborted, we
+  // assume this means that the replica we attempted to write to is not the
+  // current leader (maybe it got partitioned or slow and another node took
+  // over).
   //
-  // TODO: IllegalState is obviously way too broad an error category for
-  // this case.
-  if (new_status.IsIllegalState() || new_status.IsAborted()) {
-    followers_.insert(current_ts_);
-    mutable_retrier()->DelayedRetry(this, new_status);
-    return;
+  // TODO: This error handling block should really be rewritten to handle
+  // specific error codes exclusively instead of Status codes (this may
+  // require some server-side changes). For example, IllegalState is
+  // obviously way too broad an error category for this case.
+  if (result.status.IsIllegalState() || result.status.IsAborted()) {
+    result.result = RetriableRpcStatus::REPLICA_NOT_LEADER;
+    return result;
   }
 
-  if (!new_status.ok()) {
-    string current_ts_string;
-    if (current_ts_) {
-      current_ts_string = Substitute("on tablet server $0", current_ts_->ToString());
-    } else {
-      current_ts_string = "(no tablet server available)";
-    }
-    new_status = new_status.CloneAndPrepend(
-        Substitute("Failed to write batch of $0 ops to tablet $1 "
-                   "$2 after $3 attempt(s)",
-                   ops_.size(), tablet_->tablet_id(),
-                   current_ts_string, num_attempts()));
-    LOG(WARNING) << new_status.ToString();
+  if (result.status.ok()) {
+    result.result = RetriableRpcStatus::OK;
+  } else {
+    result.result = RetriableRpcStatus::NON_RETRIABLE_ERROR;
   }
-  batcher_->ProcessWriteResponse(*this, new_status);
-  delete this;
+  return result;
 }
 
 Batcher::Batcher(KuduClient* client,
-                 ErrorCollector* error_collector,
-                 const sp::shared_ptr<KuduSession>& session,
+                 scoped_refptr<ErrorCollector> error_collector,
+                 sp::weak_ptr<KuduSession> session,
                  kudu::client::KuduSession::ExternalConsistencyMode consistency_mode)
   : state_(kGatheringOps),
     client_(client),
-    weak_session_(session),
+    weak_session_(std::move(session)),
     consistency_mode_(consistency_mode),
-    error_collector_(error_collector),
+    error_collector_(std::move(error_collector)),
     had_errors_(false),
-    flush_callback_(NULL),
+    flush_callback_(nullptr),
     next_op_sequence_number_(0),
+    timeout_(client->default_rpc_timeout()),
     outstanding_lookups_(0),
-    max_buffer_size_(7 * 1024 * 1024),
     buffer_bytes_used_(0) {
 }
 
 void Batcher::Abort() {
-  unique_lock<simple_spinlock> l(&lock_);
+  std::unique_lock<simple_spinlock> l(lock_);
   state_ = kAborted;
 
   vector<InFlightOp*> to_abort;
   for (InFlightOp* op : ops_) {
-    lock_guard<simple_spinlock> l(&op->lock_);
+    std::lock_guard<simple_spinlock> l(op->lock_);
     if (op->state == InFlightOp::kBufferedToTabletServer) {
       to_abort.push_back(op);
     }
@@ -528,20 +440,19 @@ Batcher::~Batcher() {
   CHECK(state_ == kFlushed || state_ == kAborted) << "Bad state: " << state_;
 }
 
-void Batcher::SetTimeoutMillis(int millis) {
-  CHECK_GE(millis, 0);
-  lock_guard<simple_spinlock> l(&lock_);
-  timeout_ = MonoDelta::FromMilliseconds(millis);
+void Batcher::SetTimeout(const MonoDelta& timeout) {
+  std::lock_guard<simple_spinlock> l(lock_);
+  timeout_ = timeout;
 }
 
 
 bool Batcher::HasPendingOperations() const {
-  lock_guard<simple_spinlock> l(&lock_);
+  std::lock_guard<simple_spinlock> l(lock_);
   return !ops_.empty();
 }
 
 int Batcher::CountBufferedOperations() const {
-  lock_guard<simple_spinlock> l(&lock_);
+  std::lock_guard<simple_spinlock> l(lock_);
   if (state_ == kGatheringOps) {
     return ops_.size();
   } else {
@@ -554,7 +465,7 @@ int Batcher::CountBufferedOperations() const {
 void Batcher::CheckForFinishedFlush() {
   sp::shared_ptr<KuduSession> session;
   {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     if (state_ != kFlushing || !ops_.empty()) {
       return;
     }
@@ -568,32 +479,23 @@ void Batcher::CheckForFinishedFlush() {
     // a lock inversion deadlock -- the session lock should always
     // come before the batcher lock.
     session->data_->FlushFinished(this);
-  }
 
-  Status s;
-  if (had_errors_) {
+  }
+  if (flush_callback_) {
     // User is responsible for fetching errors from the error collector.
-    s = Status::IOError("Some errors occurred");
+    Status s = had_errors_ ? Status::IOError("Some errors occurred")
+                           : Status::OK();
+    flush_callback_->Run(s);
   }
-
-  flush_callback_->Run(s);
 }
 
 MonoTime Batcher::ComputeDeadlineUnlocked() const {
-  MonoDelta timeout = timeout_;
-  if (PREDICT_FALSE(!timeout.Initialized())) {
-    KLOG_EVERY_N(WARNING, 1000) << "Client writing with no timeout set, using 60 seconds.\n"
-                                << GetStackTrace();
-    timeout = MonoDelta::FromSeconds(60);
-  }
-  MonoTime ret = MonoTime::Now(MonoTime::FINE);
-  ret.AddDelta(timeout);
-  return ret;
+  return MonoTime::Now() + timeout_;
 }
 
 void Batcher::FlushAsync(KuduStatusCallback* cb) {
   {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     CHECK_EQ(state_, kGatheringOps);
     state_ = kFlushing;
     flush_callback_ = cb;
@@ -615,30 +517,16 @@ void Batcher::FlushAsync(KuduStatusCallback* cb) {
 }
 
 Status Batcher::Add(KuduWriteOperation* write_op) {
-  int64_t required_size = write_op->SizeInBuffer();
-  int64_t size_after_adding = buffer_bytes_used_.IncrementBy(required_size);
-  if (PREDICT_FALSE(size_after_adding > max_buffer_size_)) {
-    buffer_bytes_used_.IncrementBy(-required_size);
-    int64_t size_before_adding = size_after_adding - required_size;
-    return Status::Incomplete(Substitute(
-        "not enough space remaining in buffer for op (required $0, "
-        "$1 already used",
-        HumanReadableNumBytes::ToString(required_size),
-        HumanReadableNumBytes::ToString(size_before_adding)));
-  }
-
-
   // As soon as we get the op, start looking up where it belongs,
   // so that when the user calls Flush, we are ready to go.
   gscoped_ptr<InFlightOp> op(new InFlightOp());
-  RETURN_NOT_OK(write_op->table_->partition_schema()
-                .EncodeKey(write_op->row(), &op->partition_key));
+  string partition_key;
+  RETURN_NOT_OK(write_op->table_->partition_schema().EncodeKey(write_op->row(), &partition_key));
   op->write_op.reset(write_op);
   op->state = InFlightOp::kLookingUpTablet;
 
   AddInFlightOp(op.get());
-  VLOG(3) << "Looking up tablet for " << op->write_op->ToString();
-
+  VLOG(3) << "Looking up tablet for " << op->ToString();
   // Increment our reference count for the outstanding callback.
   //
   // deadline_ is set in FlushAsync(), after all Add() calls are done, so
@@ -647,21 +535,29 @@ Status Batcher::Add(KuduWriteOperation* write_op) {
   base::RefCountInc(&outstanding_lookups_);
   client_->data_->meta_cache_->LookupTabletByKey(
       op->write_op->table(),
-      op->partition_key,
+      std::move(partition_key),
       deadline,
       &op->tablet,
       Bind(&Batcher::TabletLookupFinished, this, op.get()));
   IgnoreResult(op.release());
+
+  buffer_bytes_used_.IncrementBy(write_op->SizeInBuffer());
+
   return Status::OK();
 }
 
 void Batcher::AddInFlightOp(InFlightOp* op) {
   DCHECK_EQ(op->state, InFlightOp::kLookingUpTablet);
 
-  lock_guard<simple_spinlock> l(&lock_);
+  std::lock_guard<simple_spinlock> l(lock_);
   CHECK_EQ(state_, kGatheringOps);
   InsertOrDie(&ops_, op);
   op->sequence_number_ = next_op_sequence_number_++;
+
+  // Set the time of the first operation in the batch, if not set yet.
+  if (PREDICT_FALSE(!first_op_time_.Initialized())) {
+    first_op_time_ = MonoTime::Now();
+  }
 }
 
 bool Batcher::IsAbortedUnlocked() const {
@@ -669,12 +565,12 @@ bool Batcher::IsAbortedUnlocked() const {
 }
 
 void Batcher::MarkHadErrors() {
-  lock_guard<simple_spinlock> l(&lock_);
+  std::lock_guard<simple_spinlock> l(lock_);
   had_errors_ = true;
 }
 
 void Batcher::MarkInFlightOpFailed(InFlightOp* op, const Status& s) {
-  lock_guard<simple_spinlock> l(&lock_);
+  std::lock_guard<simple_spinlock> l(lock_);
   MarkInFlightOpFailedUnlocked(op, s);
 }
 
@@ -682,7 +578,7 @@ void Batcher::MarkInFlightOpFailedUnlocked(InFlightOp* op, const Status& s) {
   CHECK_EQ(1, ops_.erase(op))
     << "Could not remove op " << op->ToString() << " from in-flight list";
   gscoped_ptr<KuduError> error(new KuduError(op->write_op.release(), s));
-  error_collector_->AddError(error.Pass());
+  error_collector_->AddError(std::move(error));
   had_errors_ = true;
   delete op;
 }
@@ -693,17 +589,17 @@ void Batcher::TabletLookupFinished(InFlightOp* op, const Status& s) {
   // Acquire the batcher lock early to atomically:
   // 1. Test if the batcher was aborted, and
   // 2. Change the op state.
-  unique_lock<simple_spinlock> l(&lock_);
+  std::unique_lock<simple_spinlock> l(lock_);
 
   if (IsAbortedUnlocked()) {
-    VLOG(1) << "Aborted batch: TabletLookupFinished for " << op->write_op->ToString();
+    VLOG(1) << "Aborted batch: TabletLookupFinished for " << op->ToString();
     MarkInFlightOpFailedUnlocked(op, Status::Aborted("Batch aborted"));
     // 'op' is deleted by above function.
     return;
   }
 
   if (VLOG_IS_ON(3)) {
-    VLOG(3) << "TabletLookupFinished for " << op->write_op->ToString()
+    VLOG(3) << "TabletLookupFinished for " << op->ToString()
             << ": " << s.ToString();
     if (s.ok()) {
       VLOG(3) << "Result: tablet_id = " << op->tablet->tablet_id();
@@ -723,7 +619,7 @@ void Batcher::TabletLookupFinished(InFlightOp* op, const Status& s) {
   }
 
   {
-    lock_guard<simple_spinlock> l2(&op->lock_);
+    std::lock_guard<simple_spinlock> l2(op->lock_);
     CHECK_EQ(op->state, InFlightOp::kLookingUpTablet);
     CHECK(op->tablet != NULL);
 
@@ -764,7 +660,7 @@ void Batcher::FlushBuffersIfReady() {
   // 2. All outstanding ops have finished lookup. Why? To avoid a situation
   //    where ops are flushed one by one as they finish lookup.
   {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     if (state_ != kFlushing) {
       VLOG(3) << "FlushBuffersIfReady: batcher not yet in flushing state";
       return;
@@ -797,11 +693,22 @@ void Batcher::FlushBuffer(RemoteTablet* tablet, const vector<InFlightOp*>& ops) 
   // its callback completes.
   //
   // The RPC object takes ownership of the ops.
+
+  // TODO Keep a replica picker per tablet and share it across writes
+  // to the same tablet.
+  scoped_refptr<MetaCacheServerPicker> server_picker(
+      new MetaCacheServerPicker(client_,
+                                client_->data_->meta_cache_,
+                                ops[0]->write_op->table(),
+                                tablet));
   WriteRpc* rpc = new WriteRpc(this,
-                               tablet,
+                               server_picker,
+                               client_->data_->request_tracker_,
                                ops,
                                deadline_,
-                               client_->data_->messenger_);
+                               client_->data_->messenger_,
+                               tablet->tablet_id(),
+                               client_->data_->GetLatestObservedTimestamp());
   rpc->SendRpc();
 }
 
@@ -821,43 +728,60 @@ void Batcher::ProcessWriteResponse(const WriteRpc& rpc,
     // Mark each of the rows in the write op as failed, since the whole RPC failed.
     for (InFlightOp* op : rpc.ops()) {
       gscoped_ptr<KuduError> error(new KuduError(op->write_op.release(), s));
-      error_collector_->AddError(error.Pass());
+      error_collector_->AddError(std::move(error));
     }
 
     MarkHadErrors();
   }
 
-
-  // Remove all the ops from the "in-flight" list.
-  {
-    lock_guard<simple_spinlock> l(&lock_);
-    for (InFlightOp* op : rpc.ops()) {
-      CHECK_EQ(1, ops_.erase(op))
-            << "Could not remove op " << op->ToString()
-            << " from in-flight list";
-    }
-  }
-
   // Check individual row errors.
   for (const WriteResponsePB_PerRowErrorPB& err_pb : rpc.resp().per_row_errors()) {
-    // TODO: handle case where we get one of the more specific TS errors
+    // TODO(todd): handle case where we get one of the more specific TS errors
     // like the tablet not being hosted?
 
     if (err_pb.row_index() >= rpc.ops().size()) {
       LOG(ERROR) << "Received a per_row_error for an out-of-bound op index "
                  << err_pb.row_index() << " (sent only "
                  << rpc.ops().size() << " ops)";
-      LOG(ERROR) << "Response from tablet " << rpc.tablet()->tablet_id() << ":\n"
-                 << rpc.resp().DebugString();
+      LOG(ERROR) << "Response from tablet " << rpc.tablet_id() << ":\n"
+                 << SecureDebugString(rpc.resp());
       continue;
     }
-    gscoped_ptr<KuduWriteOperation> op = rpc.ops()[err_pb.row_index()]->write_op.Pass();
-    VLOG(1) << "Error on op " << op->ToString() << ": "
-            << err_pb.error().ShortDebugString();
+    gscoped_ptr<KuduWriteOperation> op = std::move(rpc.ops()[err_pb.row_index()]->write_op);
+    VLOG(2) << "Error on op " << op->ToString() << ": "
+            << SecureShortDebugString(err_pb.error());
     Status op_status = StatusFromPB(err_pb.error());
     gscoped_ptr<KuduError> error(new KuduError(op.release(), op_status));
-    error_collector_->AddError(error.Pass());
+    error_collector_->AddError(std::move(error));
     MarkHadErrors();
+  }
+
+  // Remove all the ops from the "in-flight" list. It's essential to do so
+  // _after_ adding all errors into the collector, otherwise there might be
+  // a race which manifests itself as described at KUDU-1743. Essentially,
+  // the race was the following:
+  //
+  //   * There are two concurrent calls to this method, one from each of RPC
+  //     sent to corresponding tservers.
+  //
+  //   * T1 removes its Write's ops from ops_, adds its errors, and calls
+  //     CheckForFinishedFlush().
+  //
+  //   * T2 does the same.
+  //
+  //   * T1 is descheduled/delayed after removing from ops_ but before adding
+  //     its errors.
+  //
+  //   * T2 runs completely through ProcessWriteResponse(),
+  //     calls CheckForFinishedFlush(), and wakes up the client thread
+  //     from which the Flush() is being called.
+  {
+    std::lock_guard<simple_spinlock> l(lock_);
+    for (InFlightOp* op : rpc.ops()) {
+      CHECK_EQ(1, ops_.erase(op))
+            << "Could not remove op " << op->ToString()
+            << " from in-flight list";
+    }
   }
 
   CheckForFinishedFlush();

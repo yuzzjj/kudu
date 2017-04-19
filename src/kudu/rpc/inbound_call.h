@@ -22,10 +22,10 @@
 #include <vector>
 
 #include "kudu/gutil/gscoped_ptr.h"
-#include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/remote_method.h"
+#include "kudu/rpc/service_if.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/transfer.h"
 #include "kudu/util/faststring.h"
@@ -48,14 +48,19 @@ namespace rpc {
 
 class Connection;
 class DumpRunningRpcsRequestPB;
+class RemoteUser;
 class RpcCallInProgressPB;
+struct RpcMethodInfo;
 class RpcSidecar;
-class UserCredentials;
 
 struct InboundCallTiming {
   MonoTime time_received;   // Time the call was first accepted.
   MonoTime time_handled;    // Time the call handler was kicked off.
   MonoTime time_completed;  // Time the call handler completed.
+
+  MonoDelta TotalDuration() const {
+    return time_completed - time_received;
+  }
 };
 
 // Inbound call on server
@@ -73,7 +78,8 @@ class InboundCall {
   Status ParseFrom(gscoped_ptr<InboundTransfer> transfer);
 
   // Return the serialized request parameter protobuf.
-  const Slice &serialized_request() const {
+  const Slice& serialized_request() const {
+    DCHECK(transfer_) << "Transfer discarded before parameter parsing";
     return serialized_request_;
   }
 
@@ -102,6 +108,8 @@ class InboundCall {
   void RespondFailure(ErrorStatusPB::RpcErrorCodePB error_code,
                       const Status &status);
 
+  void RespondUnsupportedFeature(const std::vector<uint32_t>& unsupported_features);
+
   void RespondApplicationError(int error_ext_id, const std::string& message,
                                const google::protobuf::MessageLite& app_error_pb);
 
@@ -116,19 +124,40 @@ class InboundCall {
   void SerializeResponseTo(std::vector<Slice>* slices) const;
 
   // See RpcContext::AddRpcSidecar()
-  Status AddRpcSidecar(gscoped_ptr<RpcSidecar> car, int* idx);
+  Status AddOutboundSidecar(std::unique_ptr<RpcSidecar> car, int* idx);
 
   std::string ToString() const;
 
   void DumpPB(const DumpRunningRpcsRequestPB& req, RpcCallInProgressPB* resp);
 
-  const UserCredentials& user_credentials() const;
+  const RemoteUser& remote_user() const;
 
   const Sockaddr& remote_address() const;
 
   const scoped_refptr<Connection>& connection() const;
 
   Trace* trace();
+
+  const InboundCallTiming& timing() const {
+    return timing_;
+  }
+
+  const RequestHeader& header() const {
+    return header_;
+  }
+
+  // Associate this call with a particular method that will be invoked
+  // by the service.
+  void set_method_info(scoped_refptr<RpcMethodInfo> info) {
+    method_info_ = std::move(info);
+  }
+
+  // Return the method associated with this call. This is set just before
+  // the call is enqueued onto the service queue, and therefore may be
+  // 'nullptr' for much of the lifecycle of a call.
+  RpcMethodInfo* method_info() {
+    return method_info_.get();
+  }
 
   // When this InboundCall was received (instantiated).
   // Should only be called once on a given instance.
@@ -141,12 +170,6 @@ class InboundCall {
   // Not thread-safe. Should only be called by the current "owner" thread.
   void RecordHandlingStarted(scoped_refptr<Histogram> incoming_queue_time);
 
-  // When RPC call Handle() completed execution on the server side.
-  // Updates the Histogram with time elapsed since the call was started,
-  // and should only be called once on a given instance.
-  // Not thread-safe. Should only be called by the current "owner" thread.
-  void RecordHandlingCompleted(scoped_refptr<Histogram> handler_run_time);
-
   // Return true if the deadline set by the client has already elapsed.
   // In this case, the server may stop processing the call, since the
   // call response will be ignored anyway.
@@ -157,7 +180,28 @@ class InboundCall {
   // If the client did not specify a deadline, returns MonoTime::Max().
   MonoTime GetClientDeadline() const;
 
+  // Return the time when this call was received.
+  MonoTime GetTimeReceived() const;
+
+  // Returns the set of application-specific feature flags required to service
+  // the RPC.
+  std::vector<uint32_t> GetRequiredFeatures() const;
+
+  // Get a sidecar sent as part of the request. If idx < 0 || idx > num sidecars - 1,
+  // returns an error.
+  Status GetInboundSidecar(int idx, Slice* sidecar) const;
+
+  // Releases the buffer that contains the request + sidecar data. It is an error to
+  // access sidecars or serialized_request() after this method is called.
+  void DiscardTransfer();
+
+  // Returns the size of the transfer buffer that backs this call. If the transfer does
+  // not exist (e.g. GetTransferSize() is called after DiscardTransfer()), returns 0.
+  size_t GetTransferSize();
+
  private:
+  friend class RpczStore;
+
   // Serialize and queue the response.
   void Respond(const google::protobuf::MessageLite& response,
                bool is_success);
@@ -165,14 +209,14 @@ class InboundCall {
   // Serialize a response message for either success or failure. If it is a success,
   // 'response' should be the user-defined response type for the call. If it is a
   // failure, 'response' should be an ErrorStatusPB instance.
-  Status SerializeResponseBuffer(const google::protobuf::MessageLite& response,
-                                 bool is_success);
+  void SerializeResponseBuffer(const google::protobuf::MessageLite& response,
+                               bool is_success);
 
-  // Log a WARNING message if the RPC response was slow enough that the
-  // client likely timed out. This is based on the client-provided timeout
-  // value.
-  // Also can be configured to log _all_ RPC traces for help debugging.
-  void LogTrace() const;
+  // When RPC call Handle() completed execution on the server side.
+  // Updates the Histogram with time elapsed since the call was started,
+  // and should only be called once on a given instance.
+  // Not thread-safe. Should only be called by the current "owner" thread.
+  void RecordHandlingCompleted();
 
   // The connection on which this inbound call arrived.
   scoped_refptr<Connection> conn_;
@@ -195,8 +239,11 @@ class InboundCall {
 
   // Vector of additional sidecars that are tacked on to the call's response
   // after serialization of the protobuf. See rpc/rpc_sidecar.h for more info.
-  std::vector<RpcSidecar*> sidecars_;
-  ElementDeleter sidecars_deleter_;
+  std::vector<std::unique_ptr<RpcSidecar>> outbound_sidecars_;
+
+  // Inbound sidecars from the request. The slices are views onto transfer_. There are as
+  // many slices as header_.sidecar_offsets_size().
+  Slice inbound_sidecar_slices_[TransferLimits::kMaxSidecars];
 
   // The trace buffer.
   scoped_refptr<Trace> trace_;
@@ -207,6 +254,11 @@ class InboundCall {
   // Proto service this calls belongs to. Used for routing.
   // This field is filled in when the inbound request header is parsed.
   RemoteMethod remote_method_;
+
+  // After the method has been looked up within the service, this is filled in
+  // to point to the information about this method. Acts as a pointer back to
+  // per-method info such as tracing.
+  scoped_refptr<RpcMethodInfo> method_info_;
 
   DISALLOW_COPY_AND_ASSIGN(InboundCall);
 };

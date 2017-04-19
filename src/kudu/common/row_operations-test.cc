@@ -96,7 +96,7 @@ void RowOperationsTest::CheckDecodeDoesntCrash(const Schema& client_schema,
 void RowOperationsTest::DoFuzzTest(const Schema& server_schema,
                                    const KuduPartialRow& row,
                                    int n_random_changes) {
-  for (int operation = 0; operation < 3; operation++) {
+  for (int operation = 0; operation <= 8; operation++) {
     RowOperationsPB pb;
     RowOperationsPBEncoder enc(&pb);
 
@@ -105,13 +105,28 @@ void RowOperationsTest::DoFuzzTest(const Schema& server_schema,
         enc.Add(RowOperationsPB::INSERT, row);
         break;
       case 1:
-        enc.Add(RowOperationsPB::UPDATE, row);
+        enc.Add(RowOperationsPB::UPSERT, row);
         break;
       case 2:
-        enc.Add(RowOperationsPB::DELETE, row);
+        enc.Add(RowOperationsPB::UPDATE, row);
         break;
       case 3:
+        enc.Add(RowOperationsPB::DELETE, row);
+        break;
+      case 4:
         enc.Add(RowOperationsPB::SPLIT_ROW, row);
+        break;
+      case 5:
+        enc.Add(RowOperationsPB::RANGE_LOWER_BOUND, row);
+        break;
+      case 6:
+        enc.Add(RowOperationsPB::RANGE_UPPER_BOUND, row);
+        break;
+      case 7:
+        enc.Add(RowOperationsPB::EXCLUSIVE_RANGE_LOWER_BOUND, row);
+        break;
+      case 8:
+        enc.Add(RowOperationsPB::INCLUSIVE_RANGE_UPPER_BOUND, row);
         break;
     }
 
@@ -226,7 +241,13 @@ void GlogFailure() {
 // random mutations like adding an extra column, removing a column, changing
 // types, and changing nullability.
 TEST_F(RowOperationsTest, SchemaFuzz) {
-  const int n_iters = AllowSlowTests() ? 10000 : 10;
+#ifdef ADDRESS_SANITIZER
+  // Prevent timeouts in ASAN build.
+  const int kSlowTestIters = 1000;
+#else
+  const int kSlowTestIters = 10000;
+#endif
+  const int n_iters = AllowSlowTests() ? kSlowTestIters : 10;
   for (int i = 0; i < n_iters; i++) {
     // Generate a random client and server schema pair.
     Schema client_schema = GenRandomSchema(false);
@@ -363,7 +384,7 @@ TEST_F(RowOperationsTest, ProjectionTestWholeSchemaSpecified) {
     CHECK_OK(client_row.SetInt32("key", 12345));
     CHECK_OK(client_row.SetInt32("int_val", 54321));
     CHECK_OK(client_row.SetStringCopy("string_val", "hello world"));
-    EXPECT_EQ("INSERT (int32 key=12345, int32 int_val=54321, string string_val=hello world)",
+    EXPECT_EQ(R"(INSERT (int32 key=12345, int32 int_val=54321, string string_val="hello world"))",
               TestProjection(RowOperationsPB::INSERT, client_row, schema_));
 
     // The first result should have the field specified.
@@ -509,8 +530,8 @@ TEST_F(RowOperationsTest, TestProjectUpdates) {
             TestProjection(RowOperationsPB::UPDATE, client_row, server_schema));
 
   // Specify the key and update both columns
-  ASSERT_OK(client_row.SetString("string_val", "foo"));
-  EXPECT_EQ("MUTATE (int32 key=12345) SET int_val=12345, string_val=foo",
+  ASSERT_OK(client_row.SetStringNoCopy("string_val", "foo"));
+  EXPECT_EQ(R"(MUTATE (int32 key=12345) SET int_val=12345, string_val="foo")",
             TestProjection(RowOperationsPB::UPDATE, client_row, server_schema));
 
   // Update the nullable column to null.
@@ -553,7 +574,7 @@ TEST_F(RowOperationsTest, DISABLED_TestProjectUpdatesSubsetOfColumns) {
 
   KuduPartialRow client_row(&client_schema);
   ASSERT_OK(client_row.SetInt32("key", 12345));
-  ASSERT_OK(client_row.SetString("string_val", "foo"));
+  ASSERT_OK(client_row.SetStringNoCopy("string_val", "foo"));
   EXPECT_EQ("MUTATE (int32 key=12345) SET string_val=foo",
             TestProjection(RowOperationsPB::UPDATE, client_row, server_schema));
 }
@@ -598,7 +619,7 @@ TEST_F(RowOperationsTest, TestProjectDeletes) {
             TestProjection(RowOperationsPB::DELETE, client_row, server_schema));
 
   // Extra column set (incorrect)
-  ASSERT_OK(client_row.SetString("string_val", "hello"));
+  ASSERT_OK(client_row.SetStringNoCopy("string_val", "hello"));
   EXPECT_EQ("error: Invalid argument: DELETE should not have a value for column: "
             "string_val[string NULLABLE]",
             TestProjection(RowOperationsPB::DELETE, client_row, server_schema));
@@ -611,7 +632,7 @@ TEST_F(RowOperationsTest, SplitKeyRoundTrip) {
                                   ColumnSchema("int64", INT64),
                                   ColumnSchema("string", STRING),
                                   ColumnSchema("binary", BINARY),
-                                  ColumnSchema("timestamp", TIMESTAMP),
+                                  ColumnSchema("timestamp", UNIXTIME_MICROS),
                                   ColumnSchema("missing", STRING) },
                                 8);
 
@@ -626,9 +647,9 @@ TEST_F(RowOperationsTest, SplitKeyRoundTrip) {
   ASSERT_OK(row.SetInt16("int16", int16_expected));
   ASSERT_OK(row.SetInt32("int32", int32_expected));
   ASSERT_OK(row.SetInt64("int64", int64_expected));
-  ASSERT_OK(row.SetString("string", "string-value"));
-  ASSERT_OK(row.SetBinary("binary", "binary-value"));
-  ASSERT_OK(row.SetTimestamp("timestamp", 9));
+  ASSERT_OK(row.SetStringNoCopy("string", "string-value"));
+  ASSERT_OK(row.SetBinaryNoCopy("binary", "binary-value"));
+  ASSERT_OK(row.SetUnixTimeMicros("timestamp", 9));
 
   RowOperationsPB pb;
   RowOperationsPBEncoder(&pb).Add(RowOperationsPB::SPLIT_ROW, row);

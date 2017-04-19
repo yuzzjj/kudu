@@ -1,23 +1,6 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
-//
 // Some portions Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
-// found in the LICENSE file. See the AUTHORS file for names of contributors.
+// found in the LICENSE file.
 
 #include <glog/logging.h>
 #include <gflags/gflags.h>
@@ -38,30 +21,28 @@ DECLARE_string(nvm_cache_path);
 namespace kudu {
 
 // Conversions between numeric keys/values and the types expected by Cache.
-static std::string EncodeKey(int k) {
+static std::string EncodeInt(int k) {
   faststring result;
   PutFixed32(&result, k);
   return result.ToString();
 }
-static int DecodeKey(const Slice& k) {
+static int DecodeInt(const Slice& k) {
   assert(k.size() == 4);
   return DecodeFixed32(k.data());
 }
-static void* EncodeValue(uintptr_t v) { return reinterpret_cast<void*>(v); }
-static int DecodeValue(void* v) { return reinterpret_cast<uintptr_t>(v); }
 
 class CacheTest : public KuduTest,
                   public ::testing::WithParamInterface<CacheType>,
-                  public CacheDeleter {
+                  public Cache::EvictionCallback {
  public:
 
-  // Implementation of the CacheDeleter interface
-  virtual void Delete(const Slice& key, void* v) OVERRIDE {
-    deleted_keys_.push_back(DecodeKey(key));
-    deleted_values_.push_back(DecodeValue(v));
+  // Implementation of the EvictionCallback interface
+  void EvictedEntry(Slice key, Slice val) override {
+    evicted_keys_.push_back(DecodeInt(key));
+    evicted_values_.push_back(DecodeInt(val));
   }
-  std::vector<int> deleted_keys_;
-  std::vector<int> deleted_values_;
+  std::vector<int> evicted_keys_;
+  std::vector<int> evicted_values_;
   std::shared_ptr<MemTracker> mem_tracker_;
   gscoped_ptr<Cache> cache_;
   MetricRegistry metric_registry_;
@@ -92,8 +73,8 @@ class CacheTest : public KuduTest,
   }
 
   int Lookup(int key) {
-    Cache::Handle* handle = cache_->Lookup(EncodeKey(key), Cache::EXPECT_IN_CACHE);
-    const int r = (handle == nullptr) ? -1 : DecodeValue(cache_->Value(handle));
+    Cache::Handle* handle = cache_->Lookup(EncodeInt(key), Cache::EXPECT_IN_CACHE);
+    const int r = (handle == nullptr) ? -1 : DecodeInt(cache_->Value(handle));
     if (handle != nullptr) {
       cache_->Release(handle);
     }
@@ -101,12 +82,16 @@ class CacheTest : public KuduTest,
   }
 
   void Insert(int key, int value, int charge = 1) {
-    cache_->Release(cache_->Insert(EncodeKey(key), EncodeValue(value), charge,
-                                   this));
+    string key_str = EncodeInt(key);
+    string val_str = EncodeInt(value);
+    Cache::PendingHandle* handle = CHECK_NOTNULL(cache_->Allocate(key_str, val_str.size(), charge));
+    memcpy(cache_->MutableValue(handle), val_str.data(), val_str.size());
+
+    cache_->Release(cache_->Insert(handle, this));
   }
 
   void Erase(int key) {
-    cache_->Erase(EncodeKey(key));
+    cache_->Erase(EncodeInt(key));
   }
 };
 
@@ -144,53 +129,53 @@ TEST_P(CacheTest, HitAndMiss) {
   ASSERT_EQ(201, Lookup(200));
   ASSERT_EQ(-1,  Lookup(300));
 
-  ASSERT_EQ(1, deleted_keys_.size());
-  ASSERT_EQ(100, deleted_keys_[0]);
-  ASSERT_EQ(101, deleted_values_[0]);
+  ASSERT_EQ(1, evicted_keys_.size());
+  ASSERT_EQ(100, evicted_keys_[0]);
+  ASSERT_EQ(101, evicted_values_[0]);
 }
 
 TEST_P(CacheTest, Erase) {
   Erase(200);
-  ASSERT_EQ(0, deleted_keys_.size());
+  ASSERT_EQ(0, evicted_keys_.size());
 
   Insert(100, 101);
   Insert(200, 201);
   Erase(100);
   ASSERT_EQ(-1,  Lookup(100));
   ASSERT_EQ(201, Lookup(200));
-  ASSERT_EQ(1, deleted_keys_.size());
-  ASSERT_EQ(100, deleted_keys_[0]);
-  ASSERT_EQ(101, deleted_values_[0]);
+  ASSERT_EQ(1, evicted_keys_.size());
+  ASSERT_EQ(100, evicted_keys_[0]);
+  ASSERT_EQ(101, evicted_values_[0]);
 
   Erase(100);
   ASSERT_EQ(-1,  Lookup(100));
   ASSERT_EQ(201, Lookup(200));
-  ASSERT_EQ(1, deleted_keys_.size());
+  ASSERT_EQ(1, evicted_keys_.size());
 }
 
 TEST_P(CacheTest, EntriesArePinned) {
   Insert(100, 101);
-  Cache::Handle* h1 = cache_->Lookup(EncodeKey(100), Cache::EXPECT_IN_CACHE);
-  ASSERT_EQ(101, DecodeValue(cache_->Value(h1)));
+  Cache::Handle* h1 = cache_->Lookup(EncodeInt(100), Cache::EXPECT_IN_CACHE);
+  ASSERT_EQ(101, DecodeInt(cache_->Value(h1)));
 
   Insert(100, 102);
-  Cache::Handle* h2 = cache_->Lookup(EncodeKey(100), Cache::EXPECT_IN_CACHE);
-  ASSERT_EQ(102, DecodeValue(cache_->Value(h2)));
-  ASSERT_EQ(0, deleted_keys_.size());
+  Cache::Handle* h2 = cache_->Lookup(EncodeInt(100), Cache::EXPECT_IN_CACHE);
+  ASSERT_EQ(102, DecodeInt(cache_->Value(h2)));
+  ASSERT_EQ(0, evicted_keys_.size());
 
   cache_->Release(h1);
-  ASSERT_EQ(1, deleted_keys_.size());
-  ASSERT_EQ(100, deleted_keys_[0]);
-  ASSERT_EQ(101, deleted_values_[0]);
+  ASSERT_EQ(1, evicted_keys_.size());
+  ASSERT_EQ(100, evicted_keys_[0]);
+  ASSERT_EQ(101, evicted_values_[0]);
 
   Erase(100);
   ASSERT_EQ(-1, Lookup(100));
-  ASSERT_EQ(1, deleted_keys_.size());
+  ASSERT_EQ(1, evicted_keys_.size());
 
   cache_->Release(h2);
-  ASSERT_EQ(2, deleted_keys_.size());
-  ASSERT_EQ(100, deleted_keys_[1]);
-  ASSERT_EQ(102, deleted_values_[1]);
+  ASSERT_EQ(2, evicted_keys_.size());
+  ASSERT_EQ(100, evicted_keys_[1]);
+  ASSERT_EQ(102, evicted_values_[1]);
 }
 
 TEST_P(CacheTest, EvictionPolicy) {
@@ -200,13 +185,16 @@ TEST_P(CacheTest, EvictionPolicy) {
   const int kNumElems = 1000;
   const int kSizePerElem = kCacheSize / kNumElems;
 
-  // Frequently used entry must be kept around
-  for (int i = 0; i < kNumElems + 100; i++) {
+  // Loop adding and looking up new entries, but repeatedly accessing key 101. This
+  // frequently-used entry should not be evicted.
+  for (int i = 0; i < kNumElems + 1000; i++) {
     Insert(1000+i, 2000+i, kSizePerElem);
     ASSERT_EQ(2000+i, Lookup(1000+i));
     ASSERT_EQ(101, Lookup(100));
   }
   ASSERT_EQ(101, Lookup(100));
+  // Since '200' wasn't accessed in the loop above, it should have
+  // been evicted.
   ASSERT_EQ(-1, Lookup(200));
 }
 

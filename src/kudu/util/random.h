@@ -1,15 +1,16 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
-
 #ifndef KUDU_UTIL_RANDOM_H_
 #define KUDU_UTIL_RANDOM_H_
 
-#include <stdint.h>
-
 #include <cmath>
+#include <cstdint>
+#include <mutex>
+#include <random>
 #include <vector>
 
+#include "kudu/gutil/casts.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/util/locks.h"
 
@@ -21,6 +22,9 @@ static const uint32_t M = 2147483647L;   // 2^31-1
 const double kTwoPi = 6.283185307179586476925286;
 
 } // namespace random_internal
+
+template<class R>
+class StdUniformRNG;
 
 // A very simple random number generator.  Not especially good at
 // generating truly random bits, but good enough for our needs in this
@@ -70,16 +74,12 @@ class Random {
   uint32_t Next32() { return Next(); }
 
   // Next pseudo-random 64-bit unsigned integer.
-  // FIXME: This currently only generates 62 bits of randomness due to Next()
-  // only giving 31 bits of randomness. The 2 most significant bits will always
-  // be zero.
   uint64_t Next64() {
     uint64_t large = Next();
-    // Only shift by 31 bits so we end up with zeros in MSB and not scattered
-    // throughout the 64-bit word. This is due to the weakness in Next() noted
-    // above.
     large <<= 31;
     large |= Next();
+    // Fill in the highest two MSBs.
+    large |= implicit_cast<uint64_t>(Next32()) << 62;
     return large;
   }
 
@@ -105,16 +105,8 @@ class Random {
     return Uniform(1 << Uniform(max_log + 1));
   }
 
-  // Creates a normal distribution variable using the
-  // Box-Muller transform. See:
-  // http://en.wikipedia.org/wiki/Box%E2%80%93Muller_transform
-  // Adapted from WebRTC source code at:
-  // webrtc/trunk/modules/video_coding/main/test/test_util.cc
-  double Normal(double mean, double std_dev) {
-    double uniform1 = (Next() + 1.0) / (random_internal::M + 1.0);
-    double uniform2 = (Next() + 1.0) / (random_internal::M + 1.0);
-    return (mean + std_dev * sqrt(-2 * ::log(uniform1)) * cos(random_internal::kTwoPi * uniform2));
-  }
+  // Samples a random number from the given normal distribution.
+  double Normal(double mean, double std_dev);
 
   // Return a random number between 0.0 and 1.0 inclusive.
   double NextDoubleFraction() {
@@ -164,59 +156,59 @@ class ThreadSafeRandom {
   }
 
   void Reset(uint32_t s) {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     random_.Reset(s);
   }
 
   uint32_t Next() {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     return random_.Next();
   }
 
   uint32_t Next32() {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     return random_.Next32();
   }
 
   uint64_t Next64() {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     return random_.Next64();
   }
 
   uint32_t Uniform(uint32_t n) {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     return random_.Uniform(n);
   }
 
   uint32_t Uniform32(uint32_t n) {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     return random_.Uniform32(n);
   }
 
   uint64_t Uniform64(uint64_t n) {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     return random_.Uniform64(n);
   }
 
   bool OneIn(int n) {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     return random_.OneIn(n);
   }
 
   uint32_t Skewed(int max_log) {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     return random_.Skewed(max_log);
   }
 
   double Normal(double mean, double std_dev) {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     return random_.Normal(mean, std_dev);
   }
 
   template<class Collection, class Set, class T>
   void ReservoirSample(const Collection& c, int k, const Set& avoid,
                        std::vector<T>* result) {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     random_.ReservoirSample(c, k, avoid, result);
   }
 
@@ -225,7 +217,31 @@ class ThreadSafeRandom {
   Random random_;
 };
 
+// Wraps either Random or ThreadSafeRandom as a C++ standard library
+// compliant UniformRandomNumberGenerator:
+//   http://en.cppreference.com/w/cpp/concept/UniformRandomNumberGenerator
+template<class R>
+class StdUniformRNG {
+ public:
+  typedef uint32_t result_type;
 
+  explicit StdUniformRNG(R* r) : r_(r) {}
+  uint32_t operator()() {
+    return r_->Next32();
+  }
+  constexpr static uint32_t min() { return 0; }
+  constexpr static uint32_t max() { return (1L << 31) - 1; }
+
+ private:
+  R* r_;
+};
+
+// Defined outside the class to make use of StdUniformRNG above.
+inline double Random::Normal(double mean, double std_dev) {
+  std::normal_distribution<> nd(mean, std_dev);
+  StdUniformRNG<Random> gen(this);
+  return nd(gen);
+}
 
 }  // namespace kudu
 

@@ -14,24 +14,12 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 #ifndef UTIL_URL_CODING_H
 #define UTIL_URL_CODING_H
 
 #include <stdint.h>
 
+#include <iosfwd>
 #include <string>
 #include <vector>
 
@@ -58,9 +46,9 @@ bool UrlDecode(const std::string& in, std::string* out, bool hive_compat = false
 // very performant (multiple string copies) and should not be used
 // in a hot path.
 void Base64Encode(const std::vector<uint8_t>& in, std::string* out);
-void Base64Encode(const std::vector<uint8_t>& in, std::stringstream* out);
+void Base64Encode(const std::vector<uint8_t>& in, std::ostringstream* out);
 void Base64Encode(const std::string& in, std::string* out);
-void Base64Encode(const std::string& in, std::stringstream* out);
+void Base64Encode(const std::string& in, std::ostringstream* out);
 
 // Utility method to decode base64 encoded strings.  Also not extremely
 // performant.
@@ -72,7 +60,7 @@ bool Base64Decode(const std::string& in, std::string* out);
 // added to on a case-by-case basis. Slow, since it necessarily
 // inspects each character in turn, and copies them all to *out; use
 // judiciously.
-void EscapeForHtml(const std::string& in, std::stringstream* out);
+void EscapeForHtml(const std::string& in, std::ostringstream* out);
 
 // Same as above, but returns a string.
 std::string EscapeForHtmlToString(const std::string& in);

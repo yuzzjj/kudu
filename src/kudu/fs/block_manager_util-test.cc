@@ -38,19 +38,19 @@ using strings::Substitute;
 
 TEST_F(KuduTest, Lifecycle) {
   string kType = "asdf";
-  string kFileName = JoinPathSegments(GetTestDataDirectory(), "foo");
+  string kFileName = GetTestPath("foo");
   string kUuid = "a_uuid";
 
   // Test that the metadata file was created.
   {
-    PathInstanceMetadataFile file(env_.get(), kType, kFileName);
+    PathInstanceMetadataFile file(env_, kType, kFileName);
     ASSERT_OK(file.Create(kUuid, { kUuid }));
   }
   ASSERT_TRUE(env_->FileExists(kFileName));
 
   // Test that we could open and parse it.
   {
-    PathInstanceMetadataFile file(env_.get(), kType, kFileName);
+    PathInstanceMetadataFile file(env_, kType, kFileName);
     ASSERT_OK(file.LoadFromDisk());
     PathInstanceMetadataPB* md = file.metadata();
     ASSERT_EQ(kType, md->block_manager_type());
@@ -62,7 +62,7 @@ TEST_F(KuduTest, Lifecycle) {
 
   // Test that expecting a different type of block manager fails.
   {
-    PathInstanceMetadataFile file(env_.get(), "other type", kFileName);
+    PathInstanceMetadataFile file(env_, "other type", kFileName);
     PathInstanceMetadataPB pb;
     ASSERT_TRUE(file.LoadFromDisk().IsIOError());
   }
@@ -70,25 +70,25 @@ TEST_F(KuduTest, Lifecycle) {
 
 TEST_F(KuduTest, Locking) {
   string kType = "asdf";
-  string kFileName = JoinPathSegments(GetTestDataDirectory(), "foo");
+  string kFileName = GetTestPath("foo");
   string kUuid = "a_uuid";
 
-  PathInstanceMetadataFile file(env_.get(), kType, kFileName);
+  PathInstanceMetadataFile file(env_, kType, kFileName);
   ASSERT_OK(file.Create(kUuid, { kUuid }));
 
-  PathInstanceMetadataFile first(env_.get(), kType, kFileName);
+  PathInstanceMetadataFile first(env_, kType, kFileName);
   ASSERT_OK(first.LoadFromDisk());
   ASSERT_OK(first.Lock());
 
   ASSERT_DEATH({
-    PathInstanceMetadataFile second(env_.get(), kType, kFileName);
+    PathInstanceMetadataFile second(env_, kType, kFileName);
     CHECK_OK(second.LoadFromDisk());
     CHECK_OK(second.Lock());
   }, "Could not lock");
 
   ASSERT_OK(first.Unlock());
   ASSERT_DEATH({
-    PathInstanceMetadataFile second(env_.get(), kType, kFileName);
+    PathInstanceMetadataFile second(env_, kType, kFileName);
     CHECK_OK(second.LoadFromDisk());
     Status s = second.Lock();
     if (s.ok()) {
@@ -108,12 +108,12 @@ static void RunCheckIntegrityTest(Env* env,
   int i = 0;
   for (const PathSetPB& ps : path_sets) {
     gscoped_ptr<PathInstanceMetadataFile> instance(
-        new PathInstanceMetadataFile(env, "asdf", Substitute("$0", i)));
+        new PathInstanceMetadataFile(env, "asdf", Substitute("/tmp/$0/instance", i)));
     gscoped_ptr<PathInstanceMetadataPB> metadata(new PathInstanceMetadataPB());
     metadata->set_block_manager_type("asdf");
     metadata->set_filesystem_block_size_bytes(1);
     metadata->mutable_path_set()->CopyFrom(ps);
-    instance->SetMetadataForTests(metadata.Pass());
+    instance->SetMetadataForTests(std::move(metadata));
     instances.push_back(instance.release());
     i++;
   }
@@ -136,15 +136,16 @@ TEST_F(KuduTest, CheckIntegrity) {
 
   {
     // Test consistent path sets.
-    EXPECT_NO_FATAL_FAILURE(RunCheckIntegrityTest(env_.get(), path_sets, "OK"));
+    EXPECT_NO_FATAL_FAILURE(RunCheckIntegrityTest(env_, path_sets, "OK"));
   }
   {
     // Test where two path sets claim the same UUID.
     vector<PathSetPB> path_sets_copy(path_sets);
     path_sets_copy[1].set_uuid(path_sets_copy[0].uuid());
     EXPECT_NO_FATAL_FAILURE(RunCheckIntegrityTest(
-        env_.get(), path_sets_copy,
-        "IO error: File 1 claimed uuid fee already claimed by file 0"));
+        env_, path_sets_copy,
+        "IO error: Data directories /tmp/0 and /tmp/1 have duplicate instance metadata UUIDs: "
+        "fee"));
   }
   {
     // Test where the path sets have duplicate UUIDs.
@@ -153,26 +154,35 @@ TEST_F(KuduTest, CheckIntegrity) {
       ps.add_all_uuids("fee");
     }
     EXPECT_NO_FATAL_FAILURE(RunCheckIntegrityTest(
-        env_.get(), path_sets_copy,
-        "IO error: File 0 has duplicate uuids: fee,fi,fo,fum,fee"));
+        env_, path_sets_copy,
+        "IO error: Data directory /tmp/0 instance metadata path set contains duplicate UUIDs: "
+        "fee,fi,fo,fum,fee"));
   }
   {
     // Test where a path set claims a UUID that isn't in all_uuids.
     vector<PathSetPB> path_sets_copy(path_sets);
     path_sets_copy[1].set_uuid("something_else");
     EXPECT_NO_FATAL_FAILURE(RunCheckIntegrityTest(
-        env_.get(), path_sets_copy,
-        "IO error: File 1 claimed uuid something_else which is not in "
-        "all_uuids (fee,fi,fo,fum)"));
+        env_, path_sets_copy,
+        "IO error: Data directory /tmp/1 instance metadata contains unexpected UUID: "
+        "something_else"));
   }
   {
     // Test where a path set claims a different all_uuids.
     vector<PathSetPB> path_sets_copy(path_sets);
     path_sets_copy[1].add_all_uuids("another_uuid");
     EXPECT_NO_FATAL_FAILURE(RunCheckIntegrityTest(
-        env_.get(), path_sets_copy,
-        "IO error: File 1 claimed all_uuids fee,fi,fo,fum,another_uuid but "
-        "file 0 claimed all_uuids fee,fi,fo,fum"));
+        env_, path_sets_copy,
+        "IO error: Data directories /tmp/0 and /tmp/1 have different instance metadata UUID sets: "
+        "fee,fi,fo,fum vs fee,fi,fo,fum,another_uuid"));
+  }
+  {
+    // Test removing a path from the set.
+    vector<PathSetPB> path_sets_copy(path_sets);
+    path_sets_copy.resize(1);
+    EXPECT_NO_FATAL_FAILURE(RunCheckIntegrityTest(
+        env_, path_sets_copy,
+        "IO error: 1 data directories provided, but expected 4"));
   }
 }
 

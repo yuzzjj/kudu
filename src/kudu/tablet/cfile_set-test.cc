@@ -23,6 +23,7 @@
 #include "kudu/tablet/cfile_set.h"
 #include "kudu/tablet/diskrowset-test-base.h"
 #include "kudu/tablet/tablet-test-base.h"
+#include "kudu/util/mem_tracker.h"
 #include "kudu/util/test_util.h"
 
 DECLARE_int32(cfile_default_block_size);
@@ -35,9 +36,9 @@ namespace tablet {
 class TestCFileSet : public KuduRowSetTest {
  public:
   TestCFileSet() :
-    KuduRowSetTest(Schema({ ColumnSchema("c0", UINT32),
-                            ColumnSchema("c1", UINT32, false, nullptr, nullptr, GetRLEStorage()),
-                            ColumnSchema("c2", UINT32) }, 1))
+    KuduRowSetTest(Schema({ ColumnSchema("c0", INT32),
+                            ColumnSchema("c1", INT32, false, nullptr, nullptr, GetRLEStorage()),
+                            ColumnSchema("c2", INT32) }, 1))
   {}
 
   virtual void SetUp() OVERRIDE {
@@ -61,9 +62,9 @@ class TestCFileSet : public KuduRowSetTest {
     RowBuilder rb(schema_);
     for (int i = 0; i < nrows; i++) {
       rb.Reset();
-      rb.AddUint32(i * 2);
-      rb.AddUint32(i * 10);
-      rb.AddUint32(i * 100);
+      rb.AddInt32(i * 2);
+      rb.AddInt32(i * 10);
+      rb.AddInt32(i * 100);
       ASSERT_OK_FAST(WriteRow(rb.data(), &rsw));
     }
     ASSERT_OK(rsw.Finish());
@@ -72,18 +73,17 @@ class TestCFileSet : public KuduRowSetTest {
   // Issue a range scan between 'lower' and 'upper', and verify that all result
   // rows indeed fall inside that predicate.
   void DoTestRangeScan(const shared_ptr<CFileSet> &fileset,
-                       uint32_t lower,
-                       uint32_t upper) {
+                       int32_t lower,
+                       int32_t upper) {
     // Create iterator.
     shared_ptr<CFileSet::Iterator> cfile_iter(fileset->NewIterator(&schema_));
     gscoped_ptr<RowwiseIterator> iter(new MaterializingIterator(cfile_iter));
 
     // Create a scan with a range predicate on the key column.
     ScanSpec spec;
-    ColumnRangePredicate pred1(
-      schema_.column(0),
-      lower != kNoBound ? &lower : nullptr,
-      upper != kNoBound ? &upper : nullptr);
+    auto pred1 = ColumnPredicate::Range(schema_.column(0),
+                                        lower != kNoBound ? &lower : nullptr,
+                                        upper != kNoBound ? &upper : nullptr);
     spec.AddPredicate(pred1);
     ASSERT_OK(iter->Init(&spec));
 
@@ -95,14 +95,22 @@ class TestCFileSet : public KuduRowSetTest {
       for (size_t i = 0; i < block.nrows(); i++) {
         if (block.selection_vector()->IsRowSelected(i)) {
           RowBlockRow row = block.row(i);
-          if ((lower != kNoBound && *schema_.ExtractColumnFromRow<UINT32>(row, 0) < lower) ||
-              (upper != kNoBound && *schema_.ExtractColumnFromRow<UINT32>(row, 0) > upper)) {
+          if ((lower != kNoBound && *schema_.ExtractColumnFromRow<INT32>(row, 0) < lower) ||
+              (upper != kNoBound && *schema_.ExtractColumnFromRow<INT32>(row, 0) >= upper)) {
             FAIL() << "Row " << schema_.DebugRow(row) << " should not have "
                    << "passed predicate " << pred1.ToString();
           }
         }
       }
     }
+  }
+
+  Status MaterializeColumn(CFileSet::Iterator *iter,
+                           size_t col_idx,
+                           ColumnBlock *cb) {
+    SelectionVector sel(cb->nrows());
+    ColumnMaterializationContext ctx(col_idx, nullptr, cb, &sel);
+    return iter->MaterializeColumn(&ctx);
   }
 
  private:
@@ -113,19 +121,19 @@ class TestCFileSet : public KuduRowSetTest {
   }
 
  protected:
-  static const uint32_t kNoBound;
+  static const int32_t kNoBound;
   google::FlagSaver saver;
 };
 
-const uint32_t TestCFileSet::kNoBound = kuint32max;
+const int32_t TestCFileSet::kNoBound = kuint32max;
 
 TEST_F(TestCFileSet, TestPartiallyMaterialize) {
   const int kCycleInterval = 10000;
   const int kNumRows = 100000;
   WriteTestRowSet(kNumRows);
 
-  shared_ptr<CFileSet> fileset(new CFileSet(rowset_meta_));
-  ASSERT_OK(fileset->Open());
+  shared_ptr<CFileSet> fileset;
+  ASSERT_OK(CFileSet::Open(rowset_meta_, MemTracker::GetRootTracker(), &fileset));
 
   gscoped_ptr<CFileSet::Iterator> iter(fileset->NewIterator(&schema_));
   ASSERT_OK(iter->Init(nullptr));
@@ -149,12 +157,12 @@ TEST_F(TestCFileSet, TestPartiallyMaterialize) {
     int cycle = (row_idx / kCycleInterval) % 3;
     if (cycle == 0 || cycle == 2) {
       ColumnBlock col(block.column_block(0));
-      ASSERT_OK_FAST(iter->MaterializeColumn(0, &col));
+      ASSERT_OK_FAST(MaterializeColumn(iter.get(), 0, &col));
 
       // Verify
       for (int i = 0; i < n; i++) {
-        uint32_t got = *reinterpret_cast<const uint32_t *>(col.cell_ptr(i));
-        uint32_t expected = (row_idx + i) * 2;
+        int32_t got = *reinterpret_cast<const int32_t *>(col.cell_ptr(i));
+        int32_t expected = (row_idx + i) * 2;
         if (got != expected) {
           FAIL() << "Failed at row index " << (row_idx + i) << ": expected "
                  << expected << " got " << got;
@@ -163,11 +171,11 @@ TEST_F(TestCFileSet, TestPartiallyMaterialize) {
     }
     if (cycle == 1 || cycle == 2) {
       ColumnBlock col(block.column_block(1));
-      ASSERT_OK_FAST(iter->MaterializeColumn(1, &col));
+      ASSERT_OK_FAST(MaterializeColumn(iter.get(), 1, &col));
 
       // Verify
       for (int i = 0; i < n; i++) {
-        uint32_t got = *reinterpret_cast<const uint32_t *>(col.cell_ptr(i));
+        int32_t got = *reinterpret_cast<const int32_t *>(col.cell_ptr(i));
         if (got != 10 * (row_idx + i)) {
           FAIL() << "Failed at row index " << (row_idx + i) << ": expected "
                  << 10 * (row_idx + i) << " got " << got;
@@ -204,8 +212,8 @@ TEST_F(TestCFileSet, TestIteratePartialSchema) {
   const int kNumRows = 100;
   WriteTestRowSet(kNumRows);
 
-  shared_ptr<CFileSet> fileset(new CFileSet(rowset_meta_));
-  ASSERT_OK(fileset->Open());
+  shared_ptr<CFileSet> fileset;
+  ASSERT_OK(CFileSet::Open(rowset_meta_, MemTracker::GetRootTracker(), &fileset));
 
   Schema new_schema;
   ASSERT_OK(schema_.CreateProjectionByNames({ "c0", "c2" }, &new_schema));
@@ -226,7 +234,7 @@ TEST_F(TestCFileSet, TestIteratePartialSchema) {
   // Ensure that we got the expected rows.
   ASSERT_EQ(results.size(), kNumRows);
   for (int i = 0; i < kNumRows; i++) {
-    ASSERT_EQ(StringPrintf("(uint32 c0=%d, uint32 c2=%d)", i * 2, i * 100),
+    ASSERT_EQ(StringPrintf("(int32 c0=%d, int32 c2=%d)", i * 2, i * 100),
               results[i]);
   }
 }
@@ -237,31 +245,30 @@ TEST_F(TestCFileSet, TestRangeScan) {
   const int kNumRows = 10000;
   WriteTestRowSet(kNumRows);
 
-  shared_ptr<CFileSet> fileset(new CFileSet(rowset_meta_));
-  ASSERT_OK(fileset->Open());
+  shared_ptr<CFileSet> fileset;
+  ASSERT_OK(CFileSet::Open(rowset_meta_, MemTracker::GetRootTracker(), &fileset));
 
   // Create iterator.
   shared_ptr<CFileSet::Iterator> cfile_iter(fileset->NewIterator(&schema_));
   gscoped_ptr<RowwiseIterator> iter(new MaterializingIterator(cfile_iter));
   Schema key_schema = schema_.CreateKeyProjection();
   Arena arena(1024, 256 * 1024);
-  RangePredicateEncoder encoder(&key_schema, &arena);
+  AutoReleasePool pool;
 
   // Create a scan with a range predicate on the key column.
   ScanSpec spec;
-  uint32_t lower = 2000;
-  uint32_t upper = 2009;
-  ColumnRangePredicate pred1(schema_.column(0), &lower, &upper);
+  int32_t lower = 2000;
+  int32_t upper = 2010;
+  auto pred1 = ColumnPredicate::Range(schema_.column(0), &lower, &upper);
   spec.AddPredicate(pred1);
-  encoder.EncodeRangePredicates(&spec, true);
+  spec.OptimizeScan(schema_, &arena, &pool, true);
   ASSERT_OK(iter->Init(&spec));
 
   // Check that the bounds got pushed as index bounds.
   // Since the key column is the rowidx * 2, we need to divide the integer bounds
   // back down.
   EXPECT_EQ(lower / 2, cfile_iter->lower_bound_idx_);
-  // + 1 because the upper bound is exclusive
-  EXPECT_EQ(upper / 2 + 1, cfile_iter->upper_bound_idx_);
+  EXPECT_EQ(upper / 2, cfile_iter->upper_bound_idx_);
 
   // Read all the results.
   vector<string> results;
@@ -272,8 +279,8 @@ TEST_F(TestCFileSet, TestRangeScan) {
     LOG(INFO) << str;
   }
   ASSERT_EQ(5, results.size());
-  EXPECT_EQ("(uint32 c0=2000, uint32 c1=10000, uint32 c2=100000)", results[0]);
-  EXPECT_EQ("(uint32 c0=2008, uint32 c1=10040, uint32 c2=100400)", results[4]);
+  EXPECT_EQ("(int32 c0=2000, int32 c1=10000, int32 c2=100000)", results[0]);
+  EXPECT_EQ("(int32 c0=2008, int32 c1=10040, int32 c2=100400)", results[4]);
 
   // Ensure that we only read the relevant range from all of the columns.
   // Since it's a small range, it should be all in one data block in each column.
@@ -290,8 +297,8 @@ TEST_F(TestCFileSet, TestRangePredicates2) {
   const int kNumRows = 10000;
   WriteTestRowSet(kNumRows);
 
-  shared_ptr<CFileSet> fileset(new CFileSet(rowset_meta_));
-  ASSERT_OK(fileset->Open());
+  shared_ptr<CFileSet> fileset;
+  ASSERT_OK(CFileSet::Open(rowset_meta_, MemTracker::GetRootTracker(), &fileset));
 
   // Range scan where rows match on both ends
   DoTestRangeScan(fileset, 2000, 2010);

@@ -16,10 +16,11 @@
 // under the License.
 
 #include <algorithm>
+#include <memory>
+
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
-#include <memory>
 
 #include "kudu/common/partial_row.h"
 #include "kudu/consensus/log_anchor_registry.h"
@@ -32,6 +33,7 @@
 #include "kudu/tablet/compaction.h"
 #include "kudu/tablet/local_tablet_writer.h"
 #include "kudu/tablet/tablet-test-util.h"
+#include "kudu/tablet/tablet_mem_trackers.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/test_util.h"
 
@@ -47,7 +49,6 @@ DEFINE_int32(merge_benchmark_num_rows_per_rowset, 500000,
              "Number of rowsets as input to the merge");
 
 DECLARE_string(block_manager);
-DECLARE_bool(enable_data_block_fsync);
 
 using std::shared_ptr;
 
@@ -68,8 +69,8 @@ class TestCompaction : public KuduRowSetTest {
     : KuduRowSetTest(CreateSchema()),
       op_id_(consensus::MaximumOpId()),
       row_builder_(schema_),
-      mvcc_(scoped_refptr<server::Clock>(
-              server::LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp))),
+      arena_(32*1024, 128*1024),
+      clock_(server::LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp)),
       log_anchor_registry_(new log::LogAnchorRegistry()) {
   }
 
@@ -93,8 +94,13 @@ class TestCompaction : public KuduRowSetTest {
   // The 'nullable_val' column is set to either NULL (when val is odd)
   // or 'val' (when val is even).
   void InsertRow(MemRowSet *mrs, int row_key, int32_t val) {
-    ScopedTransaction tx(&mvcc_);
+    ScopedTransaction tx(&mvcc_, clock_->Now());
     tx.StartApplying();
+    InsertRowInTransaction(mrs, tx, row_key, val);
+    tx.Commit();
+  }
+
+  void BuildRow(int row_key, int32_t val) {
     row_builder_.Reset();
     snprintf(key_buf_, sizeof(key_buf_), kRowKeyFormat, row_key);
     row_builder_.AddString(Slice(key_buf_));
@@ -104,6 +110,13 @@ class TestCompaction : public KuduRowSetTest {
     } else {
       row_builder_.AddNull();
     }
+  }
+
+  void InsertRowInTransaction(MemRowSet *mrs,
+                              const ScopedTransaction& txn,
+                              int row_key,
+                              int32_t val) {
+    BuildRow(row_key, val);
     if (!mrs->schema().Equals(row_builder_.schema())) {
       // The MemRowSet is not projecting the row, so must be done by the caller
       RowProjector projector(&row_builder_.schema(), &mrs->schema());
@@ -111,12 +124,11 @@ class TestCompaction : public KuduRowSetTest {
       ContiguousRow dst_row(&mrs->schema(), rowbuf);
       ASSERT_OK_FAST(projector.Init());
       ASSERT_OK_FAST(projector.ProjectRowForWrite(row_builder_.row(),
-                            &dst_row, static_cast<Arena*>(nullptr)));
-      ASSERT_OK_FAST(mrs->Insert(tx.timestamp(), ConstContiguousRow(dst_row), op_id_));
+                                                  &dst_row, static_cast<Arena*>(nullptr)));
+      ASSERT_OK_FAST(mrs->Insert(txn.timestamp(), ConstContiguousRow(dst_row), op_id_));
     } else {
-      ASSERT_OK_FAST(mrs->Insert(tx.timestamp(), row_builder_.row(), op_id_));
+      ASSERT_OK_FAST(mrs->Insert(txn.timestamp(), row_builder_.row(), op_id_));
     }
-    tx.Commit();
   }
 
   // Update n_rows rows of data.
@@ -126,68 +138,88 @@ class TestCompaction : public KuduRowSetTest {
   // Note that this is the opposite of InsertRow() above, so that the updates
   // flop NULL to non-NULL and vice versa.
   void UpdateRows(RowSet *rowset, int n_rows, int delta, int32_t new_val) {
-    char keybuf[256];
-    faststring update_buf;
-    ColumnId col_id = schema_.column_id(schema_.find_column("val"));
-    ColumnId nullable_col_id = schema_.column_id(schema_.find_column("nullable_val"));
     for (uint32_t i = 0; i < n_rows; i++) {
       SCOPED_TRACE(i);
-      ScopedTransaction tx(&mvcc_);
-      tx.StartApplying();
-      snprintf(keybuf, sizeof(keybuf), kRowKeyFormat, i * 10 + delta);
-
-      update_buf.clear();
-      RowChangeListEncoder update(&update_buf);
-      update.AddColumnUpdate(schema_.column_by_id(col_id), col_id, &new_val);
-      if (new_val % 2 == 0) {
-        update.AddColumnUpdate(schema_.column_by_id(nullable_col_id),
-                               nullable_col_id, nullptr);
-      } else {
-        update.AddColumnUpdate(schema_.column_by_id(nullable_col_id),
-                               nullable_col_id, &new_val);
-      }
-
-      RowBuilder rb(schema_.CreateKeyProjection());
-      rb.AddString(Slice(keybuf));
-      RowSetKeyProbe probe(rb.row());
-      ProbeStats stats;
-      OperationResultPB result;
-      ASSERT_OK(rowset->MutateRow(tx.timestamp(),
-                                         probe,
-                                         RowChangeList(update_buf),
-                                         op_id_,
-                                         &stats,
-                                         &result));
-      tx.Commit();
+      UpdateRow(rowset, i * 10 + delta, new_val);
     }
   }
 
-  void DeleteRows(RowSet *rowset, int n_rows, int delta) {
+  void UpdateRow(RowSet *rowset, int row_key, int32_t new_val) {
+    ScopedTransaction tx(&mvcc_, clock_->Now());
+    tx.StartApplying();
+    UpdateRowInTransaction(rowset, tx, row_key, new_val);
+    tx.Commit();
+  }
+
+  void UpdateRowInTransaction(RowSet *rowset,
+                              const ScopedTransaction& txn,
+                              int row_key,
+                              int32_t new_val) {
+    ColumnId col_id = schema_.column_id(schema_.find_column("val"));
+    ColumnId nullable_col_id = schema_.column_id(schema_.find_column("nullable_val"));
+
     char keybuf[256];
+    faststring update_buf;
+    snprintf(keybuf, sizeof(keybuf), kRowKeyFormat, row_key);
+
+    update_buf.clear();
+    RowChangeListEncoder update(&update_buf);
+    update.AddColumnUpdate(schema_.column_by_id(col_id), col_id, &new_val);
+    if (new_val % 2 == 0) {
+      update.AddColumnUpdate(schema_.column_by_id(nullable_col_id),
+                             nullable_col_id, nullptr);
+    } else {
+      update.AddColumnUpdate(schema_.column_by_id(nullable_col_id),
+                             nullable_col_id, &new_val);
+    }
+
+    RowBuilder rb(schema_.CreateKeyProjection());
+    rb.AddString(Slice(keybuf));
+    RowSetKeyProbe probe(rb.row());
+    ProbeStats stats;
+    OperationResultPB result;
+    ASSERT_OK(rowset->MutateRow(txn.timestamp(),
+                                probe,
+                                RowChangeList(update_buf),
+                                op_id_,
+                                &stats,
+                                &result));
+  }
+
+  void DeleteRows(RowSet* rowset, int n_rows) {
     faststring update_buf;
     for (uint32_t i = 0; i < n_rows; i++) {
       SCOPED_TRACE(i);
-      ScopedTransaction tx(&mvcc_);
-      tx.StartApplying();
-      snprintf(keybuf, sizeof(keybuf), kRowKeyFormat, i * 10 + delta);
-
-      update_buf.clear();
-      RowChangeListEncoder update(&update_buf);
-      update.SetToDelete();
-
-      RowBuilder rb(schema_.CreateKeyProjection());
-      rb.AddString(Slice(keybuf));
-      RowSetKeyProbe probe(rb.row());
-      ProbeStats stats;
-      OperationResultPB result;
-      ASSERT_OK(rowset->MutateRow(tx.timestamp(),
-                                         probe,
-                                         RowChangeList(update_buf),
-                                         op_id_,
-                                         &stats,
-                                         &result));
-      tx.Commit();
+      DeleteRow(rowset, i * 10);
     }
+  }
+
+  void DeleteRow(RowSet* rowset, int row_key) {
+    ScopedTransaction tx(&mvcc_, clock_->Now());
+    tx.StartApplying();
+    DeleteRowInTransaction(rowset, tx, row_key);
+    tx.Commit();
+  }
+
+  void DeleteRowInTransaction(RowSet *rowset, const ScopedTransaction& txn, int row_key) {
+    char keybuf[256];
+    faststring update_buf;
+    snprintf(keybuf, sizeof(keybuf), kRowKeyFormat, row_key);
+    update_buf.clear();
+    RowChangeListEncoder update(&update_buf);
+    update.SetToDelete();
+
+    RowBuilder rb(schema_.CreateKeyProjection());
+    rb.AddString(Slice(keybuf));
+    RowSetKeyProbe probe(rb.row());
+    ProbeStats stats;
+    OperationResultPB result;
+    ASSERT_OK(rowset->MutateRow(txn.timestamp(),
+                                probe,
+                                RowChangeList(update_buf),
+                                op_id_,
+                                &stats,
+                                &result));
   }
 
   // Iterate over the given compaction input, stringifying and dumping each
@@ -205,10 +237,10 @@ class TestCompaction : public KuduRowSetTest {
     // Flush with a large roll threshold so we only write a single file.
     // This simplifies the test so we always need to reopen only a single rowset.
     RollingDiskRowSetWriter rsw(tablet()->metadata(), projection,
-                                BloomFilterSizing::BySizeAndFPRate(32*1024, 0.01f),
+                                Tablet::DefaultBloomSizing(),
                                 roll_threshold);
     ASSERT_OK(rsw.Open());
-    ASSERT_OK(FlushCompactionInput(input, snap, &rsw));
+    ASSERT_OK(FlushCompactionInput(input, snap, HistoryGcOpts::Disabled(), &rsw));
     ASSERT_OK(rsw.Finish());
 
     vector<shared_ptr<RowSetMetadata> > metas;
@@ -221,7 +253,8 @@ class TestCompaction : public KuduRowSetTest {
       // Re-open the outputs
       for (const shared_ptr<RowSetMetadata>& meta : metas) {
         shared_ptr<DiskRowSet> rs;
-        ASSERT_OK(DiskRowSet::Open(meta, log_anchor_registry_.get(), &rs));
+        ASSERT_OK(DiskRowSet::Open(meta, log_anchor_registry_.get(),
+                                   mem_trackers_, &rs));
         result_rowsets->push_back(rs);
       }
     }
@@ -296,7 +329,9 @@ class TestCompaction : public KuduRowSetTest {
     int delta = 0;
     for (const Schema& schema : schemas) {
       // Create a memrowset with a bunch of rows and updates.
-      shared_ptr<MemRowSet> mrs(new MemRowSet(delta, schema, log_anchor_registry_.get()));
+      shared_ptr<MemRowSet> mrs;
+      CHECK_OK(MemRowSet::Create(delta, schema, log_anchor_registry_.get(),
+                                 mem_trackers_.tablet_tracker, &mrs));
       InsertRows(mrs.get(), 1000, delta);
       UpdateRows(mrs.get(), 1000, delta, 1);
 
@@ -330,7 +365,9 @@ class TestCompaction : public KuduRowSetTest {
       // Create inputs.
       for (int i = 0; i < FLAGS_merge_benchmark_num_rowsets; i++) {
         // Create a memrowset with a bunch of rows and updates.
-        shared_ptr<MemRowSet> mrs(new MemRowSet(i, schema_, log_anchor_registry_.get()));
+        shared_ptr<MemRowSet> mrs;
+        CHECK_OK(MemRowSet::Create(i, schema_, log_anchor_registry_.get(),
+                                   mem_trackers_.tablet_tracker, &mrs));
 
         for (int n = 0; n < FLAGS_merge_benchmark_num_rows_per_rowset; n++) {
 
@@ -355,13 +392,14 @@ class TestCompaction : public KuduRowSetTest {
       }
     } else {
       string tablet_id = "KuduCompactionBenchTablet";
-      FsManager fs_manager(env_.get(), FLAGS_merge_benchmark_input_dir);
+      FsManager fs_manager(env_, FLAGS_merge_benchmark_input_dir);
       scoped_refptr<TabletMetadata> input_meta;
       ASSERT_OK(TabletMetadata::Load(&fs_manager, tablet_id, &input_meta));
 
       for (const shared_ptr<RowSetMetadata>& meta : input_meta->rowsets()) {
         shared_ptr<DiskRowSet> rs;
-        CHECK_OK(DiskRowSet::Open(meta, log_anchor_registry_.get(), &rs));
+        CHECK_OK(DiskRowSet::Open(meta, log_anchor_registry_.get(),
+                                  mem_trackers_, &rs));
         rowsets.push_back(rs);
       }
 
@@ -375,56 +413,40 @@ class TestCompaction : public KuduRowSetTest {
       ASSERT_OK(BuildCompactionInput(merge_snap, rowsets, schema_, &compact_input));
       // Use a low target row size to increase the number of resulting rowsets.
       RollingDiskRowSetWriter rdrsw(tablet()->metadata(), schema_,
-                                    BloomFilterSizing::BySizeAndFPRate(32 * 1024, 0.01f),
+                                    Tablet::DefaultBloomSizing(),
                                     1024 * 1024); // 1 MB
       ASSERT_OK(rdrsw.Open());
-      ASSERT_OK(FlushCompactionInput(compact_input.get(), merge_snap, &rdrsw));
+      ASSERT_OK(FlushCompactionInput(compact_input.get(), merge_snap, HistoryGcOpts::Disabled(),
+                                     &rdrsw));
       ASSERT_OK(rdrsw.Finish());
     }
   }
 
-  Status GetDataDiskSpace(uint64_t* bytes_used) {
-    *bytes_used = 0;
-    return env_->Walk(fs_manager()->GetDataRootDirs().at(0),
-                      Env::PRE_ORDER, Bind(&TestCompaction::GetDataDiskSpaceCb,
-                                           Unretained(this), bytes_used));
-  }
+  // Helpers for building an expected row history.
+  void AddExpectedDelete(Mutation** current_head, Timestamp ts = Timestamp::kInvalidTimestamp);
+  void AddExpectedUpdate(Mutation** current_head, int32_t val);
+  void AddExpectedReinsert(Mutation** current_head, int32_t val);
+  void AddUpdateAndDelete(RowSet* rs, CompactionInputRow* row, int row_id, int32_t val);
 
  protected:
   OpId op_id_;
 
   RowBuilder row_builder_;
   char key_buf_[256];
+  Arena arena_;
+  scoped_refptr<server::LogicalClock> clock_;
   MvccManager mvcc_;
 
   scoped_refptr<LogAnchorRegistry> log_anchor_registry_;
 
- private:
-
-  Status GetDataDiskSpaceCb(uint64_t* bytes_used,
-                            Env::FileType type,
-                            const string& dirname, const string& basename) {
-    uint64_t file_bytes_used = 0;
-    switch (type) {
-      case Env::FILE_TYPE:
-        RETURN_NOT_OK(env_->GetFileSizeOnDisk(
-            JoinPathSegments(dirname, basename), &file_bytes_used));
-        *bytes_used += file_bytes_used;
-        break;
-      case Env::DIRECTORY_TYPE:
-        // Ignore directory space consumption; it varies from filesystem to
-        // filesystem and isn't interesting for this test.
-        break;
-      default:
-        LOG(FATAL) << "Unknown file type: " << type;
-    }
-    return Status::OK();
-  }
+  TabletMemTrackers mem_trackers_;
 };
 
 TEST_F(TestCompaction, TestMemRowSetInput) {
   // Create a memrowset with 10 rows and several updates.
-  shared_ptr<MemRowSet> mrs(new MemRowSet(0, schema_, log_anchor_registry_.get()));
+  shared_ptr<MemRowSet> mrs;
+  ASSERT_OK(MemRowSet::Create(0, schema_, log_anchor_registry_.get(),
+                              mem_trackers_.tablet_tracker, &mrs));
   InsertRows(mrs.get(), 10, 0);
   UpdateRows(mrs.get(), 10, 0, 1);
   UpdateRows(mrs.get(), 10, 0, 2);
@@ -436,20 +458,22 @@ TEST_F(TestCompaction, TestMemRowSetInput) {
   gscoped_ptr<CompactionInput> input(CompactionInput::Create(*mrs, &schema_, snap));
   IterateInput(input.get(), &out);
   ASSERT_EQ(10, out.size());
-  ASSERT_EQ("(string key=hello 00000000, int32 val=0, int32 nullable_val=0) "
-      "Undos: [@1(DELETE)] "
-      "Redos: [@11(SET val=1, nullable_val=1), @21(SET val=2, nullable_val=NULL)]",
+  EXPECT_EQ(R"(RowIdxInBlock: 0; Base: (string key="hello 00000000", int32 val=0, )"
+                "int32 nullable_val=0); Undo Mutations: [@1(DELETE)]; Redo Mutations: "
+                "[@11(SET val=1, nullable_val=1), @21(SET val=2, nullable_val=NULL)];",
             out[0]);
-  ASSERT_EQ("(string key=hello 00000090, int32 val=9, int32 nullable_val=NULL) "
-      "Undos: [@10(DELETE)] "
-      "Redos: [@20(SET val=1, nullable_val=1), @30(SET val=2, nullable_val=NULL)]",
+  EXPECT_EQ(R"(RowIdxInBlock: 9; Base: (string key="hello 00000090", int32 val=9, )"
+                "int32 nullable_val=NULL); Undo Mutations: [@10(DELETE)]; Redo Mutations: "
+                "[@20(SET val=1, nullable_val=1), @30(SET val=2, nullable_val=NULL)];",
             out[9]);
 }
 
 TEST_F(TestCompaction, TestFlushMRSWithRolling) {
   // Create a memrowset with enough rows so that, when we flush with a small
   // roll threshold, we'll end up creating multiple DiskRowSets.
-  shared_ptr<MemRowSet> mrs(new MemRowSet(0, schema_, log_anchor_registry_.get()));
+  shared_ptr<MemRowSet> mrs;
+  ASSERT_OK(MemRowSet::Create(0, schema_, log_anchor_registry_.get(),
+                              mem_trackers_.tablet_tracker, &mrs));
   InsertRows(mrs.get(), 30000, 0);
 
   vector<shared_ptr<DiskRowSet> > rowsets;
@@ -459,17 +483,17 @@ TEST_F(TestCompaction, TestFlushMRSWithRolling) {
   vector<string> rows;
   rows.reserve(30000 / 2);
   rowsets[0]->DebugDump(&rows);
-  EXPECT_EQ("(string key=hello 00000000, int32 val=0, int32 nullable_val=0) "
-            "Undos: [@1(DELETE)] Redos: []",
+  EXPECT_EQ(R"(RowIdxInBlock: 0; Base: (string key="hello 00000000", int32 val=0, )"
+                "int32 nullable_val=0); Undo Mutations: [@1(DELETE)]; Redo Mutations: [];",
             rows[0]);
 
   rows.clear();
   rowsets[1]->DebugDump(&rows);
-  EXPECT_EQ("(string key=hello 00154700, int32 val=15470, int32 nullable_val=15470) "
-            "Undos: [@15471(DELETE)] Redos: []",
+  EXPECT_EQ(R"(RowIdxInBlock: 0; Base: (string key="hello 00017150", int32 val=1715, )"
+            "int32 nullable_val=NULL); Undo Mutations: [@1716(DELETE)]; Redo Mutations: [];",
             rows[0]);
-  EXPECT_EQ("(string key=hello 00154710, int32 val=15471, int32 nullable_val=NULL) "
-            "Undos: [@15472(DELETE)] Redos: []",
+  EXPECT_EQ(R"(RowIdxInBlock: 1; Base: (string key="hello 00017160", int32 val=1716, )"
+            "int32 nullable_val=1716); Undo Mutations: [@1717(DELETE)]; Redo Mutations: [];",
             rows[1]);
 }
 
@@ -477,7 +501,9 @@ TEST_F(TestCompaction, TestRowSetInput) {
   // Create a memrowset with a bunch of rows, flush and reopen.
   shared_ptr<DiskRowSet> rs;
   {
-    shared_ptr<MemRowSet> mrs(new MemRowSet(0, schema_, log_anchor_registry_.get()));
+    shared_ptr<MemRowSet> mrs;
+    ASSERT_OK(MemRowSet::Create(0, schema_, log_anchor_registry_.get(),
+                                mem_trackers_.tablet_tracker, &mrs));
     InsertRows(mrs.get(), 10, 0);
     FlushMRSAndReopenNoRoll(*mrs, schema_, &rs);
     ASSERT_NO_FATAL_FAILURE();
@@ -497,51 +523,52 @@ TEST_F(TestCompaction, TestRowSetInput) {
   ASSERT_OK(CompactionInput::Create(*rs, &schema_, MvccSnapshot(mvcc_), &input));
   IterateInput(input.get(), &out);
   ASSERT_EQ(10, out.size());
-  EXPECT_EQ("(string key=hello 00000000, int32 val=0, int32 nullable_val=0) "
-            "Undos: [@1(DELETE)] "
-            "Redos: ["
-            "@11(SET val=1, nullable_val=1), "
-            "@21(SET val=2, nullable_val=NULL), "
-            "@31(SET val=3, nullable_val=3), "
-            "@41(SET val=4, nullable_val=NULL)]",
+  EXPECT_EQ(R"(RowIdxInBlock: 0; Base: (string key="hello 00000000", int32 val=0, )"
+                "int32 nullable_val=0); Undo Mutations: [@1(DELETE)]; Redo Mutations: "
+                "[@11(SET val=1, nullable_val=1), @21(SET val=2, nullable_val=NULL), "
+                "@31(SET val=3, nullable_val=3), @41(SET val=4, nullable_val=NULL)];",
             out[0]);
-  EXPECT_EQ("(string key=hello 00000090, int32 val=9, int32 nullable_val=NULL) "
-            "Undos: [@10(DELETE)] "
-            "Redos: ["
-            "@20(SET val=1, nullable_val=1), "
-            "@30(SET val=2, nullable_val=NULL), "
-            "@40(SET val=3, nullable_val=3), "
-            "@50(SET val=4, nullable_val=NULL)]",
+  EXPECT_EQ(R"(RowIdxInBlock: 9; Base: (string key="hello 00000090", int32 val=9, )"
+                "int32 nullable_val=NULL); Undo Mutations: [@10(DELETE)]; Redo Mutations: "
+                "[@20(SET val=1, nullable_val=1), @30(SET val=2, nullable_val=NULL), "
+                "@40(SET val=3, nullable_val=3), @50(SET val=4, nullable_val=NULL)];",
             out[9]);
 }
 
 // Tests that the same rows, duplicated in three DRSs, ghost in two of them
-// appears only once on the compaction output
-TEST_F(TestCompaction, TestDuplicatedGhostRowsDontSurviveCompaction) {
+// appears only once on the compaction output but that the resulting row
+// includes reinserts for the ghost and all its mutations.
+TEST_F(TestCompaction, TestDuplicatedGhostRowsMerging) {
   shared_ptr<DiskRowSet> rs1;
   {
-    shared_ptr<MemRowSet> mrs(new MemRowSet(0, schema_, log_anchor_registry_.get()));
+    shared_ptr<MemRowSet> mrs;
+    ASSERT_OK(MemRowSet::Create(0, schema_, log_anchor_registry_.get(),
+                                mem_trackers_.tablet_tracker, &mrs));
     InsertRows(mrs.get(), 10, 0);
     FlushMRSAndReopenNoRoll(*mrs, schema_, &rs1);
     ASSERT_NO_FATAL_FAILURE();
   }
   // Now delete the rows, this will make the rs report them as deleted and
   // so we would reinsert them into the MRS.
-  DeleteRows(rs1.get(), 10, 0);
+  DeleteRows(rs1.get(), 10);
 
   shared_ptr<DiskRowSet> rs2;
   {
-    shared_ptr<MemRowSet> mrs(new MemRowSet(1, schema_, log_anchor_registry_.get()));
+    shared_ptr<MemRowSet> mrs;
+    ASSERT_OK(MemRowSet::Create(1, schema_, log_anchor_registry_.get(),
+                                mem_trackers_.tablet_tracker, &mrs));
     InsertRows(mrs.get(), 10, 0);
     UpdateRows(mrs.get(), 10, 0, 1);
     FlushMRSAndReopenNoRoll(*mrs, schema_, &rs2);
     ASSERT_NO_FATAL_FAILURE();
   }
-  DeleteRows(rs2.get(), 10, 0);
+  DeleteRows(rs2.get(), 10);
 
   shared_ptr<DiskRowSet> rs3;
   {
-    shared_ptr<MemRowSet> mrs(new MemRowSet(1, schema_, log_anchor_registry_.get()));
+    shared_ptr<MemRowSet> mrs;
+    ASSERT_OK(MemRowSet::Create(1, schema_, log_anchor_registry_.get(),
+                                mem_trackers_.tablet_tracker, &mrs));
     InsertRows(mrs.get(), 10, 0);
     UpdateRows(mrs.get(), 10, 0, 2);
     FlushMRSAndReopenNoRoll(*mrs, schema_, &rs3);
@@ -569,12 +596,253 @@ TEST_F(TestCompaction, TestDuplicatedGhostRowsDontSurviveCompaction) {
   vector<string> out;
   IterateInput(input.get(), &out);
   ASSERT_EQ(out.size(), 10);
-  EXPECT_EQ("(string key=hello 00000000, int32 val=2, int32 nullable_val=NULL) "
-      "Undos: [@61(SET val=0, nullable_val=0), @51(DELETE)] "
-      "Redos: []", out[0]);
-  EXPECT_EQ("(string key=hello 00000090, int32 val=2, int32 nullable_val=NULL) "
-      "Undos: [@70(SET val=9, nullable_val=NULL), @60(DELETE)] "
-      "Redos: []", out[9]);
+  EXPECT_EQ(R"(RowIdxInBlock: 0; Base: (string key="hello 00000000", int32 val=2, )"
+                "int32 nullable_val=NULL); Undo Mutations: [@61(SET val=0, nullable_val=0), "
+                "@51(DELETE), @41(REINSERT val=1, nullable_val=1), @31(SET val=0, nullable_val=0), "
+                "@21(DELETE), @11(REINSERT val=0, nullable_val=0), @1(DELETE)]; "
+                "Redo Mutations: [];", out[0]);
+  EXPECT_EQ(R"(RowIdxInBlock: 9; Base: (string key="hello 00000090", int32 val=2, )"
+                "int32 nullable_val=NULL); Undo Mutations: [@70(SET val=9, nullable_val=NULL), "
+                "@60(DELETE), @50(REINSERT val=1, nullable_val=1), @40(SET val=9, "
+                "nullable_val=NULL), @30(DELETE), @20(REINSERT val=9, nullable_val=NULL), "
+                "@10(DELETE)]; Redo Mutations: [];", out[9]);
+}
+
+void TestCompaction::AddExpectedDelete(Mutation** current_head, Timestamp ts) {
+  faststring buf;
+  RowChangeListEncoder enc(&buf);
+  enc.SetToDelete();
+  if (ts == Timestamp::kInvalidTimestamp) ts = Timestamp(clock_->GetCurrentTime());
+  Mutation* mutation = Mutation::CreateInArena(&arena_,
+                                               ts,
+                                               enc.as_changelist());
+  mutation->set_next(*current_head);
+  *current_head = mutation;
+}
+
+void TestCompaction::AddExpectedUpdate(Mutation** current_head, int32_t val) {
+  faststring buf;
+  RowChangeListEncoder enc(&buf);
+  enc.SetToUpdate();
+  enc.AddColumnUpdate(schema_.column(1), schema_.column_id(1), &val);
+  if (val % 2 == 0) {
+    enc.AddColumnUpdate(schema_.column(2), schema_.column_id(2), &val);
+  } else {
+    enc.AddColumnUpdate(schema_.column(2), schema_.column_id(2), nullptr);
+  }
+  Mutation* mutation = Mutation::CreateInArena(&arena_,
+                                               Timestamp(clock_->GetCurrentTime()),
+                                               enc.as_changelist());
+  mutation->set_next(*current_head);
+  *current_head = mutation;
+}
+
+void TestCompaction::AddExpectedReinsert(Mutation** current_head, int32_t val) {
+  faststring buf;
+  RowChangeListEncoder enc(&buf);
+  enc.SetToReinsert();
+  enc.EncodeColumnMutation(schema_.column(1), schema_.column_id(1), &val);
+  if (val % 2 == 1) {
+    enc.EncodeColumnMutation(schema_.column(2), schema_.column_id(2), &val);
+  } else {
+    enc.EncodeColumnMutation(schema_.column(2), schema_.column_id(2), nullptr);
+  }
+  Mutation* mutation = Mutation::CreateInArena(&arena_, Timestamp(clock_->GetCurrentTime()),
+                                               enc.as_changelist());
+  mutation->set_next(*current_head);
+  *current_head = mutation;
+}
+
+void TestCompaction::AddUpdateAndDelete(RowSet* rs, CompactionInputRow* row, int row_id,
+                                        int32_t val) {
+  UpdateRow(rs, row_id, val);
+  // Expect an UNDO update for the update.
+  AddExpectedUpdate(&row->undo_head, row_id);
+
+  DeleteRow(rs, row_id);
+  // Expect an UNDO reinsert for the delete.
+  AddExpectedReinsert(&row->undo_head, val);
+}
+
+// Build several layers of overlapping rowsets with many ghost rows.
+// Repeatedly merge all the generated RowSets until we are left with a single RowSet, then make
+// sure that its history matches our expected history.
+//
+// There are 'kBaseNumRowSets' layers of overlapping rowsets, each level has one less rowset and
+// thus less rows. This is meant to exercise a normal-ish path where there are both duplicated and
+// unique rows per merge while at the same time making sure that some of the rows are duplicated
+// many times.
+//
+// The verification is performed against a vector of expected CompactionInputRow that we build
+// as we insert/update/delete.
+TEST_F(TestCompaction, TestDuplicatedRowsRandomCompaction) {
+  const int kBaseNumRowSets = 10;
+  const int kNumRowsPerRowSet = 10;
+
+  int total_num_rows = kBaseNumRowSets * kNumRowsPerRowSet;
+
+  MvccSnapshot all_snap = MvccSnapshot::CreateSnapshotIncludingAllTransactions();
+
+  vector<CompactionInputRow> expected_rows(total_num_rows);
+  vector<shared_ptr<DiskRowSet>> row_sets;
+
+  // Create a vector of ids for rows and fill it for the first layer.
+  vector<int> row_ids(total_num_rows);
+  std::iota(row_ids.begin(), row_ids.end(), 0);
+
+  SeedRandom();
+  int rs_id = 0;
+  for (int i = 0; i < kBaseNumRowSets; ++i) {
+    int num_rowsets_in_layer = kBaseNumRowSets - i;
+    size_t row_idx = 0;
+    for (int j = 0; j < num_rowsets_in_layer; ++j) {
+      shared_ptr<MemRowSet> mrs;
+      ASSERT_OK(MemRowSet::Create(rs_id, schema_, log_anchor_registry_.get(),
+                                  mem_trackers_.tablet_tracker, &mrs));
+
+      // For even rows, insert, update and delete them in the mrs.
+      for (int k = 0; k < kNumRowsPerRowSet; ++k) {
+        int row_id = row_ids[row_idx + k];
+        CompactionInputRow* row = &expected_rows[row_id];
+        InsertRow(mrs.get(), row_id, row_id);
+        // Expect an UNDO delete for the insert.
+        AddExpectedDelete(&row->undo_head);
+        if (row_id % 2 == 0) AddUpdateAndDelete(mrs.get(), row, row_id, row_id + i + 1);
+      }
+      shared_ptr<DiskRowSet> drs;
+      FlushMRSAndReopenNoRoll(*mrs, schema_, &drs);
+      // For odd rows, update them and delete them in the drs.
+      for (int k = 0; k < kNumRowsPerRowSet; ++k) {
+        int row_id = row_ids[row_idx];
+        CompactionInputRow* row = &expected_rows[row_id];
+        if (row_id % 2 == 1) AddUpdateAndDelete(drs.get(), row, row_id, row_id + i + 1);
+        row_idx++;
+      }
+      row_sets.push_back(drs);
+      rs_id++;
+    }
+    // For the next layer remove one rowset worth of rows at random.
+    for (int j = 0; j < kNumRowsPerRowSet; ++j) {
+      int to_remove = rand() % row_ids.size();
+      row_ids.erase(row_ids.begin() + to_remove);
+    }
+
+  }
+
+  RowBlock block(schema_, kBaseNumRowSets * kNumRowsPerRowSet, &arena_);
+  // Go through the expected compaction input rows, flip the last undo into a redo and
+  // build the base. This will give us the final version that we'll expect the result
+  // of the real compaction to match.
+  for (int i = 0; i < expected_rows.size(); ++i) {
+    CompactionInputRow* row = &expected_rows[i];
+    Mutation* reinsert = row->undo_head;
+    row->undo_head = reinsert->next();
+    row->row = block.row(i);
+    BuildRow(i, i);
+    CopyRow(row_builder_.row(), &row->row, &arena_);
+    RowChangeListDecoder redo_decoder(reinsert->changelist());
+    CHECK_OK(redo_decoder.Init());
+    faststring buf;
+    RowChangeListEncoder dummy(&buf);
+    dummy.SetToUpdate();
+    redo_decoder.MutateRowAndCaptureChanges(&row->row, &arena_, &dummy);
+    AddExpectedDelete(&row->redo_head, reinsert->timestamp());
+  }
+
+  vector<shared_ptr<CompactionInput>> inputs;
+  for (auto& row_set : row_sets) {
+    gscoped_ptr<CompactionInput> ci;
+    CHECK_OK(row_set->NewCompactionInput(&schema_, all_snap, &ci));
+    inputs.push_back(shared_ptr<CompactionInput>(ci.release()));
+  }
+
+  // Compact the row sets by picking a few at random until we're left with just one.
+  while (row_sets.size() > 1) {
+    std::random_shuffle(row_sets.begin(), row_sets.end());
+    // Merge between 2 and 4 row sets.
+    int num_rowsets_to_merge = std::min(rand() % 3 + 2, static_cast<int>(row_sets.size()));
+    vector<shared_ptr<DiskRowSet>> to_merge;
+    for (int i = 0; i < num_rowsets_to_merge; ++i) {
+      to_merge.push_back(row_sets.back());
+      row_sets.pop_back();
+    }
+    shared_ptr<DiskRowSet> result;
+    CompactAndReopenNoRoll(to_merge, schema_, &result);
+    row_sets.push_back(result);
+  }
+
+  vector<string> out;
+  gscoped_ptr<CompactionInput> ci;
+  CHECK_OK(row_sets[0]->NewCompactionInput(&schema_, all_snap, &ci));
+  IterateInput(ci.get(), &out);
+
+  // Finally go through the final compaction input and through the expected one and make sure
+  // they match.
+  ASSERT_EQ(expected_rows.size(), out.size());
+  for (int i = 0; i < expected_rows.size(); ++i) {
+    EXPECT_EQ(CompactionInputRowToString(expected_rows[i]), out[i]);
+  }
+}
+
+// Test case that inserts and deletes a row in the same transaction and makes sure
+// the row isn't on the compaction input.
+TEST_F(TestCompaction, TestMRSCompactionDoesntOutputUnobservableRows) {
+  // Insert a row in the mrs and flush it.
+  shared_ptr<DiskRowSet> rs1;
+  {
+    shared_ptr<MemRowSet> mrs;
+    ASSERT_OK(MemRowSet::Create(0, schema_, log_anchor_registry_.get(),
+                                mem_trackers_.tablet_tracker, &mrs));
+    InsertRow(mrs.get(), 1, 1);
+    FlushMRSAndReopenNoRoll(*mrs, schema_, &rs1);
+    ASSERT_NO_FATAL_FAILURE();
+  }
+
+  // Now make the row a ghost in rs1 in the same transaction as we reinsert it in the mrs then
+  // flush it. Also insert another row so that the row set isn't completely empty (otherwise
+  // it would disappear on flush).
+  shared_ptr<DiskRowSet> rs2;
+  {
+    shared_ptr<MemRowSet> mrs;
+    ASSERT_OK(MemRowSet::Create(1, schema_, log_anchor_registry_.get(),
+                                mem_trackers_.tablet_tracker, &mrs));
+    ScopedTransaction tx(&mvcc_, clock_->Now());
+    tx.StartApplying();
+    DeleteRowInTransaction(rs1.get(), tx, 1);
+    InsertRowInTransaction(mrs.get(), tx, 1, 2);
+    UpdateRowInTransaction(mrs.get(), tx, 1, 3);
+    DeleteRowInTransaction(mrs.get(), tx, 1);
+
+    InsertRowInTransaction(mrs.get(), tx, 2, 0);
+    tx.Commit();
+    FlushMRSAndReopenNoRoll(*mrs, schema_, &rs2);
+    ASSERT_NO_FATAL_FAILURE();
+  }
+
+  MvccSnapshot all_snap = MvccSnapshot::CreateSnapshotIncludingAllTransactions();
+
+  gscoped_ptr<CompactionInput> rs1_input;
+  ASSERT_OK(CompactionInput::Create(*rs1, &schema_, all_snap, &rs1_input));
+
+  gscoped_ptr<CompactionInput> rs2_input;
+  ASSERT_OK(CompactionInput::Create(*rs2, &schema_, all_snap, &rs2_input));
+
+  vector<shared_ptr<CompactionInput>> to_merge;
+  to_merge.push_back(shared_ptr<CompactionInput>(rs1_input.release()));
+  to_merge.push_back(shared_ptr<CompactionInput>(rs2_input.release()));
+
+  gscoped_ptr<CompactionInput> merged(CompactionInput::Merge(to_merge, &schema_));
+
+  // Make sure the unobservable version of the row that was inserted and deleted in the MRS
+  // in the same transaction doesn't show up in the compaction input.
+  vector<string> out;
+  IterateInput(merged.get(), &out);
+  EXPECT_EQ(out.size(), 2);
+  EXPECT_EQ(R"(RowIdxInBlock: 0; Base: (string key="hello 00000001", int32 val=1, )"
+                "int32 nullable_val=NULL); Undo Mutations: [@1(DELETE)]; Redo Mutations: "
+                "[@2(DELETE)];", out[0]);
+  EXPECT_EQ(R"(RowIdxInBlock: 0; Base: (string key="hello 00000002", int32 val=0, )"
+                "int32 nullable_val=0); Undo Mutations: [@2(DELETE)]; Redo Mutations: [];", out[1]);
 }
 
 // Test case which doesn't do any merging -- just compacts
@@ -582,7 +850,9 @@ TEST_F(TestCompaction, TestDuplicatedGhostRowsDontSurviveCompaction) {
 // output rowset (on disk).
 TEST_F(TestCompaction, TestOneToOne) {
   // Create a memrowset with a bunch of rows and updates.
-  shared_ptr<MemRowSet> mrs(new MemRowSet(0, schema_, log_anchor_registry_.get()));
+  shared_ptr<MemRowSet> mrs;
+  ASSERT_OK(MemRowSet::Create(0, schema_, log_anchor_registry_.get(),
+                              mem_trackers_.tablet_tracker, &mrs));
   InsertRows(mrs.get(), 1000, 0);
   UpdateRows(mrs.get(), 1000, 0, 1);
   MvccSnapshot snap(mvcc_);
@@ -604,17 +874,18 @@ TEST_F(TestCompaction, TestOneToOne) {
 
   string dummy_name = "";
 
-  ASSERT_OK(ReupdateMissedDeltas(dummy_name, input.get(), snap, snap2, { rs }));
+  ASSERT_OK(ReupdateMissedDeltas(dummy_name, input.get(), HistoryGcOpts::Disabled(), snap, snap2,
+                                 { rs }));
 
   // If we look at the contents of the DiskRowSet now, we should see the "re-updated" data.
   vector<string> out;
   ASSERT_OK(CompactionInput::Create(*rs, &schema_, MvccSnapshot(mvcc_), &input));
   IterateInput(input.get(), &out);
   ASSERT_EQ(1000, out.size());
-  EXPECT_EQ("(string key=hello 00000000, int32 val=1, int32 nullable_val=1) "
-      "Undos: [@1001(SET val=0, nullable_val=0), @1(DELETE)] "
-      "Redos: [@2001(SET val=2, nullable_val=NULL), "
-              "@3001(SET val=3, nullable_val=3)]", out[0]);
+  EXPECT_EQ(R"(RowIdxInBlock: 0; Base: (string key="hello 00000000", int32 val=1, )"
+                "int32 nullable_val=1); Undo Mutations: [@1001(SET val=0, nullable_val=0), "
+                "@1(DELETE)]; Redo Mutations: [@2001(SET val=2, nullable_val=NULL), "
+                "@3001(SET val=3, nullable_val=3)];", out[0]);
 
   // And compact (1 input to 1 output)
   MvccSnapshot snap3(mvcc_);
@@ -628,13 +899,17 @@ TEST_F(TestCompaction, TestOneToOne) {
 // output of a compaction, and trying to merge two MRS.
 TEST_F(TestCompaction, TestKUDU102) {
   // Create 2 row sets, flush them
-  shared_ptr<MemRowSet> mrs(new MemRowSet(0, schema_, log_anchor_registry_.get()));
+  shared_ptr<MemRowSet> mrs;
+  ASSERT_OK(MemRowSet::Create(0, schema_, log_anchor_registry_.get(),
+                              mem_trackers_.tablet_tracker, &mrs));
   InsertRows(mrs.get(), 10, 0);
   shared_ptr<DiskRowSet> rs;
   FlushMRSAndReopenNoRoll(*mrs, schema_, &rs);
   ASSERT_NO_FATAL_FAILURE();
 
-  shared_ptr<MemRowSet> mrs_b(new MemRowSet(1, schema_, log_anchor_registry_.get()));
+  shared_ptr<MemRowSet> mrs_b;
+  ASSERT_OK(MemRowSet::Create(1, schema_, log_anchor_registry_.get(),
+                              mem_trackers_.tablet_tracker, &mrs_b));
   InsertRows(mrs_b.get(), 10, 100);
   MvccSnapshot snap(mvcc_);
   shared_ptr<DiskRowSet> rs_b;
@@ -657,9 +932,9 @@ TEST_F(TestCompaction, TestKUDU102) {
   string dummy_name = "";
 
   // This would fail without KUDU-102
-  ASSERT_OK(ReupdateMissedDeltas(dummy_name, input.get(), snap, snap2, { rs, rs_b }));
+  ASSERT_OK(ReupdateMissedDeltas(dummy_name, input.get(), HistoryGcOpts::Disabled(), snap, snap2,
+                                 { rs, rs_b }));
 }
-
 
 // Test compacting when all of the inputs and the output have the same schema
 TEST_F(TestCompaction, TestMerge) {
@@ -693,10 +968,14 @@ TEST_F(TestCompaction, TestMergeMultipleSchemas) {
 // used (we never compact in-memory), but this is a regression test for a bug
 // encountered during development where the first row of each MRS got dropped.
 TEST_F(TestCompaction, TestMergeMRS) {
-  shared_ptr<MemRowSet> mrs_a(new MemRowSet(0, schema_, log_anchor_registry_.get()));
+  shared_ptr<MemRowSet> mrs_a;
+  ASSERT_OK(MemRowSet::Create(0, schema_, log_anchor_registry_.get(),
+                              mem_trackers_.tablet_tracker, &mrs_a));
   InsertRows(mrs_a.get(), 10, 0);
 
-  shared_ptr<MemRowSet> mrs_b(new MemRowSet(1, schema_, log_anchor_registry_.get()));
+  shared_ptr<MemRowSet> mrs_b;
+  ASSERT_OK(MemRowSet::Create(1, schema_, log_anchor_registry_.get(),
+                              mem_trackers_.tablet_tracker, &mrs_b));
   InsertRows(mrs_b.get(), 10, 1);
 
   MvccSnapshot snap(mvcc_);
@@ -710,10 +989,12 @@ TEST_F(TestCompaction, TestMergeMRS) {
   vector<string> out;
   IterateInput(input.get(), &out);
   ASSERT_EQ(out.size(), 20);
-  EXPECT_EQ("(string key=hello 00000000, int32 val=0, int32 nullable_val=0) "
-            "Undos: [@1(DELETE)] Redos: []", out[0]);
-  EXPECT_EQ("(string key=hello 00000091, int32 val=9, int32 nullable_val=NULL) "
-            "Undos: [@20(DELETE)] Redos: []", out[19]);
+  EXPECT_EQ(R"(RowIdxInBlock: 0; Base: (string key="hello 00000000", int32 val=0, )"
+                "int32 nullable_val=0); Undo Mutations: [@1(DELETE)]; "
+                "Redo Mutations: [];", out[0]);
+  EXPECT_EQ(R"(RowIdxInBlock: 9; Base: (string key="hello 00000091", int32 val=9, )"
+                "int32 nullable_val=NULL); Undo Mutations: [@20(DELETE)]; "
+                "Redo Mutations: [];", out[19]);
 }
 
 #ifdef NDEBUG
@@ -740,18 +1021,6 @@ TEST_F(TestCompaction, BenchmarkMergeWithOverlap) {
 #endif
 
 TEST_F(TestCompaction, TestCompactionFreesDiskSpace) {
-  // On RHEL 6.4 with an ext4 filesystem mounted as ext3, it was observed
-  // that freshly created files report st_blocks=0 via stat(2) for several
-  // seconds. This appears to be some buggy interaction with ext4 delalloc.
-  //
-  // Enabling data block fsync appears to work around the problem. We do
-  // that here and not for all tests because:
-  // 1. fsync is expensive, and
-  // 2. This is the only test that cares about disk space usage and can't
-  //    explicitly fsync() after writing new files.
-
-  FLAGS_enable_data_block_fsync = true;
-
   {
     // We must force the LocalTabletWriter out of scope before measuring
     // disk space usage. Otherwise some deleted blocks are kept open for
@@ -771,22 +1040,23 @@ TEST_F(TestCompaction, TestCompactionFreesDiskSpace) {
   }
 
   uint64_t bytes_before;
-  ASSERT_NO_FATAL_FAILURE(GetDataDiskSpace(&bytes_before));
+  ASSERT_OK(env_->GetFileSizeOnDiskRecursively(
+      fs_manager()->GetDataRootDirs().at(0), &bytes_before));
 
   ASSERT_OK(tablet()->Compact(Tablet::FORCE_COMPACT_ALL));
 
   // Block deletion may happen asynchronously, so let's loop for a bit until
   // the space becomes free.
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(MonoDelta::FromSeconds(30));
+  MonoTime deadline = MonoTime::Now() + MonoDelta::FromSeconds(30);
   while (true) {
     uint64_t bytes_after;
-    ASSERT_NO_FATAL_FAILURE(GetDataDiskSpace(&bytes_after));
+    ASSERT_OK(env_->GetFileSizeOnDiskRecursively(
+        fs_manager()->GetDataRootDirs().at(0), &bytes_after));
     LOG(INFO) << Substitute("Data disk space: $0 (before), $1 (after) ",
                             bytes_before, bytes_after);
     if (bytes_after < bytes_before) {
       break;
-    } else if (deadline.ComesBefore(MonoTime::Now(MonoTime::FINE))) {
+    } else if (MonoTime::Now() > deadline) {
       FAIL() << "Timed out waiting for compaction to reduce data block disk "
              << "space usage";
     }
@@ -807,11 +1077,18 @@ TEST_F(TestCompaction, TestEmptyFlushDoesntLeakBlocks) {
   fs::LogBlockManager* lbm = down_cast<fs::LogBlockManager*>(
       harness_->fs_manager()->block_manager());
 
-  int64_t before_count = lbm->CountBlocksForTests();
+  vector<BlockId> before_block_ids;
+  ASSERT_OK(lbm->GetAllBlockIds(&before_block_ids));
   ASSERT_OK(tablet()->Flush());
-  int64_t after_count = lbm->CountBlocksForTests();
+  vector<BlockId> after_block_ids;
+  ASSERT_OK(lbm->GetAllBlockIds(&after_block_ids));
 
-  ASSERT_EQ(after_count, before_count);
+  // Sort the two collections before the comparison as GetAllBlockIds() does
+  // not guarantee a deterministic order.
+  std::sort(before_block_ids.begin(), before_block_ids.end(), BlockIdCompare());
+  std::sort(after_block_ids.begin(), after_block_ids.end(), BlockIdCompare());
+
+  ASSERT_EQ(after_block_ids, before_block_ids);
 }
 
 } // namespace tablet

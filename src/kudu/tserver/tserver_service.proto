@@ -16,24 +16,41 @@
 // under the License.
 package kudu.tserver;
 
-option java_package = "org.kududb.tserver";
+option java_package = "org.apache.kudu.tserver";
 
+import "kudu/rpc/rpc_header.proto";
 import "kudu/tserver/tserver.proto";
 
 service TabletServerService {
+  // Set the default authz method to something invalid, so that if
+  // we forget to set the option on a new RPC call, we'll get a build
+  // failure.
+  option (kudu.rpc.default_authz_method) = "MUST_SET_AUTHZ_PER_RPC";
 
-  rpc Ping(PingRequestPB) returns (PingResponsePB);
-  rpc Write(WriteRequestPB) returns (WriteResponsePB);
-  rpc Scan(ScanRequestPB) returns (ScanResponsePB);
-  rpc ScannerKeepAlive(ScannerKeepAliveRequestPB) returns (ScannerKeepAliveResponsePB);
-  rpc ListTablets(ListTabletsRequestPB) returns (ListTabletsResponsePB);
+  rpc Ping(PingRequestPB) returns (PingResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeClientOrServiceUser";
+  }
+  rpc Write(WriteRequestPB) returns (WriteResponsePB)  {
+    option (kudu.rpc.track_rpc_result) = true;
+    option (kudu.rpc.authz_method) = "AuthorizeClient";
+  }
+  rpc Scan(ScanRequestPB) returns (ScanResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeClient";
+  }
+  rpc ScannerKeepAlive(ScannerKeepAliveRequestPB) returns (ScannerKeepAliveResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeClient";
+  }
+  rpc ListTablets(ListTabletsRequestPB) returns (ListTabletsResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeClient";
+  }
 
   // Run full-scan data checksum on a tablet to verify data integrity.
   //
   // TODO: Consider refactoring this as a scan that runs a checksum aggregation
   // function.
-  rpc Checksum(ChecksumRequestPB)
-      returns (ChecksumResponsePB);
+  rpc Checksum(ChecksumRequestPB) returns (ChecksumResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeClient";
+  }
 }
 
 message ChecksumRequestPB {
@@ -67,4 +84,12 @@ message ChecksumResponsePB {
   optional bytes scanner_id = 3;
   optional bool has_more_results = 4;
   optional fixed64 snap_timestamp = 5;
+
+  // Number of rows checksummed by this RPC.
+  // NOTE: this is not an aggregate since the scanner was opened, but
+  // rather just a count for _this_ round trip.
+  optional int64 rows_checksummed = 6;
+
+  // Resource consumption of the underlying scanner.
+  optional ResourceMetricsPB resource_metrics = 7;
 }

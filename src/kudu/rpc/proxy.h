@@ -55,7 +55,7 @@ class Messenger;
 // After initialization, multiple threads may make calls using the same proxy object.
 class Proxy {
  public:
-  Proxy(const std::shared_ptr<Messenger>& messenger, const Sockaddr& remote,
+  Proxy(std::shared_ptr<Messenger> messenger, const Sockaddr& remote,
         std::string service_name);
   ~Proxy();
 
@@ -103,6 +103,8 @@ class Proxy {
 
   // Get the user credentials which should be used to log in.
   const UserCredentials& user_credentials() const { return conn_id_.user_credentials(); }
+
+  std::string ToString() const;
 
  private:
   const std::string service_name_;

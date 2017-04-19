@@ -20,27 +20,31 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <memory>
 
+#include "kudu/cfile/binary_plain_block.h"
 #include "kudu/cfile/block_cache.h"
 #include "kudu/cfile/block_handle.h"
 #include "kudu/cfile/block_pointer.h"
 #include "kudu/cfile/cfile.pb.h"
-#include "kudu/cfile/cfile_writer.h" // for kMagicString
-#include "kudu/cfile/gvint_block.h"
+#include "kudu/cfile/cfile_writer.h"
 #include "kudu/cfile/index_block.h"
 #include "kudu/cfile/index_btree.h"
-#include "kudu/cfile/binary_plain_block.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/mathlimits.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/coding.h"
+#include "kudu/util/compression/compression_codec.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/malloc.h"
+#include "kudu/util/memory/overwrite.h"
 #include "kudu/util/object_pool.h"
+#include "kudu/util/pb_util.h"
 #include "kudu/util/rle-encoding.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
+#include "kudu/util/trace.h"
 
 DEFINE_bool(cfile_lazy_open, true,
             "Allow lazily opening of cfiles");
@@ -48,65 +52,80 @@ TAG_FLAG(cfile_lazy_open, hidden);
 
 using kudu::fs::ReadableBlock;
 using strings::Substitute;
+using std::unique_ptr;
 
 namespace kudu {
 namespace cfile {
+
+const char* CFILE_CACHE_MISS_BYTES_METRIC_NAME = "cfile_cache_miss_bytes";
+const char* CFILE_CACHE_HIT_BYTES_METRIC_NAME = "cfile_cache_hit_bytes";
 
 // Magic+Length: 8-byte magic, followed by 4-byte header size
 static const size_t kMagicAndLengthSize = 12;
 static const size_t kMaxHeaderFooterPBSize = 64*1024;
 
-static const size_t kBlockSizeLimit = 16 * 1024 * 1024; // 16MB
-
 static Status ParseMagicAndLength(const Slice &data,
+                                  uint8_t* cfile_version,
                                   uint32_t *parsed_len) {
   if (data.size() != kMagicAndLengthSize) {
     return Status::Corruption("Bad size data");
   }
 
-  if (memcmp(kMagicString, data.data(), strlen(kMagicString)) != 0) {
+  uint8_t version;
+  if (memcmp(kMagicStringV1, data.data(), kMagicLength) == 0) {
+    version = 1;
+  } else if (memcmp(kMagicStringV2, data.data(), kMagicLength) == 0) {
+    version = 2;
+  } else {
     return Status::Corruption("bad magic");
   }
 
-  *parsed_len = DecodeFixed32(data.data() + strlen(kMagicString));
-  if (*parsed_len <= 0 || *parsed_len > kMaxHeaderFooterPBSize) {
+  uint32_t len = DecodeFixed32(data.data() + kMagicLength);
+  if (len > kMaxHeaderFooterPBSize) {
     return Status::Corruption("invalid data size");
   }
 
+  *cfile_version = version;
+  *parsed_len = len;
+
   return Status::OK();
 }
 
-CFileReader::CFileReader(const ReaderOptions &options,
-                         const uint64_t file_size,
-                         gscoped_ptr<ReadableBlock> block) :
-  block_(block.Pass()),
+CFileReader::CFileReader(ReaderOptions options,
+                         uint64_t file_size,
+                         unique_ptr<ReadableBlock> block) :
+  block_(std::move(block)),
   file_size_(file_size),
-  mem_consumption_(options.parent_mem_tracker, memory_footprint()) {
+  codec_(nullptr),
+  mem_consumption_(std::move(options.parent_mem_tracker),
+                   memory_footprint()) {
 }
 
-Status CFileReader::Open(gscoped_ptr<ReadableBlock> block,
-                         const ReaderOptions& options,
-                         gscoped_ptr<CFileReader> *reader) {
-  gscoped_ptr<CFileReader> reader_local;
-  RETURN_NOT_OK(OpenNoInit(block.Pass(), options, &reader_local));
+Status CFileReader::Open(unique_ptr<ReadableBlock> block,
+                         ReaderOptions options,
+                         unique_ptr<CFileReader>* reader) {
+  unique_ptr<CFileReader> reader_local;
+  RETURN_NOT_OK(OpenNoInit(std::move(block),
+                           std::move(options),
+                           &reader_local));
   RETURN_NOT_OK(reader_local->Init());
 
-  reader->reset(reader_local.release());
+  *reader = std::move(reader_local);
   return Status::OK();
 }
 
-Status CFileReader::OpenNoInit(gscoped_ptr<ReadableBlock> block,
-                               const ReaderOptions& options,
-                               gscoped_ptr<CFileReader> *reader) {
+Status CFileReader::OpenNoInit(unique_ptr<ReadableBlock> block,
+                               ReaderOptions options,
+                               unique_ptr<CFileReader>* reader) {
   uint64_t block_size;
   RETURN_NOT_OK(block->Size(&block_size));
-  gscoped_ptr<CFileReader> reader_local(
-      new CFileReader(options, block_size, block.Pass()));
+  unique_ptr<CFileReader> reader_local(
+      new CFileReader(std::move(options), block_size, std::move(block)));
   if (!FLAGS_cfile_lazy_open) {
     RETURN_NOT_OK(reader_local->Init());
   }
 
-  reader->reset(reader_local.release());
+  *reader = std::move(reader_local);
   return Status::OK();
 }
 
@@ -119,15 +138,23 @@ Status CFileReader::ReadMagicAndLength(uint64_t offset, uint32_t *len) {
   RETURN_NOT_OK(block_->Read(offset, kMagicAndLengthSize,
                              &slice, scratch));
 
-  return ParseMagicAndLength(slice, len);
+  return ParseMagicAndLength(slice, &cfile_version_, len);
 }
 
 Status CFileReader::InitOnce() {
   VLOG(1) << "Initializing CFile with ID " << block_->id().ToString();
+  TRACE_COUNTER_INCREMENT("cfile_init", 1);
 
   RETURN_NOT_OK(ReadAndParseHeader());
 
   RETURN_NOT_OK(ReadAndParseFooter());
+
+  if (PREDICT_FALSE(footer_->incompatible_features() != 0)) {
+    // Currently we do not support any incompatible features.
+    return Status::NotSupported(Substitute(
+        "cfile uses features from an incompatible version: $0",
+        footer_->incompatible_features()));
+  }
 
   type_info_ = GetTypeInfo(footer_->data_type());
 
@@ -136,8 +163,8 @@ Status CFileReader::InitOnce() {
                                       &type_encoding_info_));
 
   VLOG(2) << "Initialized CFile reader. "
-          << "Header: " << header_->DebugString()
-          << " Footer: " << footer_->DebugString()
+          << "Header: " << SecureDebugString(*header_)
+          << " Footer: " << SecureDebugString(*footer_)
           << " Type: " << type_info_->name();
 
   // The header/footer have been allocated; memory consumption has changed.
@@ -171,7 +198,7 @@ Status CFileReader::ReadAndParseHeader() {
     return Status::Corruption("Invalid cfile pb header");
   }
 
-  VLOG(2) << "Read header: " << header_->DebugString();
+  VLOG(2) << "Read header: " << SecureDebugString(*header_);
 
   return Status::OK();
 }
@@ -203,23 +230,24 @@ Status CFileReader::ReadAndParseFooter() {
 
   // Verify if the compression codec is available
   if (footer_->compression() != NO_COMPRESSION) {
-    const CompressionCodec* codec;
-    RETURN_NOT_OK(GetCompressionCodec(footer_->compression(), &codec));
-    block_uncompressor_.reset(new CompressedBlockDecoder(codec, kBlockSizeLimit));
+    RETURN_NOT_OK(GetCompressionCodec(footer_->compression(), &codec_));
   }
 
-  VLOG(2) << "Read footer: " << footer_->DebugString();
+  VLOG(2) << "Read footer: " << SecureDebugString(*footer_);
 
   return Status::OK();
 }
 
 namespace {
 
-// ScratchMemory owns a memory buffer which could either be allocated on-heap
-// or allocated by a Cache instance. In the case of the default DRAM-based cache,
-// these two are equivalent, but we still make a distinction between "cache-managed"
-// memory and "on-heap" memory. In the case of the NVM-based cache, this is a more
-// important distinction: we would like to read (or decompress) blocks directly into NVM.
+// ScratchMemory acts as a holder for the destination buffer for a block read.
+// The buffer itself could either be allocated on the heap or be the value of
+// a pending block cache entry.
+//
+// In the case of the default DRAM-based cache, these two are equivalent, but we still
+// make a distinction between "cache-managed" memory and "on-heap" memory. In the case of
+// the NVM-based cache, this is a more important distinction: we would like to read (or
+// decompress) blocks directly into NVM.
 //
 // This class tracks the block of memory, its size, and whether it came from the heap
 // or the cache. In its destructor, the memory is freed, either via 'delete[]', if
@@ -227,12 +255,10 @@ namespace {
 // the memory can be released using 'release()'.
 class ScratchMemory {
  public:
-  ScratchMemory() : cache_(nullptr), ptr_(nullptr), size_(-1) {}
+  ScratchMemory() : ptr_(nullptr), size_(-1) {}
   ~ScratchMemory() {
     if (!ptr_) return;
-    if (cache_) {
-      cache_->Free(ptr_);
-    } else {
+    if (!from_cache_.valid()) {
       delete[] ptr_;
     }
   }
@@ -241,43 +267,40 @@ class ScratchMemory {
   // no capacity and cannot evict to make room, this will fall back
   // to allocating from the heap. In that case, IsFromCache() will
   // return false.
-  void TryAllocateFromCache(BlockCache* cache, int size) {
+  void TryAllocateFromCache(BlockCache* cache, const BlockCache::CacheKey& key, int size) {
     DCHECK(!ptr_);
-    cache_ = DCHECK_NOTNULL(cache);
-    ptr_ = cache->Allocate(size);
-    if (!ptr_) {
+    from_cache_ = cache->Allocate(key, size);
+    if (!from_cache_.valid()) {
       AllocateFromHeap(size);
       return;
+    } else {
+      ptr_ = from_cache_.val_ptr();
     }
     size_ = size;
   }
 
   void AllocateFromHeap(int size) {
     DCHECK(!ptr_);
-    cache_ = nullptr;
+    from_cache_.reset();
     ptr_ = new uint8_t[size];
     size_ = size;
   }
 
-  // If the current memory was allocated by the cache, this moves it to normal
-  // heap memory. In the case of the DRAM cache, the cache implements this as
-  // a no-op. In the case of NVM, we actually allocate on-heap memory and
-  // memcpy the data.
-  void EnsureOnHeap() {
-    DCHECK(ptr_);
-    if (cache_) {
-      ptr_ = cache_->MoveToHeap(ptr_, size_);
-    }
-    cache_ = nullptr;
-  }
-
   // Return true if the current scratch memory was allocated from the cache.
   bool IsFromCache() const {
-    return cache_ != nullptr;
+    return from_cache_.valid();
+  }
+
+  BlockCache::PendingEntry* mutable_pending_entry() {
+    return &from_cache_;
   }
 
   uint8_t* get() {
     return DCHECK_NOTNULL(ptr_);
+  }
+
+  Slice as_slice() {
+    return Slice(ptr_, size_);
   }
 
   uint8_t* release() {
@@ -289,13 +312,13 @@ class ScratchMemory {
 
   // Swap the contents of this instance with another.
   void Swap(ScratchMemory* other) {
-    std::swap(cache_, other->cache_);
+    std::swap(from_cache_, other->from_cache_);
     std::swap(ptr_, other->ptr_);
     std::swap(size_, other->size_);
   }
 
  private:
-  BlockCache* cache_;
+  BlockCache::PendingEntry from_cache_;
   uint8_t* ptr_;
   int size_;
   DISALLOW_COPY_AND_ASSIGN(ScratchMemory);
@@ -313,7 +336,10 @@ Status CFileReader::ReadBlock(const BlockPointer &ptr, CacheControl cache_contro
   Cache::CacheBehavior cache_behavior = cache_control == CACHE_BLOCK ?
       Cache::EXPECT_IN_CACHE : Cache::NO_EXPECT_IN_CACHE;
   BlockCache* cache = BlockCache::GetSingleton();
-  if (cache->Lookup(block_->id(), ptr.offset(), cache_behavior, &bc_handle)) {
+  BlockCache::CacheKey key(block_->id(), ptr.offset());
+  if (cache->Lookup(key, cache_behavior, &bc_handle)) {
+    TRACE_COUNTER_INCREMENT("cfile_cache_hit", 1);
+    TRACE_COUNTER_INCREMENT(CFILE_CACHE_HIT_BYTES_METRIC_NAME, ptr.size());
     *ret = BlockHandle::WithDataFromCache(&bc_handle);
     // Cache hit
     return Status::OK();
@@ -325,47 +351,48 @@ Status CFileReader::ReadBlock(const BlockPointer &ptr, CacheControl cache_contro
   // from the Linux cache).
   TRACE_EVENT1("io", "CFileReader::ReadBlock(cache miss)",
                "cfile", ToString());
-  Slice block;
+  TRACE_COUNTER_INCREMENT("cfile_cache_miss", 1);
+  TRACE_COUNTER_INCREMENT(CFILE_CACHE_MISS_BYTES_METRIC_NAME, ptr.size());
 
+  ScratchMemory scratch;
   // If we are reading uncompressed data and plan to cache the result,
   // then we should allocate our scratch memory directly from the cache.
   // This avoids an extra memory copy in the case of an NVM cache.
-  ScratchMemory scratch;
-  if (block_uncompressor_ == nullptr && cache_control == CACHE_BLOCK) {
-    scratch.TryAllocateFromCache(cache, ptr.size());
+  if (codec_ == nullptr && cache_control == CACHE_BLOCK) {
+    scratch.TryAllocateFromCache(cache, key, ptr.size());
   } else {
     scratch.AllocateFromHeap(ptr.size());
   }
+  uint8_t* buf = scratch.get();
 
-  RETURN_NOT_OK(block_->Read(ptr.offset(), ptr.size(), &block, scratch.get()));
-
+  Slice block;
+  RETURN_NOT_OK(block_->Read(ptr.offset(), ptr.size(), &block, buf));
   if (block.size() != ptr.size()) {
     return Status::IOError("Could not read full block length");
   }
 
   // Decompress the block
-  if (block_uncompressor_ != nullptr) {
-    // Get the size required for the uncompressed buffer
-    uint32_t uncompressed_size;
-    Status s = block_uncompressor_->ValidateHeader(block, &uncompressed_size);
+  if (codec_ != nullptr) {
+    // Init the decompressor and get the size required for the uncompressed buffer.
+    CompressedBlockDecoder uncompressor(codec_, cfile_version_, block);
+    Status s = uncompressor.Init();
     if (!s.ok()) {
-      LOG(WARNING) << "Unable to get uncompressed size at "
+      LOG(WARNING) << "Unable to validate compressed block at "
                    << ptr.offset() << " of size " << ptr.size() << ": "
                    << s.ToString();
       return s;
     }
+    int uncompressed_size = uncompressor.uncompressed_size();
 
     // If we plan to put the uncompressed block in the cache, we should
     // decompress directly into the cache's memory (to avoid a memcpy for NVM).
     ScratchMemory decompressed_scratch;
     if (cache_control == CACHE_BLOCK) {
-      decompressed_scratch.TryAllocateFromCache(cache, uncompressed_size);
+      decompressed_scratch.TryAllocateFromCache(cache, key, uncompressed_size);
     } else {
       decompressed_scratch.AllocateFromHeap(uncompressed_size);
     }
-
-    s = block_uncompressor_->UncompressIntoBuffer(block, decompressed_scratch.get(),
-                                                  uncompressed_size);
+    s = uncompressor.UncompressIntoBuffer(decompressed_scratch.get());
     if (!s.ok()) {
       LOG(WARNING) << "Unable to uncompress block at " << ptr.offset()
                    << " of size " << ptr.size() << ": " << s.ToString();
@@ -378,7 +405,7 @@ Status CFileReader::ReadBlock(const BlockPointer &ptr, CacheControl cache_contro
     scratch.Swap(&decompressed_scratch);
 
     // Set the result block to our decompressed data.
-    block = Slice(scratch.get(), uncompressed_size);
+    block = Slice(buf, uncompressed_size);
   } else {
     // Some of the File implementations from LevelDB attempt to be tricky
     // and just return a Slice into an mmapped region (or in-memory region).
@@ -389,24 +416,19 @@ Status CFileReader::ReadBlock(const BlockPointer &ptr, CacheControl cache_contro
 
   // It's possible that one of the TryAllocateFromCache() calls above
   // failed, in which case we don't insert it into the cache regardless
-  // of what the user requested.
+  // of what the user requested. The scratch memory includes both the
+  // generated key and the data read from disk.
   if (cache_control == CACHE_BLOCK && scratch.IsFromCache()) {
-    if (cache->Insert(block_->id(), ptr.offset(), block, &bc_handle)) {
-      *ret = BlockHandle::WithDataFromCache(&bc_handle);
-    } else {
-      // If we failed to insert in the cache, but we'd already read into
-      // cache-managed memory, we need to ensure that we end up with a
-      // heap-allocated block in the BlockHandle.
-      scratch.EnsureOnHeap();
-      block = Slice(scratch.get(), block.size());
-      *ret = BlockHandle::WithOwnedData(block);
-    }
+    cache->Insert(scratch.mutable_pending_entry(), &bc_handle);
+    *ret = BlockHandle::WithDataFromCache(&bc_handle);
   } else {
-    // If we never intended to cache the block, then the scratch space
-    // should not be owned by the cache.
-    DCHECK_EQ(block.data(), scratch.get());
+    // We get here by either not intending to cache the block or
+    // if the entry could not be allocated from the block cache.
+    // Since we allocate memory to include the key for the cache entry
+    // we must reset the block.
+    DCHECK_EQ(block.data(), buf);
     DCHECK(!scratch.IsFromCache());
-    *ret = BlockHandle::WithOwnedData(block);
+    *ret = BlockHandle::WithOwnedData(scratch.as_slice());
   }
 
   // The cache or the BlockHandle now has ownership over the memory, so release
@@ -456,15 +478,13 @@ size_t CFileReader::memory_footprint() const {
   if (footer_) {
     size += footer_->SpaceUsed();
   }
-  if (block_uncompressor_) {
-    size += kudu_malloc_usable_size(block_uncompressor_.get());
-  }
   return size;
 }
 
 ////////////////////////////////////////////////////////////
 // Default Column Value Iterator
 ////////////////////////////////////////////////////////////
+
 Status DefaultColumnValueIterator::SeekToOrdinal(rowid_t ord_idx) {
   ordinal_ = ord_idx;
   return Status::OK();
@@ -475,12 +495,22 @@ Status DefaultColumnValueIterator::PrepareBatch(size_t *n) {
   return Status::OK();
 }
 
-Status DefaultColumnValueIterator::Scan(ColumnBlock *dst)  {
+Status DefaultColumnValueIterator::Scan(ColumnMaterializationContext* ctx) {
+  ColumnBlock* dst = ctx->block();
   if (dst->is_nullable()) {
     ColumnDataView dst_view(dst);
     dst_view.SetNullBits(dst->nrows(), value_ != nullptr);
   }
+  // Cases where the selection vector can be cleared:
+  // 1. There is a read_default and it does not satisfy the predicate
+  // 2. There is no read_default and the predicate is searching for NULLs
   if (value_ != nullptr) {
+    if (ctx->DecoderEvalNotDisabled() &&
+        !ctx->pred()->EvaluateCell(typeinfo_->physical_type(), value_)) {
+      SelectionVectorView sel_view(ctx->sel());
+      sel_view.ClearBits(dst->nrows());
+      return Status::OK();
+    }
     if (typeinfo_->physical_type() == BINARY) {
       const Slice *src_slice = reinterpret_cast<const Slice *>(value_);
       Slice dst_slice;
@@ -494,6 +524,11 @@ Status DefaultColumnValueIterator::Scan(ColumnBlock *dst)  {
       for (size_t i = 0; i < dst->nrows(); ++i) {
         dst->SetCellValue(i, value_);
       }
+    }
+  } else {
+    if (ctx->DecoderEvalNotDisabled() && !ctx->EvaluatingIsNull()) {
+      SelectionVectorView sel_view(ctx->sel());
+      sel_view.ClearBits(dst->nrows());
     }
   }
   return Status::OK();
@@ -612,8 +647,6 @@ Status CFileIterator::SeekToFirst() {
   return Status::OK();
 }
 
-
-
 Status CFileIterator::SeekAtOrAfter(const EncodedKey &key,
                                     bool *exact_match) {
   RETURN_NOT_OK(PrepareForNewSeek());
@@ -657,7 +690,7 @@ Status CFileIterator::SeekAtOrAfter(const EncodedKey &key,
     *exact_match = false;
     if (PREDICT_FALSE(!validx_iter_->HasNext())) {
       return Status::NotFound("key after last block in file",
-                              key.encoded_key().ToDebugString());
+                              KUDU_REDACT(key.encoded_key().ToDebugString()));
     }
     RETURN_NOT_OK(validx_iter_->Next());
     RETURN_NOT_OK(ReadCurrentDataBlock(*validx_iter_, b.get()));
@@ -889,16 +922,30 @@ Status CFileIterator::FinishBatch() {
   return Status::OK();
 }
 
-
-Status CFileIterator::Scan(ColumnBlock *dst) {
+Status CFileIterator::Scan(ColumnMaterializationContext* ctx) {
   CHECK(seeked_) << "not seeked";
 
-  // Use a column data view to been able to advance it as we read into it.
-  ColumnDataView remaining_dst(dst);
-
+  // Use views to advance the block and selection vector as we read into them.
+  ColumnDataView remaining_dst(ctx->block());
+  SelectionVectorView remaining_sel(ctx->sel());
   uint32_t rem = last_prepare_count_;
-  DCHECK_LE(rem, dst->nrows());
+  DCHECK_LE(rem, ctx->block()->nrows());
 
+  // Determine the matching codewords for dictionary encoding if they haven't
+  // yet been determined for this CFile.
+  if (dict_decoder_ && ctx->DecoderEvalNotDisabled() && !codewords_matching_pred_) {
+    size_t nwords = dict_decoder_->Count();
+    if (nwords > 0) {
+      codewords_matching_pred_.reset(new SelectionVector(nwords));
+      codewords_matching_pred_->SetAllFalse();
+      for (size_t i = 0; i < nwords; i++) {
+        Slice cur_string = dict_decoder_->string_at_index(i);
+        if (ctx->pred()->EvaluateCell<BINARY>(static_cast<const void *>(&cur_string))) {
+          BitmapSet(codewords_matching_pred_->mutable_bitmap(), i);
+        }
+      }
+    }
+  }
   for (PreparedBlock *pb : prepared_blocks_) {
     if (pb->needs_rewind_) {
       // Seek back to the saved position.
@@ -907,12 +954,10 @@ Status CFileIterator::Scan(ColumnBlock *dst) {
       // that might be more efficient (allowing the decoder to save internal state
       // instead of having to reconstruct it)
     }
-
     if (reader_->is_nullable()) {
-      DCHECK(dst->is_nullable());
+      DCHECK(ctx->block()->is_nullable());
 
       size_t nrows = std::min(rem, pb->num_rows_in_block_ - pb->idx_in_block_);
-
       // Fill column bitmap
       size_t count = nrows;
       while (count > 0) {
@@ -924,11 +969,16 @@ Status CFileIterator::Scan(ColumnBlock *dst) {
             Substitute("Unexpected EOF on NULL bitmap read. Expected at least $0 more rows",
                        count));
         }
-
         size_t this_batch = nblock;
         if (not_null) {
-          // TODO: Maybe copy all and shift later?
-          RETURN_NOT_OK(pb->dblk_->CopyNextValues(&this_batch, &remaining_dst));
+          if (ctx->DecoderEvalNotDisabled()) {
+            RETURN_NOT_OK(pb->dblk_->CopyNextAndEval(&this_batch,
+                                                     ctx,
+                                                     &remaining_sel,
+                                                     &remaining_dst));
+          } else {
+            RETURN_NOT_OK(pb->dblk_->CopyNextValues(&this_batch, &remaining_dst));
+          }
           DCHECK_EQ(nblock, this_batch);
           pb->needs_rewind_ = true;
         } else {
@@ -937,6 +987,9 @@ Status CFileIterator::Scan(ColumnBlock *dst) {
                                      remaining_dst.stride() * nblock,
                                      "NULLNULLNULLNULLNULL");
 #endif
+          if (ctx->DecoderEvalNotDisabled() && !ctx->EvaluatingIsNull()) {
+            remaining_sel.ClearBits(this_batch);
+          }
         }
 
         // Set the ColumnBlock bitmap
@@ -946,22 +999,29 @@ Status CFileIterator::Scan(ColumnBlock *dst) {
         count -= this_batch;
         pb->idx_in_block_ += this_batch;
         remaining_dst.Advance(this_batch);
+        remaining_sel.Advance(this_batch);
       }
     } else {
       // Fetch as many as we can from the current datablock.
       size_t this_batch = rem;
-      RETURN_NOT_OK(pb->dblk_->CopyNextValues(&this_batch, &remaining_dst));
+
+      if (ctx->DecoderEvalNotDisabled()) {
+        RETURN_NOT_OK(pb->dblk_->CopyNextAndEval(&this_batch, ctx, &remaining_sel, &remaining_dst));
+      } else {
+        RETURN_NOT_OK(pb->dblk_->CopyNextValues(&this_batch, &remaining_dst));
+      }
       pb->needs_rewind_ = true;
       DCHECK_LE(this_batch, rem);
 
       // If the column is nullable, set all bits to true
-      if (dst->is_nullable()) {
+      if (ctx->block()->is_nullable()) {
         remaining_dst.SetNullBits(this_batch, true);
       }
 
       rem -= this_batch;
       pb->idx_in_block_ += this_batch;
       remaining_dst.Advance(this_batch);
+      remaining_sel.Advance(this_batch);
     }
 
     // If we didn't fetch as many as requested, then it should
@@ -978,13 +1038,12 @@ Status CFileIterator::Scan(ColumnBlock *dst) {
   return Status::OK();
 }
 
-Status CFileIterator::CopyNextValues(size_t *n, ColumnBlock *cb) {
+Status CFileIterator::CopyNextValues(size_t* n, ColumnMaterializationContext* ctx) {
   RETURN_NOT_OK(PrepareBatch(n));
-  RETURN_NOT_OK(Scan(cb));
+  RETURN_NOT_OK(Scan(ctx));
   RETURN_NOT_OK(FinishBatch());
   return Status::OK();
 }
-
 
 } // namespace cfile
 } // namespace kudu

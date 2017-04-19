@@ -16,13 +16,16 @@
 // under the License.
 
 #include <cmath>
-#include <gtest/gtest.h>
 #include <string>
 #include <tuple>
 #include <vector>
 
+#include <gflags/gflags.h>
+#include <gtest/gtest.h>
+
 #include "kudu/common/types.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/util/test_util.h"
 
 using std::get;
 using std::make_tuple;
@@ -33,21 +36,23 @@ using std::vector;
 
 namespace kudu {
 
-TEST(TestTypes, TestTimestampPrinting) {
-  const TypeInfo* info = GetTypeInfo(TIMESTAMP);
+class TestTypes : public KuduTest {};
+
+TEST_F(TestTypes, TestTimestampPrinting) {
+  const TypeInfo* info = GetTypeInfo(UNIXTIME_MICROS);
 
   // Test the minimum value
   int64 time;
   info->CopyMinValue(&time);
   string result;
   info->AppendDebugStringForValue(&time, &result);
-  ASSERT_EQ("-290308-12-21 19:59:05.224192 GMT", result);
+  ASSERT_EQ("-290308-12-21T19:59:05.224192Z", result);
   result = "";
 
   // Test a regular negative timestamp.
   time = -1454368523123456;
   info->AppendDebugStringForValue(&time, &result);
-  ASSERT_EQ("1923-12-01 00:44:36.876544 GMT", result);
+  ASSERT_EQ("1923-12-01T00:44:36.876544Z", result);
   result = "";
 
   // Test that passing 0 microseconds returns the correct time (0 msecs after the epoch).
@@ -55,19 +60,30 @@ TEST(TestTypes, TestTimestampPrinting) {
   // current time instead.
   time = 0;
   info->AppendDebugStringForValue(&time, &result);
-  ASSERT_EQ("1970-01-01 00:00:00.000000 GMT", result);
+  ASSERT_EQ("1970-01-01T00:00:00.000000Z", result);
   result = "";
 
   // Test a regular positive timestamp.
   time = 1454368523123456;
   info->AppendDebugStringForValue(&time, &result);
-  ASSERT_EQ("2016-02-01 23:15:23.123456 GMT", result);
+  ASSERT_EQ("2016-02-01T23:15:23.123456Z", result);
   result = "";
 
   // Test the maximum value.
   time = MathLimits<int64>::kMax;
   info->AppendDebugStringForValue(&time, &result);
-  ASSERT_EQ("294247-01-10 04:00:54.775807 GMT", result);
+  ASSERT_EQ("294247-01-10T04:00:54.775807Z", result);
+  result = "";
+
+  {
+    // Check that row values are redacted when --redact is set with 'log'.
+    google::FlagSaver flag_saver;
+    ASSERT_NE("", gflags::SetCommandLineOption("redact", "log"));
+    time = 0;
+    info->AppendDebugStringForValue(&time, &result);
+    ASSERT_EQ("<redacted>", result);
+    result = "";
+  }
 }
 
 namespace {
@@ -86,7 +102,7 @@ namespace {
   }
 } // anonymous namespace
 
-TEST(TestTypes, TestAreConsecutiveInteger) {
+TEST_F(TestTypes, TestAreConsecutiveInteger) {
   vector<tuple<int64_t, int64_t, bool>> test_cases {
     make_tuple(0, 0, false),
     make_tuple(0, 1, true),
@@ -104,7 +120,7 @@ TEST(TestTypes, TestAreConsecutiveInteger) {
   TestAreConsecutive(INT64, test_cases);
 }
 
-TEST(TestTypes, TestAreConsecutiveDouble) {
+TEST_F(TestTypes, TestAreConsecutiveDouble) {
   vector<tuple<double, double, bool>> test_cases {
     make_tuple(0.0, 1.0, false),
     make_tuple(0.0, 0.1, false),
@@ -116,7 +132,7 @@ TEST(TestTypes, TestAreConsecutiveDouble) {
   TestAreConsecutive(DOUBLE, test_cases);
 }
 
-TEST(TestTypes, TestAreConsecutiveString) {
+TEST_F(TestTypes, TestAreConsecutiveString) {
   vector<tuple<Slice, Slice, bool>> test_cases {
     make_tuple("abc", "abc", false),
     make_tuple("abc", Slice("abc\0", 4), true),

@@ -17,13 +17,15 @@
 #ifndef KUDU_TABLET_LAYER_TEST_BASE_H
 #define KUDU_TABLET_LAYER_TEST_BASE_H
 
-#include <glog/logging.h>
-#include <gtest/gtest.h>
+#include <unistd.h>
+
 #include <memory>
 #include <string>
-#include <unistd.h>
 #include <unordered_set>
 #include <vector>
+
+#include <glog/logging.h>
+#include <gtest/gtest.h>
 
 #include "kudu/common/iterator.h"
 #include "kudu/common/rowblock.h"
@@ -32,9 +34,11 @@
 #include "kudu/consensus/log_util.h"
 #include "kudu/consensus/opid_util.h"
 #include "kudu/gutil/stringprintf.h"
+#include "kudu/server/clock.h"
 #include "kudu/server/logical_clock.h"
 #include "kudu/tablet/diskrowset.h"
 #include "kudu/tablet/tablet-test-util.h"
+#include "kudu/tablet/tablet_mem_trackers.h"
 #include "kudu/util/env.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/stopwatch.h"
@@ -57,8 +61,7 @@ class TestRowSet : public KuduRowSetTest {
     : KuduRowSetTest(CreateTestSchema()),
       n_rows_(FLAGS_roundtrip_num_rows),
       op_id_(consensus::MaximumOpId()),
-      mvcc_(scoped_refptr<server::Clock>(
-          server::LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp))) {
+      clock_(server::LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp)) {
     CHECK_GT(n_rows_, 0);
   }
 
@@ -183,7 +186,7 @@ class TestRowSet : public KuduRowSetTest {
     RowSetKeyProbe probe(rb.row());
 
     ProbeStats stats;
-    ScopedTransaction tx(&mvcc_);
+    ScopedTransaction tx(&mvcc_, clock_->Now());
     tx.StartApplying();
     Status s = rs->MutateRow(tx.timestamp(), probe, mutation, op_id_, &stats, result);
     tx.Commit();
@@ -213,7 +216,7 @@ class TestRowSet : public KuduRowSetTest {
     Schema proj_val = CreateProjection(schema_, { "val" });
     MvccSnapshot snap = MvccSnapshot::CreateSnapshotIncludingAllTransactions();
     gscoped_ptr<RowwiseIterator> row_iter;
-    CHECK_OK(rs.NewRowIterator(&proj_val, snap, &row_iter));
+    CHECK_OK(rs.NewRowIterator(&proj_val, snap, UNORDERED, &row_iter));
     CHECK_OK(row_iter->Init(NULL));
     Arena arena(1024, 1024*1024);
     int batch_size = 10000;
@@ -252,15 +255,15 @@ class TestRowSet : public KuduRowSetTest {
   void VerifyRandomRead(const DiskRowSet& rs, const Slice& row_key,
                         const string& expected_val) {
     Arena arena(256, 1024);
+    AutoReleasePool pool;
     ScanSpec spec;
-    ColumnRangePredicate pred(schema_.column(0), &row_key, &row_key);
+    auto pred = ColumnPredicate::Equality(schema_.column(0), &row_key);
     spec.AddPredicate(pred);
-    RangePredicateEncoder enc(&schema_, &arena);
-    enc.EncodeRangePredicates(&spec, true);
+    spec.OptimizeScan(schema_, &arena, &pool, true);
 
     MvccSnapshot snap = MvccSnapshot::CreateSnapshotIncludingAllTransactions();
     gscoped_ptr<RowwiseIterator> row_iter;
-    CHECK_OK(rs.NewRowIterator(&schema_, snap, &row_iter));
+    CHECK_OK(rs.NewRowIterator(&schema_, snap, UNORDERED, &row_iter));
     CHECK_OK(row_iter->Init(&spec));
     vector<string> rows;
     IterateToStringList(row_iter.get(), &rows);
@@ -274,7 +277,7 @@ class TestRowSet : public KuduRowSetTest {
                                 int expected_rows, bool do_log = true) {
     MvccSnapshot snap = MvccSnapshot::CreateSnapshotIncludingAllTransactions();
     gscoped_ptr<RowwiseIterator> row_iter;
-    CHECK_OK(rs.NewRowIterator(&schema, snap, &row_iter));
+    CHECK_OK(rs.NewRowIterator(&schema, snap, UNORDERED, &row_iter));
     CHECK_OK(row_iter->Init(NULL));
 
     int batch_size = 1000;
@@ -320,7 +323,10 @@ class TestRowSet : public KuduRowSetTest {
   }
 
   Status OpenTestRowSet(std::shared_ptr<DiskRowSet> *rowset) {
-    return DiskRowSet::Open(rowset_meta_, new log::LogAnchorRegistry(), rowset);
+    return DiskRowSet::Open(rowset_meta_,
+                            new log::LogAnchorRegistry(),
+                            TabletMemTrackers(),
+                            rowset);
   }
 
   void FormatKey(int i, char *buf, size_t buf_len) {
@@ -329,6 +335,7 @@ class TestRowSet : public KuduRowSetTest {
 
   size_t n_rows_;
   consensus::OpId op_id_; // Generally a "fake" OpId for these tests.
+  scoped_refptr<server::Clock> clock_;
   MvccManager mvcc_;
 };
 

@@ -85,6 +85,7 @@ class UpdateScanDeltaCompactionTest : public KuduTest {
     gscoped_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
     ASSERT_OK(table_creator->table_name(kTableName)
              .schema(&schema_)
+             .set_range_partition_columns({ "key" })
              .num_replicas(1)
              .Create());
     ASSERT_OK(client_->OpenTable(kTableName, &table_));
@@ -113,7 +114,7 @@ class UpdateScanDeltaCompactionTest : public KuduTest {
 
   void InitCluster() {
     // Start mini-cluster with 1 tserver.
-    cluster_.reset(new MiniCluster(env_.get(), MiniClusterOptions()));
+    cluster_.reset(new MiniCluster(env_, MiniClusterOptions()));
     ASSERT_OK(cluster_->Start());
     KuduClientBuilder client_builder;
     client_builder.add_master_server_addr(
@@ -260,6 +261,11 @@ void UpdateScanDeltaCompactionTest::UpdateRows(CountDownLatch* stop_latch) {
 void UpdateScanDeltaCompactionTest::ScanRows(CountDownLatch* stop_latch) const {
   while (stop_latch->count() > 0) {
     KuduScanner scanner(table_.get());
+    // Sometimes use fault-tolerant scans, to get more coverage of the
+    // MergeIterator code paths.
+    if (rand() % 2 == 1) {
+      CHECK_OK(scanner.SetFaultTolerant());
+    }
     LOG_TIMING(INFO, "Scan") {
       CHECK_OK(scanner.Open());
       vector<KuduRowResult> rows;

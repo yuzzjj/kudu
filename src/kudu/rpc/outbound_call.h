@@ -17,6 +17,7 @@
 #ifndef KUDU_RPC_CLIENT_CALL_H
 #define KUDU_RPC_CLIENT_CALL_H
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -26,9 +27,11 @@
 #include "kudu/gutil/macros.h"
 #include "kudu/rpc/constants.h"
 #include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/rpc/rpc_sidecar.h"
 #include "kudu/rpc/remote_method.h"
 #include "kudu/rpc/response_callback.h"
 #include "kudu/rpc/transfer.h"
+#include "kudu/rpc/user_credentials.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/sockaddr.h"
@@ -50,49 +53,8 @@ class DumpRunningRpcsRequestPB;
 class InboundTransfer;
 class RpcCallInProgressPB;
 class RpcController;
+class RpcSidecar;
 
-// Client-side user credentials, such as a user's username & password.
-// In the future, we will add Kerberos credentials.
-//
-// TODO(mpercy): this is actually used server side too -- should
-// we instead introduce a RemoteUser class or something?
-class UserCredentials {
- public:
-   UserCredentials();
-
-  // Effective user, in cases where impersonation is supported.
-  // If impersonation is not supported, this should be left empty.
-  bool has_effective_user() const;
-  void set_effective_user(const std::string& eff_user);
-  const std::string& effective_user() const { return eff_user_; }
-
-  // Real user.
-  bool has_real_user() const;
-  void set_real_user(const std::string& real_user);
-  const std::string& real_user() const { return real_user_; }
-
-  // The real user's password.
-  bool has_password() const;
-  void set_password(const std::string& password);
-  const std::string& password() const { return password_; }
-
-  // Copy state from another object to this one.
-  void CopyFrom(const UserCredentials& other);
-
-  // Returns a string representation of the object, not including the password field.
-  std::string ToString() const;
-
-  std::size_t HashCode() const;
-  bool Equals(const UserCredentials& other) const;
-
- private:
-  // Remember to update HashCode() and Equals() when new fields are added.
-  std::string eff_user_;
-  std::string real_user_;
-  std::string password_;
-
-  DISALLOW_COPY_AND_ASSIGN(UserCredentials);
-};
 
 // Used to key on Connection information.
 // For use as a key in an unordered STL collection, use ConnectionIdHash and ConnectionIdEqual.
@@ -105,14 +67,14 @@ class ConnectionId {
   ConnectionId(const ConnectionId& other);
 
   // Convenience constructor.
-  ConnectionId(const Sockaddr& remote, const UserCredentials& user_credentials);
+  ConnectionId(const Sockaddr& remote, UserCredentials user_credentials);
 
   // The remote address.
   void set_remote(const Sockaddr& remote);
   const Sockaddr& remote() const { return remote_; }
 
   // The credentials of the user associated with this connection, if any.
-  void set_user_credentials(const UserCredentials& user_credentials);
+  void set_user_credentials(UserCredentials user_credentials);
   const UserCredentials& user_credentials() const { return user_credentials_; }
   UserCredentials* mutable_user_credentials() { return &user_credentials_; }
 
@@ -164,11 +126,13 @@ class OutboundCall {
 
   ~OutboundCall();
 
-  // Serialize the given request PB into this call's internal storage.
+  // Serialize the given request PB into this call's internal storage, and assume
+  // ownership of any sidecars that should accompany this request.
   //
-  // Because the data is fully serialized by this call, 'req' may be
-  // subsequently mutated with no ill effects.
-  Status SetRequestParam(const google::protobuf::Message& req);
+  // Because the request data is fully serialized by this call, 'req' may be subsequently
+  // mutated with no ill effects.
+  void SetRequestPayload(const google::protobuf::Message& req,
+      std::vector<std::unique_ptr<RpcSidecar>>&& sidecars);
 
   // Assign the call ID for this call. This is called from the reactor
   // thread once a connection has been assigned. Must only be called once.
@@ -177,12 +141,16 @@ class OutboundCall {
     header_.set_call_id(call_id);
   }
 
-  // Serialize the call for the wire. Requires that SetRequestParam()
+  // Serialize the call for the wire. Requires that SetRequestPayload()
   // is called first. This is called from the Reactor thread.
   Status SerializeTo(std::vector<Slice>* slices);
 
   // Callback after the call has been put on the outbound connection queue.
   void SetQueued();
+
+  // Update the call state to show that the request has started being sent
+  // on the socket.
+  void SetSending();
 
   // Update the call state to show that the request has been sent.
   void SetSent();
@@ -204,6 +172,10 @@ class OutboundCall {
 
   // Fill in the call response.
   void SetResponse(gscoped_ptr<CallResponse> resp);
+
+  const std::set<RpcFeatureFlag>& required_rpc_features() const {
+    return required_rpc_features_;
+  }
 
   std::string ToString() const;
 
@@ -237,11 +209,12 @@ class OutboundCall {
   // and OutboundCall::StateName(State state) as well.
   enum State {
     READY = 0,
-    ON_OUTBOUND_QUEUE = 1,
-    SENT = 2,
-    TIMED_OUT = 3,
-    FINISHED_ERROR = 4,
-    FINISHED_SUCCESS = 5
+    ON_OUTBOUND_QUEUE,
+    SENDING,
+    SENT,
+    TIMED_OUT,
+    FINISHED_ERROR,
+    FINISHED_SUCCESS
   };
 
   static std::string StateName(State state);
@@ -282,6 +255,9 @@ class OutboundCall {
   // The remote method being called.
   RemoteMethod remote_method_;
 
+  // RPC-system features required to send this call.
+  std::set<RpcFeatureFlag> required_rpc_features_;
+
   ConnectionId conn_id_;
   ResponseCallback callback_;
   RpcController* controller_;
@@ -296,6 +272,12 @@ class OutboundCall {
   // Once a response has been received for this call, contains that response.
   // Otherwise NULL.
   gscoped_ptr<CallResponse> call_response_;
+
+  // All sidecars to be sent with this call.
+  std::vector<std::unique_ptr<RpcSidecar>> sidecars_;
+
+  // Total size in bytes of all sidecars in 'sidecars_'. Set in SetRequestPayload().
+  int64_t sidecar_byte_size_ = -1;
 
   DISALLOW_COPY_AND_ASSIGN(OutboundCall);
 };
@@ -350,7 +332,7 @@ class CallResponse {
   Slice serialized_response_;
 
   // Slices of data for rpc sidecars. They point into memory owned by transfer_.
-  Slice sidecar_slices_[OutboundTransfer::kMaxPayloadSlices];
+  Slice sidecar_slices_[TransferLimits::kMaxSidecars];
 
   // The incoming transfer data - retained because serialized_response_
   // and sidecar_slices_ refer into its data.

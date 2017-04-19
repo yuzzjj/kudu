@@ -20,8 +20,11 @@
 #ifndef KUDU_UTIL_PB_UTIL_INTERNAL_H
 #define KUDU_UTIL_PB_UTIL_INTERNAL_H
 
+#include <memory>
+
 #include <glog/logging.h>
 #include <google/protobuf/io/zero_copy_stream.h>
+
 #include "kudu/util/env.h"
 
 namespace kudu {
@@ -56,6 +59,10 @@ class SequentialFileFileInputStream : public google::protobuf::io::ZeroCopyInput
     return total_read_;
   }
 
+  Status status() const {
+    return status_;
+  }
+
  private:
   static const size_t kDefaultBufferSize = 8192;
 
@@ -64,7 +71,7 @@ class SequentialFileFileInputStream : public google::protobuf::io::ZeroCopyInput
   size_t buffer_used_;
   size_t buffer_offset_;
   const size_t buffer_size_;
-  gscoped_ptr<uint8_t[]> buffer_;
+  std::unique_ptr<uint8_t[]> buffer_;
 
   size_t total_read_;
   SequentialFile *rfile_;
@@ -111,7 +118,7 @@ class WritableFileOutputStream : public google::protobuf::io::ZeroCopyOutputStre
 
   size_t buffer_offset_;
   const size_t buffer_size_;
-  gscoped_ptr<uint8_t[]> buffer_;
+  std::unique_ptr<uint8_t[]> buffer_;
 
   size_t flushed_;
   WritableFile *wfile_;

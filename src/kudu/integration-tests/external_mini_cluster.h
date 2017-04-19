@@ -17,6 +17,8 @@
 #ifndef KUDU_INTEGRATION_TESTS_EXTERNAL_MINI_CLUSTER_H
 #define KUDU_INTEGRATION_TESTS_EXTERNAL_MINI_CLUSTER_H
 
+#include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <sys/types.h>
@@ -26,6 +28,8 @@
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
+#include "kudu/integration-tests/mini_cluster_base.h"
+#include "kudu/security/test/mini_kdc.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/status.h"
@@ -41,14 +45,6 @@ class MetricEntityPrototype;
 class NodeInstancePB;
 class Sockaddr;
 class Subprocess;
-
-namespace master {
-class MasterServiceProxy;
-} // namespace master
-
-namespace rpc {
-class Messenger;
-} // namespace rpc
 
 namespace server {
 class ServerStatusPB;
@@ -70,13 +66,22 @@ struct ExternalMiniClusterOptions {
   // Default: "", which auto-generates a unique path for this cluster.
   std::string data_root;
 
-  // If true, binds each tablet server to a different loopback address.
+  // BindMode lets you specify the socket binding mode for RPC and/or HTTP server.
+  // A) LOOPBACK binds each server to loopback ip address "127.0.0.1".
+  //
+  // B) WILDCARD specifies "0.0.0.0" as the ip to bind to, which means sockets
+  // can be bound to any interface on the local host.
+  // For example, if a host has two interfaces with addresses
+  // 192.168.0.10 and 192.168.0.11, the server process can accept connection
+  // requests addressed to 192.168.0.10 or 192.168.0.11.
+  //
+  // C) UNIQUE_LOOPBACK binds each tablet server to a different loopback address.
   // This affects the server's RPC server, and also forces the server to
   // only use this IP address for outgoing socket connections as well.
   // This allows the use of iptables on the localhost to simulate network
   // partitions.
   //
-  // The addressed used are 127.<A>.<B>.<C> where:
+  // The addresses used are 127.<A>.<B>.<C> where:
   // - <A,B> are the high and low bytes of the pid of the process running the
   //   minicluster (not the daemon itself).
   // - <C> is the index of the server within this minicluster.
@@ -91,8 +96,13 @@ struct ExternalMiniClusterOptions {
   //
   // NOTE: this does not currently affect the HTTP server.
   //
-  // Default: true
-  bool bind_to_unique_loopback_addresses;
+  // Default: UNIQUE_LOOPBACK on Linux, LOOPBACK on macOS.
+  enum BindMode {
+    UNIQUE_LOOPBACK,
+    WILDCARD,
+    LOOPBACK
+  };
+  BindMode bind_mode;
 
   // The path where the kudu daemons should be run from.
   // Default: "", which uses the same path as the currently running executable.
@@ -110,6 +120,22 @@ struct ExternalMiniClusterOptions {
   // masters in a consensus configuration. Port at index 0 is used for the leader
   // master.
   std::vector<uint16_t> master_rpc_ports;
+
+  // Options to configure the MiniKdc before starting it up.
+  // Only used when 'enable_kerberos' is 'true'.
+  MiniKdcOptions mini_kdc_options;
+
+  // If true, set up a KDC as part of this MiniCluster, generate keytabs for
+  // the servers, and require Kerberos authentication from clients.
+  //
+  // Additionally, when the cluster is started, the environment of the
+  // test process will be modified to include Kerberos credentials for
+  // a principal named 'testuser'.
+  bool enable_kerberos;
+
+  // If true, sends logging output to stderr instead of a log file. Defaults to
+  // true.
+  bool logtostderr;
 };
 
 // A mini-cluster made up of subprocesses running each of the daemons
@@ -118,36 +144,23 @@ struct ExternalMiniClusterOptions {
 // cluster participants, which isn't feasible in the normal MiniCluster.
 // On the other hand, there is little access to inspect the internal state
 // of the daemons.
-class ExternalMiniCluster {
+class ExternalMiniCluster : public MiniClusterBase {
  public:
-  // Mode to which node types a certain action (like Shutdown()) should apply.
-  enum NodeSelectionMode {
-    TS_ONLY,
-    ALL
-  };
-
   explicit ExternalMiniCluster(const ExternalMiniClusterOptions& opts);
-  ~ExternalMiniCluster();
+  virtual ~ExternalMiniCluster();
 
   // Start the cluster.
-  Status Start();
+  Status Start() override;
 
   // Restarts the cluster. Requires that it has been Shutdown() first.
   Status Restart();
-
-  // Like the previous method but performs initialization synchronously, i.e.
-  // this will wait for all TS's to be started and initialized. Tests should
-  // use this if they interact with tablets immediately after Start();
-  Status StartSync();
 
   // Add a new TS to the cluster. The new TS is started.
   // Requires that the master is already running.
   Status AddTabletServer();
 
-  // Shuts down the whole cluster or part of it, depending on the selected
-  // 'mode'.
   // Currently, this uses SIGKILL on each daemon for a non-graceful shutdown.
-  void Shutdown(NodeSelectionMode mode = ALL);
+  void ShutdownNodes(ClusterNodes nodes) override;
 
   // Return the IP address that the tablet server with the given index will bind to.
   // If options.bind_to_unique_loopback_addresses is false, this will be 127.0.0.1
@@ -202,46 +215,47 @@ class ExternalMiniCluster {
   // Return all tablet servers and masters.
   std::vector<ExternalDaemon*> daemons() const;
 
-  int num_tablet_servers() const {
+  MiniKdc* kdc() const {
+    return CHECK_NOTNULL(kdc_.get());
+  }
+
+  int num_tablet_servers() const override {
     return tablet_servers_.size();
   }
 
-  int num_masters() const {
+  int num_masters() const override {
     return masters_.size();
   }
 
-  // Return the client messenger used by the ExternalMiniCluster.
-  std::shared_ptr<rpc::Messenger> messenger();
+  std::shared_ptr<rpc::Messenger> messenger() const override;
+  std::shared_ptr<master::MasterServiceProxy> master_proxy() const override;
+  std::shared_ptr<master::MasterServiceProxy> master_proxy(int idx) const override;
 
-  // If the cluster is configured for a single non-distributed master,
-  // return a proxy to that master. Requires that the single master is
-  // running.
-  std::shared_ptr<master::MasterServiceProxy> master_proxy();
-
-  // Returns an RPC proxy to the master at 'idx'. Requires that the
-  // master at 'idx' is running.
-  std::shared_ptr<master::MasterServiceProxy> master_proxy(int idx);
-
-  // Wait until the number of registered tablet servers reaches the
-  // given count on at least one of the running masters.  Returns
-  // Status::TimedOut if the desired count is not achieved with the
-  // given timeout.
+  // Wait until the number of registered tablet servers reaches the given count
+  // on all of the running masters. Returns Status::TimedOut if the desired
+  // count is not achieved with the given timeout.
   Status WaitForTabletServerCount(int count, const MonoDelta& timeout);
 
   // Runs gtest assertions that no servers have crashed.
   void AssertNoCrashes();
 
-  // Wait until all tablets on the given tablet server are in 'RUNNING'
-  // state.
-  Status WaitForTabletsRunning(ExternalTabletServer* ts, const MonoDelta& timeout);
+  // Wait until all tablets on the given tablet server are in the RUNNING
+  // state. Returns Status::TimedOut if 'timeout' elapses and at least one
+  // tablet is not yet RUNNING.
+  //
+  // If 'min_tablet_count' is not -1, will also wait for at least that many
+  // RUNNING tablets to appear before returning (potentially timing out if that
+  // number is never reached).
+  Status WaitForTabletsRunning(ExternalTabletServer* ts, int min_tablet_count,
+                               const MonoDelta& timeout);
 
   // Create a client configured to talk to this cluster.
   // Builder may contain override options for the client. The master address will
   // be overridden to talk to the running master.
   //
   // REQUIRES: the cluster must have already been Start()ed.
-  Status CreateClient(client::KuduClientBuilder& builder,
-                      client::sp::shared_ptr<client::KuduClient>* client);
+  Status CreateClient(client::KuduClientBuilder* builder,
+                      client::sp::shared_ptr<client::KuduClient>* client) const override;
 
   // Sets the given flag on the given daemon, which must be running.
   //
@@ -251,15 +265,31 @@ class ExternalMiniCluster {
                  const std::string& flag,
                  const std::string& value);
 
+  // Set the path where daemon binaries can be found.
+  // Overrides 'daemon_bin_path' set by ExternalMiniClusterOptions.
+  // The cluster must be shut down before calling this method.
+  void SetDaemonBinPath(std::string daemon_bin_path);
+
+  // Returns the path where 'binary' is expected to live, based on
+  // ExternalMiniClusterOptions.daemon_bin_path if it was provided, or on the
+  // path of the currently running executable otherwise.
+  std::string GetBinaryPath(const std::string& binary) const;
+
+  // Returns the path where 'daemon_id' is expected to store its data, based on
+  // ExternalMiniClusterOptions.data_root if it was provided, or on the
+  // standard Kudu test directory otherwise.
+  std::string GetDataPath(const std::string& daemon_id) const;
+
+  // Returns the path where 'daemon_id' is expected to store its logs, or other
+  // files that reside in the log dir.
+  std::string GetLogPath(const std::string& daemon_id) const;
+
  private:
   FRIEND_TEST(MasterFailoverTest, TestKillAnyMaster);
 
   Status StartSingleMaster();
 
   Status StartDistributedMasters();
-
-  std::string GetBinaryPath(const std::string& binary) const;
-  std::string GetDataPath(const std::string& daemon_id) const;
 
   Status DeduceBinRoot(std::string* ret);
   Status HandleOptions();
@@ -273,26 +303,62 @@ class ExternalMiniCluster {
 
   std::vector<scoped_refptr<ExternalMaster> > masters_;
   std::vector<scoped_refptr<ExternalTabletServer> > tablet_servers_;
+  std::unique_ptr<MiniKdc> kdc_;
 
   std::shared_ptr<rpc::Messenger> messenger_;
 
   DISALLOW_COPY_AND_ASSIGN(ExternalMiniCluster);
 };
 
+struct ExternalDaemonOptions {
+  explicit ExternalDaemonOptions(bool logtostderr)
+      : logtostderr(logtostderr) {
+  }
+
+  bool logtostderr;
+  std::shared_ptr<rpc::Messenger> messenger;
+  std::string exe;
+  std::string data_dir;
+  std::string log_dir;
+  std::vector<std::string> extra_flags;
+};
+
 class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
  public:
-  ExternalDaemon(std::shared_ptr<rpc::Messenger> messenger, std::string exe,
-                 std::string data_dir, std::vector<std::string> extra_flags);
+  explicit ExternalDaemon(ExternalDaemonOptions opts);
 
   HostPort bound_rpc_hostport() const;
   Sockaddr bound_rpc_addr() const;
+
+  // Return the host/port that this daemon is bound to for HTTP.
+  // May return an uninitialized HostPort if HTTP is disabled.
   HostPort bound_http_hostport() const;
+
   const NodeInstancePB& instance_id() const;
   const std::string& uuid() const;
 
   // Return the pid of the running process.
   // Causes a CHECK failure if the process is not running.
   pid_t pid() const;
+
+  // Return the pointer to the undelying Subprocess if it is set.
+  // Otherwise, returns nullptr.
+  Subprocess* process() const;
+
+  // Set the path of the executable to run as a daemon.
+  // Overrides the exe path specified in the constructor.
+  // The daemon must be shut down before calling this method.
+  void SetExePath(std::string exe);
+
+  // Enable Kerberos for this daemon. This creates a Kerberos principal
+  // and keytab, and sets the appropriate environment variables in the
+  // subprocess such that the server will use Kerberos authentication.
+  //
+  // 'bind_host' is the hostname that will be used to generate the Kerberos
+  // service principal.
+  //
+  // Must be called before 'StartProcess()'.
+  Status EnableKerberos(MiniKdc* kdc, const std::string& bind_host);
 
   // Sends a SIGSTOP signal to the daemon.
   Status Pause();
@@ -308,9 +374,25 @@ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
   // explicitly call Shutdown().
   bool IsProcessAlive() const;
 
+  // Wait for this process to crash due to a configured fault
+  // injection, or the given timeout to elapse. If the process
+  // crashes for some reason other than an injected fault, returns
+  // Status::Aborted.
+  //
+  // If the process is already crashed, returns immediately.
+  Status WaitForInjectedCrash(const MonoDelta& timeout) const;
+
+  // Same as the above, but expects the process to crash due to a
+  // LOG(FATAL) or CHECK failure. In other words, waits for it to
+  // crash from SIGABRT.
+  Status WaitForFatal(const MonoDelta& timeout) const;
+
   virtual void Shutdown();
 
   const std::string& data_dir() const { return data_dir_; }
+
+  // Returns the log dir of the external daemon.
+  const std::string& log_dir() const { return log_dir_; }
 
   // Return a pointer to the flags used for this server on restart.
   // Modifying these flags will only take effect on the next restart.
@@ -335,20 +417,49 @@ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
   friend class RefCountedThreadSafe<ExternalDaemon>;
   virtual ~ExternalDaemon();
 
-  Status StartProcess(const std::vector<std::string>& flags);
+  // Starts a process with the given flags.
+  Status StartProcess(const std::vector<std::string>& user_flags);
+
+  // Wait for the process to exit, and then call 'wait_status_predicate'
+  // on the resulting exit status. NOTE: this is not the return code, but
+  // rather the value provided by waitpid(2): use WEXITSTATUS, etc.
+  //
+  // If the predicate matches, returns OK. Otherwise, returns an error.
+  // 'crash_type_str' should be a descriptive name for the type of crash,
+  // used in formatting the error message.
+  Status WaitForCrash(const MonoDelta& timeout,
+                      const std::function<bool(int)>& wait_status_predicate,
+                      const char* crash_type_str) const;
 
   // In a code-coverage build, try to flush the coverage data to disk.
   // In a non-coverage build, this does nothing.
   void FlushCoverage();
 
+  // In an LSAN build, ask the daemon to check for leaked memory, and
+  // LOG(FATAL) if there are any leaks.
+  void CheckForLeaks();
+
+  // Get/Set rpc_bind_addresses for daemon.
+  virtual const std::string& get_rpc_bind_address() const {
+    return rpc_bind_address_;
+  }
+  virtual void set_rpc_bind_address(std::string host) {
+    rpc_bind_address_ = host;
+  }
+
   const std::shared_ptr<rpc::Messenger> messenger_;
-  const std::string exe_;
   const std::string data_dir_;
+  const std::string log_dir_;
+  const bool logtostderr_;
+  std::string exe_;
   std::vector<std::string> extra_flags_;
+  std::map<std::string, std::string> extra_env_;
 
   gscoped_ptr<Subprocess> process_;
+  bool paused_ = false;
 
   gscoped_ptr<server::ServerStatusPB> status_;
+  std::string rpc_bind_address_;
 
   // These capture the daemons parameters and running ports and
   // are used to Restart() the daemon with the same parameters.
@@ -358,7 +469,7 @@ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
   DISALLOW_COPY_AND_ASSIGN(ExternalDaemon);
 };
 
-// Resumes a daemon that was stopped with ExteranlDaemon::Pause() upon
+// Resumes a daemon that was stopped with ExternalDaemon::Pause() upon
 // exiting a scope.
 class ScopedResumeExternalDaemon {
  public:
@@ -375,17 +486,12 @@ class ScopedResumeExternalDaemon {
   DISALLOW_COPY_AND_ASSIGN(ScopedResumeExternalDaemon);
 };
 
-
 class ExternalMaster : public ExternalDaemon {
  public:
-  ExternalMaster(const std::shared_ptr<rpc::Messenger>& messenger,
-                 const std::string& exe, const std::string& data_dir,
-                 const std::vector<std::string>& extra_flags);
+  explicit ExternalMaster(ExternalDaemonOptions opts);
 
-  ExternalMaster(const std::shared_ptr<rpc::Messenger>& messenger,
-                 const std::string& exe, const std::string& data_dir,
-                 std::string rpc_bind_address,
-                 const std::vector<std::string>& extra_flags);
+  ExternalMaster(ExternalDaemonOptions opts,
+                 std::string rpc_bind_address);
 
   Status Start();
 
@@ -393,21 +499,22 @@ class ExternalMaster : public ExternalDaemon {
   // Requires that it has previously been shutdown.
   Status Restart() WARN_UNUSED_RESULT;
 
+  // Blocks until the master's catalog manager is initialized and responding to
+  // RPCs.
+  Status WaitForCatalogManager() WARN_UNUSED_RESULT;
 
  private:
+  std::vector<std::string> GetCommonFlags() const;
+
   friend class RefCountedThreadSafe<ExternalMaster>;
   virtual ~ExternalMaster();
-
-  const std::string rpc_bind_address_;
 };
 
 class ExternalTabletServer : public ExternalDaemon {
  public:
-  ExternalTabletServer(const std::shared_ptr<rpc::Messenger>& messenger,
-                       const std::string& exe, const std::string& data_dir,
+  ExternalTabletServer(ExternalDaemonOptions opts,
                        std::string bind_host,
-                       const std::vector<HostPort>& master_addrs,
-                       const std::vector<std::string>& extra_flags);
+                       std::vector<HostPort> master_addrs);
 
   Status Start();
 
@@ -415,10 +522,8 @@ class ExternalTabletServer : public ExternalDaemon {
   // Requires that it has previously been shutdown.
   Status Restart() WARN_UNUSED_RESULT;
 
-
  private:
   const std::string master_addrs_;
-  const std::string bind_host_;
 
   friend class RefCountedThreadSafe<ExternalTabletServer>;
   virtual ~ExternalTabletServer();

@@ -19,9 +19,9 @@
                       http://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
   <parent>
-    <groupId>org.kududb</groupId>
+    <groupId>org.apache.kudu</groupId>
     <artifactId>kudu-parent</artifactId>
-    <version>0.8.0-SNAPSHOT</version>
+    <version>1.4.0-SNAPSHOT</version>
   </parent>
 
   <artifactId>interface-annotations</artifactId>
@@ -32,6 +32,7 @@
       <groupId>jdiff</groupId>
       <artifactId>jdiff</artifactId>
       <version>1.0.9</version>
+      <scope>provided</scope>
     </dependency>
   </dependencies>
 

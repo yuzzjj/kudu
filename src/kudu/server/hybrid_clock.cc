@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <algorithm>
-#include <boost/thread/locks.hpp>
-#include <glog/logging.h>
-
 #include "kudu/server/hybrid_clock.h"
+
+#include <algorithm>
+#include <glog/logging.h>
+#include <mutex>
 
 #include "kudu/gutil/bind.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -111,8 +111,7 @@ Status CheckDeadlineNotWithinMicros(const MonoTime& deadline, int64_t wait_for_u
     // No deadline.
     return Status::OK();
   }
-  int64_t us_until_deadline = deadline.GetDeltaSince(
-      MonoTime::Now(MonoTime::FINE)).ToMicroseconds();
+  int64_t us_until_deadline = (deadline - MonoTime::Now()).ToMicroseconds();
   if (us_until_deadline <= wait_for_usec) {
     return Status::TimedOut(Substitute(
         "specified time is $0us in the future, but deadline expires in $1us",
@@ -140,8 +139,7 @@ HybridClock::HybridClock()
       divisor_(1),
 #endif
       tolerance_adjustment_(1),
-      last_usec_(0),
-      next_logical_(0),
+      next_timestamp_(0),
       state_(kNotInitialized) {
 }
 
@@ -190,7 +188,7 @@ Timestamp HybridClock::Now() {
   Timestamp now;
   uint64_t error;
 
-  boost::lock_guard<simple_spinlock> lock(lock_);
+  std::lock_guard<simple_spinlock> lock(lock_);
   NowWithError(&now, &error);
   return now;
 }
@@ -200,7 +198,7 @@ Timestamp HybridClock::NowLatest() {
   uint64_t error;
 
   {
-    boost::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard<simple_spinlock> lock(lock_);
     NowWithError(&now, &error);
   }
 
@@ -230,11 +228,12 @@ void HybridClock::NowWithError(Timestamp* timestamp, uint64_t* max_error_usec) {
         "Status: $0", s.ToString());
   }
 
-  // If the current time surpasses the last update just return it
-  if (PREDICT_TRUE(now_usec > last_usec_)) {
-    last_usec_ = now_usec;
-    next_logical_ = 1;
-    *timestamp = TimestampFromMicroseconds(last_usec_);
+  // If the physical time from the system clock is higher than our last-returned
+  // time, we should use the physical timestamp.
+  uint64_t candidate_phys_timestamp = now_usec << kBitsToShift;
+  if (PREDICT_TRUE(candidate_phys_timestamp > next_timestamp_)) {
+    next_timestamp_ = candidate_phys_timestamp;
+    *timestamp = Timestamp(next_timestamp_++);
     *max_error_usec = error_usec;
     if (PREDICT_FALSE(VLOG_IS_ON(2))) {
       VLOG(2) << "Current clock is higher than the last one. Resetting logical values."
@@ -262,26 +261,27 @@ void HybridClock::NowWithError(Timestamp* timestamp, uint64_t* max_error_usec) {
   // This broadens the error interval for both cases but always returns
   // a correct error interval.
 
-  *max_error_usec = last_usec_ - (now_usec - error_usec);
-  *timestamp = TimestampFromMicrosecondsAndLogicalValue(last_usec_, next_logical_);
+  *max_error_usec = (next_timestamp_ >> kBitsToShift) - (now_usec - error_usec);
+  *timestamp = Timestamp(next_timestamp_++);
   if (PREDICT_FALSE(VLOG_IS_ON(2))) {
     VLOG(2) << "Current clock is lower than the last one. Returning last read and incrementing"
-        " logical values. Physical Value: " << now_usec << " usec Logical Value: "
-        << next_logical_ << " Error: " << *max_error_usec;
+        " logical values. Clock: " + Stringify(*timestamp) << " Error: " << *max_error_usec;
   }
-  next_logical_++;
 }
 
 Status HybridClock::Update(const Timestamp& to_update) {
-  boost::lock_guard<simple_spinlock> lock(lock_);
+  std::lock_guard<simple_spinlock> lock(lock_);
   Timestamp now;
   uint64_t error_ignored;
   NowWithError(&now, &error_ignored);
 
-  if (PREDICT_TRUE(now.CompareTo(to_update) > 0)) return Status::OK();
+  // If the incoming message is in the past relative to our current
+  // physical clock, there's nothing to do.
+  if (PREDICT_TRUE(now > to_update)) {
+    return Status::OK();
+  }
 
   uint64_t to_update_physical = GetPhysicalValueMicros(to_update);
-  uint64_t to_update_logical = GetLogicalValue(to_update);
   uint64_t now_physical = GetPhysicalValueMicros(now);
 
   // we won't update our clock if to_update is more than 'max_clock_sync_error_usec'
@@ -291,8 +291,9 @@ Status HybridClock::Update(const Timestamp& to_update) {
     return Status::InvalidArgument("Tried to update clock beyond the max. error.");
   }
 
-  last_usec_ = to_update_physical;
-  next_logical_ = to_update_logical + 1;
+  // Our next timestamp must be higher than the one that we are updating
+  // from.
+  next_timestamp_ = to_update.value() + 1;
   return Status::OK();
 }
 
@@ -300,19 +301,27 @@ bool HybridClock::SupportsExternalConsistencyMode(ExternalConsistencyMode mode) 
   return true;
 }
 
-Status HybridClock::WaitUntilAfter(const Timestamp& then_latest,
+bool HybridClock::HasPhysicalComponent() const {
+  return true;
+}
+
+MonoDelta HybridClock::GetPhysicalComponentDifference(Timestamp lhs, Timestamp rhs) const {
+  return MonoDelta::FromMicroseconds(GetPhysicalValueMicros(lhs) - GetPhysicalValueMicros(rhs));
+}
+
+Status HybridClock::WaitUntilAfter(const Timestamp& then,
                                    const MonoTime& deadline) {
   TRACE_EVENT0("clock", "HybridClock::WaitUntilAfter");
   Timestamp now;
   uint64_t error;
   {
-    boost::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard<simple_spinlock> lock(lock_);
     NowWithError(&now, &error);
   }
 
   // "unshift" the timestamps so that we can measure actual time
   uint64_t now_usec = GetPhysicalValueMicros(now);
-  uint64_t then_latest_usec = GetPhysicalValueMicros(then_latest);
+  uint64_t then_latest_usec = GetPhysicalValueMicros(then);
 
   uint64_t now_earliest_usec = now_usec - error;
 
@@ -321,7 +330,7 @@ Status HybridClock::WaitUntilAfter(const Timestamp& then_latest,
     return Status::OK();
   }
 
-  // Case 2 wait out until we are sure that then_latest has passed
+  // Case 2 wait out until we are sure that then has passed
 
   // We'll sleep then_latest_usec - now_earliest_usec so that the new
   // nw.earliest is higher than then.latest.
@@ -344,16 +353,16 @@ Status HybridClock::WaitUntilAfter(const Timestamp& then_latest,
   return Status::OK();
 }
 
-  Status HybridClock::WaitUntilAfterLocally(const Timestamp& then,
-                                            const MonoTime& deadline) {
+Status HybridClock::WaitUntilAfterLocally(const Timestamp& then,
+                                          const MonoTime& deadline) {
   while (true) {
     Timestamp now;
     uint64_t error;
     {
-      boost::lock_guard<simple_spinlock> lock(lock_);
+      std::lock_guard<simple_spinlock> lock(lock_);
       NowWithError(&now, &error);
     }
-    if (now.CompareTo(then) > 0) {
+    if (now > then) {
       return Status::OK();
     }
     uint64_t wait_for_usec = GetPhysicalValueMicros(then) - GetPhysicalValueMicros(now);
@@ -370,18 +379,11 @@ bool HybridClock::IsAfter(Timestamp t) {
   uint64_t error_usec;
   CHECK_OK(WalltimeWithError(&now_usec, &error_usec));
 
-  boost::lock_guard<simple_spinlock> lock(lock_);
-  now_usec = std::max(now_usec, last_usec_);
-
   Timestamp now;
-  if (now_usec > last_usec_) {
-    now = TimestampFromMicroseconds(now_usec);
-  } else {
-    // last_usec_ may be in the future if we were updated from a remote
-    // node.
-    now = TimestampFromMicrosecondsAndLogicalValue(last_usec_, next_logical_);
+  {
+    std::lock_guard<simple_spinlock> lock(lock_);
+    now = Timestamp(std::max(next_timestamp_, now_usec << kBitsToShift));
   }
-
   return t.value() < now.value();
 }
 
@@ -417,14 +419,14 @@ kudu::Status HybridClock::WalltimeWithError(uint64_t* now_usec, uint64_t* error_
 
 void HybridClock::SetMockClockWallTimeForTests(uint64_t now_usec) {
   CHECK(FLAGS_use_mock_wall_clock);
-  boost::lock_guard<simple_spinlock> lock(lock_);
+  std::lock_guard<simple_spinlock> lock(lock_);
   CHECK_GE(now_usec, mock_clock_time_usec_);
   mock_clock_time_usec_ = now_usec;
 }
 
 void HybridClock::SetMockMaxClockErrorForTests(uint64_t max_error_usec) {
   CHECK(FLAGS_use_mock_wall_clock);
-  boost::lock_guard<simple_spinlock> lock(lock_);
+  std::lock_guard<simple_spinlock> lock(lock_);
   mock_clock_max_error_usec_ = max_error_usec;
 }
 
@@ -438,7 +440,7 @@ uint64_t HybridClock::ErrorForMetrics() {
   Timestamp now;
   uint64_t error;
 
-  boost::lock_guard<simple_spinlock> lock(lock_);
+  std::lock_guard<simple_spinlock> lock(lock_);
   NowWithError(&now, &error);
   return error;
 }

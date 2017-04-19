@@ -22,7 +22,7 @@ PROTOBUF_GENERATE_CPP(
   PROTO_FILES common.proto)
 ADD_EXPORTABLE_LIBRARY(kudu_common_proto
   SRCS ${COMMON_PROTO_SRCS}
-  DEPS protobuf
+  DEPS pb_util_proto protobuf util_compression_proto
   NONLINK_DEPS ${COMMON_PROTO_TGTS})
 
 PROTOBUF_GENERATE_CPP(
@@ -40,19 +40,19 @@ ADD_EXPORTABLE_LIBRARY(wire_protocol_proto
   NONLINK_DEPS ${WIRE_PROTOCOL_PROTO_TGTS})
 
 set(COMMON_SRCS
+  column_predicate.cc
   encoded_key.cc
   generic_iterators.cc
   id_mapping.cc
   iterator_stats.cc
   key_encoder.cc
+  key_util.cc
   partial_row.cc
   partition.cc
-  predicate_encoder.cc
+  partition_pruner.cc
   rowblock.cc
   row_changelist.cc
-  row_key-util.cc
   row_operations.cc
-  scan_predicate.cc
   scan_spec.cc
   schema.cc
   timestamp.cc
@@ -60,9 +60,9 @@ set(COMMON_SRCS
   wire_protocol.cc)
 
 # Workaround for clang bug https://llvm.org/bugs/show_bug.cgi?id=23757
-# in which it incorrectly optimizes row_key-util.cc and causes incorrect results.
+# in which it incorrectly optimizes key_util.cc and causes incorrect results.
 if ("${COMPILER_FAMILY}" STREQUAL "clang")
-  set_source_files_properties(row_key-util.cc PROPERTIES COMPILE_FLAGS -fwrapv)
+  set_source_files_properties(key_util.cc PROPERTIES COMPILE_FLAGS -fwrapv)
 endif()
 
 set(COMMON_LIBS
@@ -77,16 +77,17 @@ ADD_EXPORTABLE_LIBRARY(kudu_common
   DEPS ${COMMON_LIBS})
 
 set(KUDU_TEST_LINK_LIBS kudu_common ${KUDU_MIN_TEST_LIBS})
+ADD_KUDU_TEST(column_predicate-test)
 ADD_KUDU_TEST(encoded_key-test)
 ADD_KUDU_TEST(generic_iterators-test)
 ADD_KUDU_TEST(id_mapping-test)
+ADD_KUDU_TEST(key_util-test)
 ADD_KUDU_TEST(partial_row-test)
 ADD_KUDU_TEST(partition-test)
-ADD_KUDU_TEST(predicate-test)
-ADD_KUDU_TEST(predicate_encoder-test)
+ADD_KUDU_TEST(partition_pruner-test)
 ADD_KUDU_TEST(row_changelist-test)
-ADD_KUDU_TEST(row_key-util-test)
 ADD_KUDU_TEST(row_operations-test)
+ADD_KUDU_TEST(scan_spec-test)
 ADD_KUDU_TEST(schema-test)
 ADD_KUDU_TEST(types-test)
 ADD_KUDU_TEST(wire_protocol-test)

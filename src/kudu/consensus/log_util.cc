@@ -35,11 +35,15 @@
 #include "kudu/gutil/strings/util.h"
 #include "kudu/util/coding-inl.h"
 #include "kudu/util/coding.h"
+#include "kudu/util/compression/compression_codec.h"
 #include "kudu/util/crc.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/env_util.h"
+#include "kudu/util/fault_injection.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/logging.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/scoped_cleanup.h"
 
 DEFINE_int32(log_segment_size_mb, 64,
              "The default segment size for log roll-overs, in MB");
@@ -57,6 +61,10 @@ DEFINE_bool(log_async_preallocate_segments, true,
             "Whether the WAL segments preallocation should happen asynchronously");
 TAG_FLAG(log_async_preallocate_segments, advanced);
 
+DEFINE_double(fault_crash_before_write_log_segment_header, 0.0,
+              "Fraction of the time we will crash just before writing the log segment header");
+TAG_FLAG(fault_crash_before_write_log_segment_header, unsafe);
+
 namespace kudu {
 namespace log {
 
@@ -64,10 +72,9 @@ using consensus::OpId;
 using env_util::ReadFully;
 using std::vector;
 using std::shared_ptr;
+using std::unique_ptr;
 using strings::Substitute;
 using strings::SubstituteAndAppend;
-
-const char kTmpSuffix[] = ".tmp";
 
 const char kLogSegmentHeaderMagicString[] = "kudulogf";
 
@@ -82,10 +89,10 @@ const size_t kLogSegmentHeaderMagicAndHeaderLength = 12;
 // Footer is suffixed with the footer magic (8 bytes) and the footer length (4 bytes).
 const size_t kLogSegmentFooterMagicAndFooterLength  = 12;
 
-const size_t kEntryHeaderSize = 12;
-
-const int kLogMajorVersion = 1;
-const int kLogMinorVersion = 0;
+// Versions of Kudu <= 1.2  used a 12-byte entry header.
+const size_t kEntryHeaderSizeV1 = 12;
+// Later versions, which added support for compression, use a 16-byte header.
+const size_t kEntryHeaderSizeV2 = 16;
 
 // Maximum log segment header/footer size, in bytes (8 MB).
 const uint32_t kLogSegmentMaxHeaderOrFooterSize = 8 * 1024 * 1024;
@@ -96,6 +103,149 @@ LogOptions::LogOptions()
   preallocate_segments(FLAGS_log_preallocate_segments),
   async_preallocate_segments(FLAGS_log_async_preallocate_segments) {
 }
+
+////////////////////////////////////////////////////////////
+// LogEntryReader
+////////////////////////////////////////////////////////////
+
+LogEntryReader::LogEntryReader(ReadableLogSegment* seg)
+    : seg_(seg),
+      num_batches_read_(0),
+      num_entries_read_(0),
+      offset_(seg_->first_entry_offset()) {
+
+  int64_t readable_to_offset = seg_->readable_to_offset_.Load();
+
+  // If we have a footer we only read up to it. If we don't we likely crashed
+  // and always read to the end.
+  read_up_to_ = (seg_->footer_.IsInitialized() && !seg_->footer_was_rebuilt_) ?
+      seg_->file_size() - seg_->footer_.ByteSize() - kLogSegmentFooterMagicAndFooterLength :
+      readable_to_offset;
+  VLOG(1) << "Reading segment entries from "
+          << seg_->path_ << ": offset=" << offset_ << " file_size="
+          << seg_->file_size() << " readable_to_offset=" << readable_to_offset;
+}
+
+LogEntryReader::~LogEntryReader() {}
+
+Status LogEntryReader::ReadNextEntry(LogEntryPB* entry) {
+  // Refill pending_entries_ if none are available.
+  while (pending_entries_.empty()) {
+
+    // If we are done reading, check that we got the expected number of entries
+    // and return EOF.
+    if (offset_ >= read_up_to_) {
+      if (seg_->footer_.IsInitialized() && seg_->footer_.num_entries() != num_entries_read_) {
+        return Status::Corruption(
+            Substitute("Read $0 log entries from $1, but expected $2 based on the footer",
+                       num_entries_read_, seg_->path_, seg_->footer_.num_entries()));
+      }
+
+      return Status::EndOfFile("Reached end of log");
+    }
+
+    // We still expect to have more entries in the log.
+    gscoped_ptr<LogEntryBatchPB> current_batch;
+
+    // Read and validate the entry header first.
+    Status s;
+    if (offset_ + seg_->entry_header_size() < read_up_to_) {
+      s = seg_->ReadEntryHeaderAndBatch(&offset_, &tmp_buf_, &current_batch);
+    } else {
+      s = Status::Corruption(Substitute("Truncated log entry at offset $0", offset_));
+    }
+
+    if (PREDICT_FALSE(!s.ok())) {
+      return HandleReadError(s);
+    }
+
+    // Add the entries from this batch to our pending queue.
+    for (int i = 0; i < current_batch->entry_size(); i++) {
+      auto entry = current_batch->mutable_entry(i);
+      pending_entries_.emplace_back(entry);
+      num_entries_read_++;
+
+      // Record it in the 'recent entries' deque.
+      OpId op_id;
+      if (entry->type() == log::REPLICATE && entry->has_replicate()) {
+        op_id = entry->replicate().id();
+      } else if (entry->has_commit() && entry->commit().has_commited_op_id()) {
+        op_id = entry->commit().commited_op_id();
+      }
+      if (recent_entries_.size() == kNumRecentEntries) {
+        recent_entries_.pop_front();
+      }
+      recent_entries_.push_back({ offset_, entry->type(), op_id });
+    }
+    current_batch->mutable_entry()->ExtractSubrange(
+        0, current_batch->entry_size(), nullptr);
+  }
+
+  pending_entries_[0]->Swap(entry);
+  pending_entries_.pop_front();
+  return Status::OK();
+}
+
+Status LogEntryReader::HandleReadError(const Status& s) const {
+  if (!s.IsCorruption()) {
+    // IO errors should always propagate back
+    return s.CloneAndPrepend(Substitute("error reading from log $0", seg_->path_));
+  }
+
+  Status corruption_status = MakeCorruptionStatus(s);
+
+  // If we have a valid footer in the segment, then the segment was correctly
+  // closed, and we shouldn't see any corruption anywhere (including the last
+  // batch).
+  if (seg_->HasFooter() && !seg_->footer_was_rebuilt_) {
+    LOG(WARNING) << "Found a corruption in a closed log segment: "
+                 << corruption_status.ToString();
+    return corruption_status;
+  }
+
+  // If we read a corrupt entry, but we don't have a footer, then it's
+  // possible that we crashed in the middle of writing an entry.
+  // In this case, we scan forward to see if there are any more valid looking
+  // entries after this one in the file. If there are, it's really a corruption.
+  // if not, we just WARN it, since it's OK for the last entry to be partially
+  // written.
+  bool has_valid_entries;
+  RETURN_NOT_OK_PREPEND(seg_->ScanForValidEntryHeaders(offset_ + seg_->entry_header_size(),
+                                                       &has_valid_entries),
+                        "Scanning forward for valid entries");
+  if (has_valid_entries) {
+    return corruption_status;
+  }
+
+  LOG(INFO) << "Ignoring log segment corruption in " << seg_->path_ << " because "
+            << "there are no log entries following the corrupted one. "
+            << "The server probably crashed in the middle of writing an entry "
+            << "to the write-ahead log or downloaded an active log via tablet copy. "
+            << "Error detail: " << corruption_status.ToString();
+  return Status::EndOfFile("");
+}
+
+Status LogEntryReader::MakeCorruptionStatus(const Status& status) const {
+
+  string err = "Log file corruption detected. ";
+  SubstituteAndAppend(&err, "Failed trying to read batch #$0 at offset $1 for log segment $2: ",
+                      num_batches_read_, offset_, seg_->path_);
+  err.append("Prior entries:");
+
+  for (const auto& r : recent_entries_) {
+    if (r.offset >= 0) {
+      SubstituteAndAppend(&err, " [off=$0 $1 ($2)]",
+                          r.offset, LogEntryTypePB_Name(r.type),
+                          OpIdToString(r.op_id));
+    }
+  }
+
+  return status.CloneAndAppend(err);
+}
+
+////////////////////////////////////////////////////////////
+// ReadableLogSegment
+////////////////////////////////////////////////////////////
 
 Status ReadableLogSegment::Open(Env* env,
                                 const string& path,
@@ -116,6 +266,7 @@ ReadableLogSegment::ReadableLogSegment(
       file_size_(0),
       readable_to_offset_(0),
       readable_file_(std::move(readable_file)),
+      codec_(nullptr),
       is_initialized_(false),
       footer_was_rebuilt_(false) {}
 
@@ -129,6 +280,8 @@ Status ReadableLogSegment::Init(const LogSegmentHeaderPB& header,
   RETURN_NOT_OK(ReadFileSize());
 
   header_.CopyFrom(header);
+  RETURN_NOT_OK(InitCompressionCodec());
+
   footer_.CopyFrom(footer);
   first_entry_offset_ = first_entry_offset;
   is_initialized_ = true;
@@ -146,6 +299,7 @@ Status ReadableLogSegment::Init(const LogSegmentHeaderPB& header,
 
   header_.CopyFrom(header);
   first_entry_offset_ = first_entry_offset;
+  RETURN_NOT_OK(InitCompressionCodec());
   is_initialized_ = true;
 
   // On a new segment, we don't expect any readable entries yet.
@@ -160,17 +314,33 @@ Status ReadableLogSegment::Init() {
   RETURN_NOT_OK(ReadFileSize());
 
   RETURN_NOT_OK(ReadHeader());
+  RETURN_NOT_OK(InitCompressionCodec());
 
   Status s = ReadFooter();
   if (!s.ok()) {
-    LOG(WARNING) << "Could not read footer for segment: " << path_
-        << ": " << s.ToString();
+    if (s.IsNotFound()) {
+      LOG(INFO) << "Log segment " << path_ << " has no footer. This segment was likely "
+                << "being written when the server previously shut down.";
+    } else {
+      LOG(WARNING) << "Could not read footer for segment: " << path_
+          << ": " << s.ToString();
+      return s;
+    }
   }
 
   is_initialized_ = true;
 
   readable_to_offset_.Store(file_size());
 
+  return Status::OK();
+}
+
+Status ReadableLogSegment::InitCompressionCodec() {
+  // Init the compression codec.
+  if (header_.has_compression_codec() && header_.compression_codec() != NO_COMPRESSION) {
+    RETURN_NOT_OK_PREPEND(GetCompressionCodec(header_.compression_codec(), &codec_),
+                          "could not init compression codec");
+  }
   return Status::OK();
 }
 
@@ -188,37 +358,31 @@ Status ReadableLogSegment::RebuildFooterByScanning() {
                "path", path_);
 
   DCHECK(!footer_.IsInitialized());
-  vector<LogEntryPB*> entries;
-  ElementDeleter deleter(&entries);
-  int64_t end_offset = 0;
-  RETURN_NOT_OK(ReadEntries(&entries, &end_offset));
 
-  footer_.set_num_entries(entries.size());
+  LogEntryReader reader(this);
 
-  // Rebuild the min/max replicate index (by scanning)
-  for (const LogEntryPB* entry : entries) {
-    if (entry->has_replicate()) {
-      int64_t index = entry->replicate().id().index();
-      // TODO: common code with Log::UpdateFooterForBatch
-      if (!footer_.has_min_replicate_index() ||
-          index < footer_.min_replicate_index()) {
-        footer_.set_min_replicate_index(index);
-      }
-      if (!footer_.has_max_replicate_index() ||
-          index > footer_.max_replicate_index()) {
-        footer_.set_max_replicate_index(index);
-      }
+  LogSegmentFooterPB new_footer;
+  int num_entries = 0;
+  LogEntryPB entry;
+  while (true) {
+    Status s = reader.ReadNextEntry(&entry);
+    if (s.IsEndOfFile()) break;
+    RETURN_NOT_OK(s);
+
+    if (entry.has_replicate()) {
+      UpdateFooterForReplicateEntry(entry, &new_footer);
     }
+    num_entries++;
   }
 
+  new_footer.set_num_entries(num_entries);
+  footer_ = new_footer;
   DCHECK(footer_.IsInitialized());
-  DCHECK_EQ(entries.size(), footer_.num_entries());
   footer_was_rebuilt_ = true;
-
-  readable_to_offset_.Store(end_offset);
+  readable_to_offset_.Store(reader.offset());
 
   LOG(INFO) << "Successfully rebuilt footer for segment: " << path_
-            << " (valid entries through byte offset " << end_offset << ")";
+            << " (valid entries through byte offset " << reader.offset() << ")";
   return Status::OK();
 }
 
@@ -239,14 +403,6 @@ Status ReadableLogSegment::ReadFileSize() {
 Status ReadableLogSegment::ReadHeader() {
   uint32_t header_size;
   RETURN_NOT_OK(ReadHeaderMagicAndHeaderLength(&header_size));
-  if (header_size == 0) {
-    // If a log file has been pre-allocated but not initialized, then
-    // 'header_size' will be 0 even the file size is > 0; in this
-    // case, 'is_initialized_' remains set to false and return
-    // Status::OK() early. LogReader ignores segments where
-    // IsInitialized() returns false.
-    return Status::OK();
-  }
 
   if (header_size > kLogSegmentMaxHeaderOrFooterSize) {
     return Status::Corruption(
@@ -269,7 +425,12 @@ Status ReadableLogSegment::ReadHeader() {
                                                 header_size),
                         "Unable to parse protobuf");
 
-  header_.CopyFrom(header);
+  if (header.incompatible_features_size() > 0) {
+    return Status::NotSupported("log segment uses a feature not supported by this version "
+                                "of Kudu");
+  }
+
+  header_.Swap(&header);
   first_entry_offset_ = header_size + kLogSegmentHeaderMagicAndHeaderLength;
 
   return Status::OK();
@@ -328,14 +489,13 @@ Status ReadableLogSegment::ParseHeaderMagicAndHeaderLength(const Slice &data,
       // 12 bytes of NULLs, good enough for us to consider this a file that
       // was never written to (but apparently preallocated).
       LOG(WARNING) << "Log segment file " << path() << " has 12 initial NULL bytes instead of "
-                   << "magic and header length: " << data.ToDebugString()
+                   << "magic and header length: " << KUDU_REDACT(data.ToDebugString())
                    << " and will be treated as a blank segment.";
-      *parsed_len = 0;
-      return Status::OK();
+      return Status::Uninitialized("log magic and header length are all NULL bytes");
     }
     // If no magic and not uninitialized, the file is considered corrupt.
     return Status::Corruption(Substitute("Invalid log segment file $0: Bad magic. $1",
-                                         path(), data.ToDebugString()));
+                                         path(), KUDU_REDACT(data.ToDebugString())));
   }
 
   *parsed_len = DecodeFixed32(data.data() + strlen(kLogSegmentHeaderMagicString));
@@ -347,14 +507,14 @@ Status ReadableLogSegment::ReadFooter() {
   RETURN_NOT_OK(ReadFooterMagicAndFooterLength(&footer_size));
 
   if (footer_size == 0 || footer_size > kLogSegmentMaxHeaderOrFooterSize) {
-    return Status::NotFound(
+    return Status::Corruption(
         Substitute("File is corrupted. "
                    "Parsed header size: $0 is zero or bigger than max header size: $1",
                    footer_size, kLogSegmentMaxHeaderOrFooterSize));
   }
 
   if (footer_size > (file_size() - first_entry_offset_)) {
-    return Status::NotFound("Footer not found. File corrupted. "
+    return Status::Corruption("Footer not found. File corrupted. "
         "Decoded footer length pointed at a footer before the first entry.");
   }
 
@@ -408,108 +568,25 @@ Status ReadableLogSegment::ParseFooterMagicAndFooterLength(const Slice &data,
   return Status::OK();
 }
 
-Status ReadableLogSegment::ReadEntries(vector<LogEntryPB*>* entries,
-                                       int64_t* end_offset) {
+Status ReadableLogSegment::ReadEntries(vector<LogEntryPB*>* entries) {
   TRACE_EVENT1("log", "ReadableLogSegment::ReadEntries",
                "path", path_);
+  LogEntryReader reader(this);
 
-  vector<int64_t> recent_offsets(4, -1);
-  int batches_read = 0;
-
-  int64_t offset = first_entry_offset();
-  int64_t readable_to_offset = readable_to_offset_.Load();
-  VLOG(1) << "Reading segment entries from "
-          << path_ << ": offset=" << offset << " file_size="
-          << file_size() << " readable_to_offset=" << readable_to_offset;
-  faststring tmp_buf;
-
-  // If we have a footer we only read up to it. If we don't we likely crashed
-  // and always read to the end.
-  int64_t read_up_to = (footer_.IsInitialized() && !footer_was_rebuilt_) ?
-      file_size() - footer_.ByteSize() - kLogSegmentFooterMagicAndFooterLength :
-      readable_to_offset;
-
-  if (end_offset != nullptr) {
-    *end_offset = offset;
-  }
-
-  int num_entries_read = 0;
-  while (offset < read_up_to) {
-    const int64_t this_batch_offset = offset;
-    recent_offsets[batches_read++ % recent_offsets.size()] = offset;
-
-    gscoped_ptr<LogEntryBatchPB> current_batch;
-
-    // Read and validate the entry header first.
-    Status s;
-    if (offset + kEntryHeaderSize < read_up_to) {
-      s = ReadEntryHeaderAndBatch(&offset, &tmp_buf, &current_batch);
-    } else {
-      s = Status::Corruption(Substitute("Truncated log entry at offset $0", offset));
-    }
-
-    if (PREDICT_FALSE(!s.ok())) {
-      if (!s.IsCorruption()) {
-        // IO errors should always propagate back
-        return s.CloneAndPrepend(Substitute("Error reading from log $0", path_));
-      }
-
-      Status corruption_status = MakeCorruptionStatus(
-          batches_read, this_batch_offset, &recent_offsets,
-          *entries, s);
-
-      // If we have a valid footer in the segment, then the segment was correctly
-      // closed, and we shouldn't see any corruption anywhere (including the last
-      // batch).
-      if (HasFooter() && !footer_was_rebuilt_) {
-        LOG(WARNING) << "Found a corruption in a closed log segment: "
-                     << corruption_status.ToString();
-        return corruption_status;
-      }
-
-      // If we read a corrupt entry, but we don't have a footer, then it's
-      // possible that we crashed in the middle of writing an entry.
-      // In this case, we scan forward to see if there are any more valid looking
-      // entries after this one in the file. If there are, it's really a corruption.
-      // if not, we just WARN it, since it's OK for the last entry to be partially
-      // written.
-      bool has_valid_entries;
-      RETURN_NOT_OK_PREPEND(ScanForValidEntryHeaders(offset, &has_valid_entries),
-                            "Scanning forward for valid entries");
-      if (has_valid_entries) {
-        return corruption_status;
-      }
-
-      LOG(INFO) << "Ignoring log segment corruption in " << path_ << " because "
-                << "there are no log entries following the corrupted one. "
-                << "The server probably crashed in the middle of writing an entry "
-                << "to the write-ahead log or downloaded an active log via remote bootstrap. "
-                << "Error detail: " << corruption_status.ToString();
-      break;
-    }
-
-    if (VLOG_IS_ON(3)) {
-      VLOG(3) << "Read Log entry batch: " << current_batch->DebugString();
-    }
-    for (size_t i = 0; i < current_batch->entry_size(); ++i) {
-      entries->push_back(current_batch->mutable_entry(i));
-      num_entries_read++;
-    }
-    current_batch->mutable_entry()->ExtractSubrange(0,
-                                                    current_batch->entry_size(),
-                                                    nullptr);
-    if (end_offset != nullptr) {
-      *end_offset = offset;
-    }
-  }
-
-  if (footer_.IsInitialized() && footer_.num_entries() != num_entries_read) {
-    return Status::Corruption(
-      Substitute("Read $0 log entries from $1, but expected $2 based on the footer",
-                 num_entries_read, path_, footer_.num_entries()));
+  while (true) {
+    unique_ptr<LogEntryPB> entry(new LogEntryPB());
+    Status s = reader.ReadNextEntry(entry.get());
+    if (s.IsEndOfFile()) break;
+    RETURN_NOT_OK(s);
+    entries->push_back(entry.release());
   }
 
   return Status::OK();
+}
+
+size_t ReadableLogSegment::entry_header_size() const {
+  DCHECK(is_initialized_);
+  return header_.has_deprecated_major_version() ? kEntryHeaderSizeV1 : kEntryHeaderSizeV2;
 }
 
 Status ReadableLogSegment::ScanForValidEntryHeaders(int64_t offset, bool* has_valid_entries) {
@@ -525,8 +602,8 @@ Status ReadableLogSegment::ScanForValidEntryHeaders(int64_t offset, bool* has_va
   // We overlap the reads by the size of the header, so that if a header
   // spans chunks, we don't miss it.
   for (;
-       offset < file_size() - kEntryHeaderSize;
-       offset += kChunkSize - kEntryHeaderSize) {
+       offset < file_size() - entry_header_size();
+       offset += kChunkSize - entry_header_size()) {
     int rem = std::min<int64_t>(file_size() - offset, kChunkSize);
     Slice chunk;
     RETURN_NOT_OK(ReadFully(readable_file().get(), offset, rem, &chunk, &buf[0]));
@@ -539,9 +616,9 @@ Status ReadableLogSegment::ScanForValidEntryHeaders(int64_t offset, bool* has_va
 
     // Check if this chunk has a valid entry header.
     for (int off_in_chunk = 0;
-         off_in_chunk < chunk.size() - kEntryHeaderSize;
+         off_in_chunk < chunk.size() - entry_header_size();
          off_in_chunk++) {
-      Slice potential_header = Slice(&chunk[off_in_chunk], kEntryHeaderSize);
+      Slice potential_header = Slice(&chunk[off_in_chunk], entry_header_size());
 
       EntryHeader header;
       if (DecodeEntryHeader(potential_header, &header)) {
@@ -556,56 +633,21 @@ Status ReadableLogSegment::ScanForValidEntryHeaders(int64_t offset, bool* has_va
   return Status::OK();
 }
 
-Status ReadableLogSegment::MakeCorruptionStatus(int batch_number, int64_t batch_offset,
-                                                vector<int64_t>* recent_offsets,
-                                                const std::vector<LogEntryPB*>& entries,
-                                                const Status& status) const {
-
-  string err = "Log file corruption detected. ";
-  SubstituteAndAppend(&err, "Failed trying to read batch #$0 at offset $1 for log segment $2: ",
-                      batch_number, batch_offset, path_);
-  err.append("Prior batch offsets:");
-  std::sort(recent_offsets->begin(), recent_offsets->end());
-  for (int64_t offset : *recent_offsets) {
-    if (offset >= 0) {
-      SubstituteAndAppend(&err, " $0", offset);
-    }
-  }
-  if (!entries.empty()) {
-    err.append("; Last log entries read:");
-    const int kNumEntries = 4; // Include up to the last 4 entries in the segment.
-    for (int i = std::max(0, static_cast<int>(entries.size()) - kNumEntries);
-        i < entries.size(); i++) {
-      LogEntryPB* entry = entries[i];
-      LogEntryTypePB type = entry->type();
-      string opid_str;
-      if (type == log::REPLICATE && entry->has_replicate()) {
-        opid_str = OpIdToString(entry->replicate().id());
-      } else if (entry->has_commit() && entry->commit().has_commited_op_id()) {
-        opid_str = OpIdToString(entry->commit().commited_op_id());
-      } else {
-        opid_str = "<unknown>";
-      }
-      SubstituteAndAppend(&err, " [$0 ($1)]", LogEntryTypePB_Name(type), opid_str);
-    }
-  }
-
-  return status.CloneAndAppend(err);
-}
-
 Status ReadableLogSegment::ReadEntryHeaderAndBatch(int64_t* offset, faststring* tmp_buf,
                                                    gscoped_ptr<LogEntryBatchPB>* batch) {
+  int64_t cur_offset = *offset;
   EntryHeader header;
-  RETURN_NOT_OK(ReadEntryHeader(offset, &header));
-  RETURN_NOT_OK(ReadEntryBatch(offset, header, tmp_buf, batch));
+  RETURN_NOT_OK(ReadEntryHeader(&cur_offset, &header));
+  RETURN_NOT_OK(ReadEntryBatch(&cur_offset, header, tmp_buf, batch));
+  *offset = cur_offset;
   return Status::OK();
 }
 
-
 Status ReadableLogSegment::ReadEntryHeader(int64_t *offset, EntryHeader* header) {
-  uint8_t scratch[kEntryHeaderSize];
+  const size_t header_size = entry_header_size();
+  uint8_t scratch[header_size];
   Slice slice;
-  RETURN_NOT_OK_PREPEND(ReadFully(readable_file().get(), *offset, kEntryHeaderSize,
+  RETURN_NOT_OK_PREPEND(ReadFully(readable_file().get(), *offset, header_size,
                                   &slice, scratch),
                         "Could not read log entry header");
 
@@ -617,14 +659,24 @@ Status ReadableLogSegment::ReadEntryHeader(int64_t *offset, EntryHeader* header)
 }
 
 bool ReadableLogSegment::DecodeEntryHeader(const Slice& data, EntryHeader* header) {
-  DCHECK_EQ(kEntryHeaderSize, data.size());
-  header->msg_length = DecodeFixed32(&data[0]);
-  header->msg_crc    = DecodeFixed32(&data[4]);
-  header->header_crc = DecodeFixed32(&data[8]);
+  uint32_t computed_header_crc;
+  if (entry_header_size() == kEntryHeaderSizeV2) {
+    header->msg_length_compressed = DecodeFixed32(&data[0]);
+    header->msg_length = DecodeFixed32(&data[4]);
+    header->msg_crc    = DecodeFixed32(&data[8]);
+    header->header_crc = DecodeFixed32(&data[12]);
+    computed_header_crc = crc::Crc32c(&data[0], 12);
+  } else {
+    DCHECK_EQ(kEntryHeaderSizeV1, data.size());
+    header->msg_length = DecodeFixed32(&data[0]);
+    header->msg_length_compressed = header->msg_length;
+    header->msg_crc    = DecodeFixed32(&data[4]);
+    header->header_crc = DecodeFixed32(&data[8]);
+    computed_header_crc = crc::Crc32c(&data[0], 8);
+  }
 
   // Verify the header.
-  uint32_t computed_crc = crc::Crc32c(&data[0], 8);
-  return computed_crc == header->header_crc;
+  return computed_header_crc == header->header_crc;
 }
 
 
@@ -641,20 +693,25 @@ Status ReadableLogSegment::ReadEntryBatch(int64_t *offset,
     return Status::Corruption("Invalid 0 entry length");
   }
   int64_t limit = readable_up_to();
-  if (PREDICT_FALSE(header.msg_length + *offset > limit)) {
+  if (PREDICT_FALSE(header.msg_length_compressed + *offset > limit)) {
     // The log was likely truncated during writing.
     return Status::Corruption(
         Substitute("Could not read $0-byte log entry from offset $1 in $2: "
                    "log only readable up to offset $3",
-                   header.msg_length, *offset, path_, limit));
+                   header.msg_length_compressed, *offset, path_, limit));
   }
 
   tmp_buf->clear();
-  tmp_buf->resize(header.msg_length);
+  size_t buf_len = header.msg_length_compressed;
+  if (codec_) {
+    // Reserve some space for the decompressed copy as well.
+    buf_len += header.msg_length;
+  }
+  tmp_buf->resize(buf_len);
   Slice entry_batch_slice;
 
   Status s =  readable_file()->Read(*offset,
-                                    header.msg_length,
+                                    header.msg_length_compressed,
                                     &entry_batch_slice,
                                     tmp_buf->data());
 
@@ -670,16 +727,25 @@ Status ReadableLogSegment::ReadEntryBatch(int64_t *offset,
                                          header.msg_crc, read_crc));
   }
 
+  // If it was compressed, decompress it.
+  if (codec_) {
+    // We pre-reserved space for the decompression up above.
+    uint8_t* uncompress_buf = &(*tmp_buf)[header.msg_length_compressed];
+    RETURN_NOT_OK_PREPEND(codec_->Uncompress(entry_batch_slice, uncompress_buf, header.msg_length),
+                          "failed to uncompress entry");
+    entry_batch_slice = Slice(uncompress_buf, header.msg_length);
+  }
 
   gscoped_ptr<LogEntryBatchPB> read_entry_batch(new LogEntryBatchPB());
   s = pb_util::ParseFromArray(read_entry_batch.get(),
                               entry_batch_slice.data(),
                               header.msg_length);
 
-  if (!s.ok()) return Status::Corruption(Substitute("Could parse PB. Cause: $0",
-                                                    s.ToString()));
+  if (!s.ok()) {
+    return Status::Corruption(Substitute("Could not parse PB. Cause: $0", s.ToString()));
+  }
 
-  *offset += entry_batch_slice.size();
+  *offset += header.msg_length_compressed;
   entry_batch->reset(read_entry_batch.release());
   return Status::OK();
 }
@@ -693,6 +759,8 @@ WritableLogSegment::WritableLogSegment(string path,
       written_offset_(0) {}
 
 Status WritableLogSegment::WriteHeaderAndOpen(const LogSegmentHeaderPB& new_header) {
+  MAYBE_FAULT(FLAGS_fault_crash_before_write_log_segment_header);
+
   DCHECK(!IsHeaderWritten()) << "Can only call WriteHeader() once";
   DCHECK(new_header.IsInitialized())
       << "Log segment header must be initialized" << new_header.InitializationErrorString();
@@ -703,9 +771,7 @@ Status WritableLogSegment::WriteHeaderAndOpen(const LogSegmentHeaderPB& new_head
   // Then Length-prefixed header.
   PutFixed32(&buf, new_header.ByteSize());
   // Then Serialize the PB.
-  if (!pb_util::AppendToString(new_header, &buf)) {
-    return Status::Corruption("unable to encode header");
-  }
+  pb_util::AppendToString(new_header, &buf);
   RETURN_NOT_OK(writable_file()->Append(Slice(buf)));
 
   header_.CopyFrom(new_header);
@@ -724,11 +790,7 @@ Status WritableLogSegment::WriteFooterAndClose(const LogSegmentFooterPB& footer)
   DCHECK(footer.IsInitialized()) << footer.InitializationErrorString();
 
   faststring buf;
-
-  if (!pb_util::AppendToString(footer, &buf)) {
-    return Status::Corruption("unable to encode header");
-  }
-
+  pb_util::AppendToString(footer, &buf);
   buf.append(kLogSegmentFooterMagicString);
   PutFixed32(&buf, footer.ByteSize());
 
@@ -744,56 +806,58 @@ Status WritableLogSegment::WriteFooterAndClose(const LogSegmentFooterPB& footer)
   return Status::OK();
 }
 
-
-Status WritableLogSegment::WriteEntryBatch(const Slice& data) {
+Status WritableLogSegment::WriteEntryBatch(const Slice& data,
+                                           const CompressionCodec* codec) {
   DCHECK(is_header_written_);
   DCHECK(!is_footer_written_);
-  uint8_t header_buf[kEntryHeaderSize];
+  uint8_t header_buf[kEntryHeaderSizeV2];
 
-  // First encode the length of the message.
-  uint32_t len = data.size();
-  InlineEncodeFixed32(&header_buf[0], len);
+  const uint32_t uncompressed_len = data.size();
 
-  // Then the CRC of the message.
-  uint32_t msg_crc = crc::Crc32c(&data[0], data.size());
-  InlineEncodeFixed32(&header_buf[4], msg_crc);
+  // If necessary, compress the data.
+  Slice data_to_write;
+  if (codec) {
+    DCHECK_NE(header_.compression_codec(), NO_COMPRESSION);
+    compress_buf_.resize(codec->MaxCompressedLength(uncompressed_len));
+    size_t compressed_len;
+    RETURN_NOT_OK(codec->Compress(data, &compress_buf_[0], &compressed_len));
+    compress_buf_.resize(compressed_len);
+    data_to_write = Slice(compress_buf_.data(), compress_buf_.size());
+  } else {
+    data_to_write = data;
+  }
 
-  // Then the CRC of the header
-  uint32_t header_crc = crc::Crc32c(&header_buf, 8);
-  InlineEncodeFixed32(&header_buf[8], header_crc);
+  // Fill in the header.
+  InlineEncodeFixed32(&header_buf[0], data_to_write.size());
+  InlineEncodeFixed32(&header_buf[4], uncompressed_len);
+  InlineEncodeFixed32(&header_buf[8], crc::Crc32c(data_to_write.data(), data_to_write.size()));
+  InlineEncodeFixed32(&header_buf[12], crc::Crc32c(&header_buf[0], kEntryHeaderSizeV2 - 4));
 
   // Write the header to the file, followed by the batch data itself.
-  RETURN_NOT_OK(writable_file_->Append(Slice(header_buf, sizeof(header_buf))));
-  written_offset_ += sizeof(header_buf);
-
-  RETURN_NOT_OK(writable_file_->Append(data));
-  written_offset_ += data.size();
-
+  RETURN_NOT_OK(writable_file_->AppendVector({
+        Slice(header_buf, arraysize(header_buf)),
+        data_to_write}));
+  written_offset_ += arraysize(header_buf) + data_to_write.size();
   return Status::OK();
 }
 
 
-void CreateBatchFromAllocatedOperations(const vector<consensus::ReplicateRefPtr>& msgs,
-                                        gscoped_ptr<LogEntryBatchPB>* batch) {
-  gscoped_ptr<LogEntryBatchPB> entry_batch(new LogEntryBatchPB);
+unique_ptr<LogEntryBatchPB> CreateBatchFromAllocatedOperations(
+    const vector<consensus::ReplicateRefPtr>& msgs) {
+  unique_ptr<LogEntryBatchPB> entry_batch(new LogEntryBatchPB);
   entry_batch->mutable_entry()->Reserve(msgs.size());
   for (const auto& msg : msgs) {
     LogEntryPB* entry_pb = entry_batch->add_entry();
     entry_pb->set_type(log::REPLICATE);
     entry_pb->set_allocated_replicate(msg->get());
   }
-  batch->reset(entry_batch.release());
+  return entry_batch;
 }
 
 bool IsLogFileName(const string& fname) {
   if (HasPrefixString(fname, ".")) {
     // Hidden file or ./..
     VLOG(1) << "Ignoring hidden file: " << fname;
-    return false;
-  }
-
-  if (HasSuffixString(fname, kTmpSuffix)) {
-    LOG(WARNING) << "Ignoring tmp file: " << fname;
     return false;
   }
 
@@ -804,6 +868,20 @@ bool IsLogFileName(const string& fname) {
   }
 
   return true;
+}
+
+void UpdateFooterForReplicateEntry(const LogEntryPB& entry_pb,
+                                   LogSegmentFooterPB* footer) {
+  DCHECK(entry_pb.has_replicate());
+  int64_t index = entry_pb.replicate().id().index();
+  if (!footer->has_min_replicate_index() ||
+      index < footer->min_replicate_index()) {
+    footer->set_min_replicate_index(index);
+  }
+  if (!footer->has_max_replicate_index() ||
+      index > footer->max_replicate_index()) {
+    footer->set_max_replicate_index(index);
+  }
 }
 
 }  // namespace log

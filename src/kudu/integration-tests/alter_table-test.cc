@@ -15,48 +15,53 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <boost/assign.hpp>
-#include <gflags/gflags.h>
-#include <gtest/gtest.h>
+#include <atomic>
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
+
+#include <boost/bind.hpp>
+#include <boost/optional.hpp>
+#include <gflags/gflags.h>
+#include <gtest/gtest.h>
 
 #include "kudu/client/client.h"
 #include "kudu/client/client-test-util.h"
 #include "kudu/client/row_result.h"
+#include "kudu/client/scan_batch.h"
 #include "kudu/client/schema.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/mini_cluster.h"
-#include "kudu/master/mini_master.h"
 #include "kudu/master/master.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master-test-util.h"
+#include "kudu/master/mini_master.h"
 #include "kudu/server/hybrid_clock.h"
 #include "kudu/tablet/tablet_peer.h"
 #include "kudu/tserver/mini_tablet_server.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/tserver/ts_tablet_manager.h"
-#include "kudu/util/atomic.h"
 #include "kudu/util/faststring.h"
 #include "kudu/util/random.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/test_util.h"
 
-DECLARE_bool(enable_data_block_fsync);
 DECLARE_bool(enable_maintenance_manager);
 DECLARE_int32(heartbeat_interval_ms);
 DECLARE_int32(flush_threshold_mb);
 DECLARE_bool(use_hybrid_clock);
+DECLARE_bool(scanner_allow_snapshot_scans_with_logical_timestamps);
 
 namespace kudu {
 
+using client::CountTableRows;
 using client::KuduClient;
 using client::KuduClientBuilder;
 using client::KuduColumnSchema;
+using client::KuduDelete;
 using client::KuduError;
 using client::KuduInsert;
 using client::KuduRowResult;
@@ -72,33 +77,30 @@ using client::KuduValue;
 using client::sp::shared_ptr;
 using master::AlterTableRequestPB;
 using master::AlterTableResponsePB;
-using master::MiniMaster;
+using std::atomic;
 using std::map;
 using std::pair;
+using std::unique_ptr;
 using std::vector;
 using tablet::TabletPeer;
-using tserver::MiniTabletServer;
 
 class AlterTableTest : public KuduTest {
  public:
   AlterTableTest()
-    : stop_threads_(false),
-      inserted_idx_(0) {
+      : stop_threads_(false),
+        next_idx_(0),
+        update_ops_cnt_(0) {
 
     KuduSchemaBuilder b;
     b.AddColumn("c0")->Type(KuduColumnSchema::INT32)->NotNull()->PrimaryKey();
     b.AddColumn("c1")->Type(KuduColumnSchema::INT32)->NotNull();
     CHECK_OK(b.Build(&schema_));
 
-    FLAGS_enable_data_block_fsync = false; // Keep unit tests fast.
     FLAGS_use_hybrid_clock = false;
-    ANNOTATE_BENIGN_RACE(&FLAGS_flush_threshold_mb,
-                         "safe to change at runtime");
-    ANNOTATE_BENIGN_RACE(&FLAGS_enable_maintenance_manager,
-                         "safe to change at runtime");
+    FLAGS_scanner_allow_snapshot_scans_with_logical_timestamps = true;
   }
 
-  virtual void SetUp() OVERRIDE {
+  void SetUp() override {
     // Make heartbeats faster to speed test runtime.
     FLAGS_heartbeat_interval_ms = 10;
 
@@ -106,29 +108,30 @@ class AlterTableTest : public KuduTest {
 
     MiniClusterOptions opts;
     opts.num_tablet_servers = num_replicas();
-    cluster_.reset(new MiniCluster(env_.get(), opts));
+    cluster_.reset(new MiniCluster(env_, opts));
     ASSERT_OK(cluster_->Start());
-    ASSERT_OK(cluster_->WaitForTabletServerCount(num_replicas()));
 
     CHECK_OK(KuduClientBuilder()
-             .add_master_server_addr(cluster_->mini_master()->bound_rpc_addr_str())
-             .default_admin_operation_timeout(MonoDelta::FromSeconds(60))
-             .Build(&client_));
+        .add_master_server_addr(cluster_->mini_master()->bound_rpc_addr_str())
+        .default_admin_operation_timeout(MonoDelta::FromSeconds(60))
+        .Build(&client_));
 
     // Add a table, make sure it reports itself.
     gscoped_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
     CHECK_OK(table_creator->table_name(kTableName)
              .schema(&schema_)
+             .set_range_partition_columns({ "c0" })
              .num_replicas(num_replicas())
              .Create());
 
     if (num_replicas() == 1) {
       tablet_peer_ = LookupTabletPeer();
+      ASSERT_OK(tablet_peer_->consensus()->WaitUntilLeaderForTests(MonoDelta::FromSeconds(10)));
     }
     LOG(INFO) << "Tablet successfully located";
   }
 
-  virtual void TearDown() OVERRIDE {
+  void TearDown() override {
     tablet_peer_.reset();
     cluster_->Shutdown();
   }
@@ -154,6 +157,7 @@ class AlterTableTest : public KuduTest {
   void RestartTabletServer(int idx = 0) {
     tablet_peer_.reset();
     if (cluster_->mini_tablet_server(idx)->server()) {
+      cluster_->mini_tablet_server(idx)->Shutdown();
       ASSERT_OK(cluster_->mini_tablet_server(idx)->Restart());
     } else {
       ASSERT_OK(cluster_->mini_tablet_server(idx)->Start());
@@ -207,6 +211,9 @@ class AlterTableTest : public KuduTest {
   void VerifyRows(int start_row, int num_rows, VerifyPattern pattern);
 
   void InsertRows(int start_row, int num_rows);
+  void DeleteRow(int row_key);
+
+  Status InsertRowsSequential(const string& table_name, int start_row, int num_rows);
 
   void UpdateRow(int32_t row_key, const map<string, int32_t>& updates);
 
@@ -226,10 +233,17 @@ class AlterTableTest : public KuduTest {
     gscoped_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
     return table_creator->table_name(table_name)
         .schema(&schema_)
+        .set_range_partition_columns({ "c0" })
         .num_replicas(num_replicas())
         .split_rows(split_rows)
         .Create();
   }
+
+  Status CreateTable(const string& table_name,
+                     const KuduSchema& schema,
+                     const vector<string>& range_partition_columns,
+                     vector<unique_ptr<KuduPartialRow>> split_rows,
+                     vector<pair<unique_ptr<KuduPartialRow>, unique_ptr<KuduPartialRow>>> bounds);
 
  protected:
   virtual int num_replicas() const { return 1; }
@@ -243,12 +257,14 @@ class AlterTableTest : public KuduTest {
 
   scoped_refptr<TabletPeer> tablet_peer_;
 
-  AtomicBool stop_threads_;
+  atomic<bool> stop_threads_;
 
-  // The index of the last row inserted by InserterThread.
-  // UpdaterThread uses this to figure out which rows can be
-  // safely updated.
-  AtomicInt<int32_t> inserted_idx_;
+  // The index of the next row to be inserted by the InserterThread.
+  // The UpdaterThread uses this to figure out which rows can be safely updated.
+  atomic<uint32_t> next_idx_;
+
+  // Number of update operations issues by the UpdaterThread so far.
+  atomic<uint32_t> update_ops_cnt_;
 };
 
 // Subclass which creates three servers and a replicated cluster.
@@ -291,15 +307,19 @@ TEST_F(AlterTableTest, TestAddNotNullableColumnWithoutDefaults) {
 
   {
     AlterTableRequestPB req;
-    req.mutable_table()->set_table_name(kTableName);
+    AlterTableResponsePB resp;
 
+    req.mutable_table()->set_table_name(kTableName);
     AlterTableRequestPB::Step *step = req.add_alter_schema_steps();
     step->set_type(AlterTableRequestPB::ADD_COLUMN);
     ColumnSchemaToPB(ColumnSchema("c2", INT32),
                      step->mutable_add_column()->mutable_schema());
-    AlterTableResponsePB resp;
-    Status s = cluster_->mini_master()->master()->catalog_manager()->AlterTable(
-      &req, &resp, nullptr);
+
+    master::CatalogManager* catalog =
+        cluster_->mini_master()->master()->catalog_manager();
+    master::CatalogManager::ScopedLeaderSharedLock l(catalog);
+    ASSERT_OK(l.first_failed_status());
+    Status s = catalog->AlterTable(&req, &resp, nullptr);
     ASSERT_TRUE(s.IsInvalidArgument());
     ASSERT_STR_CONTAINS(s.ToString(), "column `c2`: NOT NULL columns must have a default");
   }
@@ -326,6 +346,43 @@ TEST_F(AlterTableTest, TestAddNullableColumnWithoutDefault) {
   ASSERT_EQ(2, rows.size());
   EXPECT_EQ("(int32 c0=0, int32 c1=0, int32 new=NULL)", rows[0]);
   EXPECT_EQ("(int32 c0=16777216, int32 c1=1, int32 new=NULL)", rows[1]);
+}
+
+// Rename a primary key column
+TEST_F(AlterTableTest, TestRenamePrimaryKeyColumn) {
+  InsertRows(0, 1);
+  ASSERT_OK(tablet_peer_->tablet()->Flush());
+
+  {
+    gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterColumn("c0")->RenameTo("primaryKeyRenamed");
+    table_alterer->AlterColumn("c1")->RenameTo("secondColumn");
+    ASSERT_OK(table_alterer->Alter());
+  }
+
+  InsertRows(1, 1);
+
+  vector<string> rows;
+  ScanToStrings(&rows);
+  ASSERT_EQ(2, rows.size());
+  EXPECT_EQ("(int32 primaryKeyRenamed=0, int32 secondColumn=0)", rows[0]);
+  EXPECT_EQ("(int32 primaryKeyRenamed=16777216, int32 secondColumn=1)", rows[1]);
+
+  {
+    gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterColumn("primaryKeyRenamed")->RenameTo("pk");
+    table_alterer->AlterColumn("secondColumn")->RenameTo("sc");
+    ASSERT_OK(table_alterer->Alter());
+  }
+
+  InsertRows(2, 1);
+
+  rows.clear();
+  ScanToStrings(&rows);
+  ASSERT_EQ(3, rows.size());
+  EXPECT_EQ("(int32 pk=0, int32 sc=0)", rows[0]);
+  EXPECT_EQ("(int32 pk=16777216, int32 sc=1)", rows[1]);
+  EXPECT_EQ("(int32 pk=33554432, int32 sc=2)", rows[2]);
 }
 
 // Verify that, if a tablet server is down when an alter command is issued,
@@ -408,7 +465,7 @@ TEST_F(AlterTableTest, TestGetSchemaAfterAlterTable) {
 void AlterTableTest::InsertRows(int start_row, int num_rows) {
   shared_ptr<KuduSession> session = client_->NewSession();
   shared_ptr<KuduTable> table;
-  CHECK_OK(session->SetFlushMode(KuduSession::MANUAL_FLUSH));
+  CHECK_OK(session->SetFlushMode(KuduSession::AUTO_FLUSH_BACKGROUND));
   session->SetTimeoutMillis(15 * 1000);
   CHECK_OK(client_->OpenTable(kTableName, &table));
 
@@ -435,14 +492,56 @@ void AlterTableTest::InsertRows(int start_row, int num_rows) {
   FlushSessionOrDie(session);
 }
 
+void AlterTableTest::DeleteRow(int row_key) {
+  shared_ptr<KuduSession> session = client_->NewSession();
+  shared_ptr<KuduTable> table;
+  CHECK_OK(session->SetFlushMode(KuduSession::MANUAL_FLUSH));
+  session->SetTimeoutMillis(15 * 1000);
+  CHECK_OK(client_->OpenTable(kTableName, &table));
+
+  unique_ptr<KuduDelete> del(table->NewDelete());
+  CHECK_OK(del->mutable_row()->SetInt32(0, bswap_32(row_key)));
+  CHECK_OK(session->Apply(del.release()));
+  FlushSessionOrDie(session);
+}
+
+Status AlterTableTest::InsertRowsSequential(const string& table_name, int start_row, int num_rows) {
+  shared_ptr<KuduSession> session = client_->NewSession();
+  shared_ptr<KuduTable> table;
+  RETURN_NOT_OK(session->SetFlushMode(KuduSession::AUTO_FLUSH_BACKGROUND));
+  session->SetTimeoutMillis(15 * 1000);
+  RETURN_NOT_OK(client_->OpenTable(table_name, &table));
+
+  // Insert a bunch of rows with the current schema
+  for (int i = start_row; i < start_row + num_rows; i++) {
+    unique_ptr<KuduInsert> insert(table->NewInsert());
+    RETURN_NOT_OK(insert->mutable_row()->SetInt32(0, i));
+    if (table->schema().num_columns() > 1) {
+      RETURN_NOT_OK(insert->mutable_row()->SetInt32(1, i));
+    }
+    RETURN_NOT_OK(session->Apply(insert.release()));
+  }
+  Status s = session->Flush();
+  if (!s.ok()) {
+    vector<KuduError*> errors;
+    ElementDeleter d(&errors);
+    bool overflow;
+    session->GetPendingErrors(&errors, &overflow);
+    for (auto* error : errors) {
+      LOG(WARNING) << error->status().ToString();
+    }
+  }
+  return s;
+}
+
 void AlterTableTest::UpdateRow(int32_t row_key,
                                const map<string, int32_t>& updates) {
   shared_ptr<KuduSession> session = client_->NewSession();
   shared_ptr<KuduTable> table;
   CHECK_OK(client_->OpenTable(kTableName, &table));
-  CHECK_OK(session->SetFlushMode(KuduSession::MANUAL_FLUSH));
+  CHECK_OK(session->SetFlushMode(KuduSession::AUTO_FLUSH_BACKGROUND));
   session->SetTimeoutMillis(15 * 1000);
-  gscoped_ptr<KuduUpdate> update(table->NewUpdate());
+  unique_ptr<KuduUpdate> update(table->NewUpdate());
   int32_t key = bswap_32(row_key); // endian swap to match 'InsertRows'
   CHECK_OK(update->mutable_row()->SetInt32(0, key));
   typedef map<string, int32_t>::value_type entry;
@@ -507,6 +606,29 @@ void AlterTableTest::VerifyRows(int start_row, int num_rows, VerifyPattern patte
   CHECK_EQ(verified, num_rows);
 }
 
+Status AlterTableTest::CreateTable(const string& table_name,
+                                   const KuduSchema& schema,
+                                   const vector<string>& range_partition_columns,
+                                   vector<unique_ptr<KuduPartialRow>> split_rows,
+                                   vector<pair<unique_ptr<KuduPartialRow>,
+                                               unique_ptr<KuduPartialRow>>> bounds) {
+  unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+  table_creator->table_name(table_name)
+                .schema(&schema)
+                .set_range_partition_columns(range_partition_columns)
+                .num_replicas(1);
+
+  for (auto& split_row : split_rows) {
+    table_creator->add_range_partition_split(split_row.release());
+  }
+
+  for (auto& bound : bounds) {
+    table_creator->add_range_partition(bound.first.release(), bound.second.release());
+  }
+
+  return table_creator->Create();
+}
+
 // Test inserting/updating some data, dropping a column, and adding a new one
 // with the same name. Data should not "reappear" from the old column.
 //
@@ -524,7 +646,7 @@ TEST_F(AlterTableTest, TestDropAndAddNewColumn) {
   VerifyRows(0, kNumRows, C1_MATCHES_INDEX);
 
   LOG(INFO) << "Dropping and adding back c1";
-  gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+  unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
   ASSERT_OK(table_alterer->DropColumn("c1")
             ->Alter());
 
@@ -537,7 +659,7 @@ TEST_F(AlterTableTest, TestDropAndAddNewColumn) {
 // Tests that a renamed table can still be altered. This is a regression test, we used to not carry
 // over column ids after a table rename.
 TEST_F(AlterTableTest, TestRenameTableAndAdd) {
-  gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+  unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
   string new_name = "someothername";
   ASSERT_OK(table_alterer->RenameTo(new_name)
             ->Alter());
@@ -565,7 +687,7 @@ TEST_F(AlterTableTest, TestBootstrapAfterAlters) {
   ASSERT_EQ("(int32 c0=16777216, int32 c1=10002, int32 c2=12345)", rows[1]);
 
   LOG(INFO) << "Dropping c1";
-  gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+  unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
   ASSERT_OK(table_alterer->DropColumn("c1")->Alter());
 
   NO_FATALS(ScanToStrings(&rows));
@@ -620,7 +742,7 @@ TEST_F(AlterTableTest, TestCompactAfterUpdatingRemovedColumn) {
 
   // Drop c1.
   LOG(INFO) << "Dropping c1";
-  gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+  unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
   ASSERT_OK(table_alterer->DropColumn("c1")->Alter());
 
   NO_FATALS(ScanToStrings(&rows));
@@ -656,7 +778,7 @@ TEST_F(AlterTableTest, TestMajorCompactDeltasAfterUpdatingRemovedColumn) {
 
   // Drop c1.
   LOG(INFO) << "Dropping c1";
-  gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+  unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
   ASSERT_OK(table_alterer->DropColumn("c1") ->Alter());
 
   NO_FATALS(ScanToStrings(&rows));
@@ -674,8 +796,9 @@ TEST_F(AlterTableTest, TestMajorCompactDeltasAfterUpdatingRemovedColumn) {
   ASSERT_EQ("Dumping tablet:\n"
             "---------------------------\n"
             "MRS memrowset:\n"
-            "RowSet RowSet(1):\n"
-            "(int32 c0=0, int32 c2=12345) Undos: [@2(DELETE)] Redos: []",
+            "RowSet RowSet(0):\n"
+            "RowIdxInBlock: 0; Base: (int32 c0=0, int32 c2=12345); Undo Mutations: [@4(DELETE)]; "
+                "Redo Mutations: [];",
             JoinStrings(rows, "\n"));
 
 }
@@ -722,9 +845,10 @@ TEST_F(AlterTableTest, TestMajorCompactDeltasIntoMissingBaseData) {
             "---------------------------\n"
             "MRS memrowset:\n"
             "RowSet RowSet(0):\n"
-            "(int32 c0=0, int32 c1=0, int32 c2=54321) "
-            "Undos: [@4(SET c2=12345), @1(DELETE)] Redos: []\n"
-            "(int32 c0=16777216, int32 c1=1, int32 c2=12345) Undos: [@2(DELETE)] Redos: []",
+            "RowIdxInBlock: 0; Base: (int32 c0=0, int32 c1=0, int32 c2=54321); Undo Mutations: "
+                "[@6(SET c2=12345), @3(DELETE)]; Redo Mutations: [];\n"
+            "RowIdxInBlock: 1; Base: (int32 c0=16777216, int32 c1=1, int32 c2=12345); "
+                "Undo Mutations: [@4(DELETE)]; Redo Mutations: [];",
             JoinStrings(rows, "\n"));
 }
 
@@ -758,7 +882,7 @@ TEST_F(AlterTableTest, TestMajorCompactDeltasAfterAddUpdateRemoveColumn) {
 
   // Drop c2.
   LOG(INFO) << "Dropping c2";
-  gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+  unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
   ASSERT_OK(table_alterer->DropColumn("c2")->Alter());
 
   NO_FATALS(ScanToStrings(&rows));
@@ -777,24 +901,55 @@ TEST_F(AlterTableTest, TestMajorCompactDeltasAfterAddUpdateRemoveColumn) {
             "---------------------------\n"
             "MRS memrowset:\n"
             "RowSet RowSet(0):\n"
-            "(int32 c0=0, int32 c1=0) Undos: [@1(DELETE)] Redos: []",
+            "RowIdxInBlock: 0; Base: (int32 c0=0, int32 c1=0); Undo Mutations: [@3(DELETE)]; "
+                "Redo Mutations: [];",
             JoinStrings(rows, "\n"));
 }
 
+// Test that, if we have history of previous versions of a row stored as REINSERTs,
+// and those REINSERTs were written prior to adding a new column, that reading the
+// old versions of the row will return the default value for the new column.
+// See KUDU-1760.
+TEST_F(AlterTableTest, TestReadHistoryAfterAlter) {
+  FLAGS_enable_maintenance_manager = false;
+
+  InsertRows(0, 1);
+  DeleteRow(0);
+  InsertRows(0, 1);
+  DeleteRow(0);
+  InsertRows(0, 1);
+  uint64_t ts1 = client_->GetLatestObservedTimestamp();
+  ASSERT_OK(tablet_peer_->tablet()->Flush());
+  ASSERT_OK(AddNewI32Column(kTableName, "c2", 12345));
+
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(client_->OpenTable(kTableName, &table));
+  KuduScanner scanner(table.get());
+  ASSERT_OK(scanner.SetReadMode(KuduScanner::READ_AT_SNAPSHOT));
+  // TODO(KUDU-1813): why do we need the '- 1' below? this seems odd that the
+  // "latest observed" timestamp is one higher than the thing we wrote, and the
+  // Delete then is assigned that timestamp.
+  ASSERT_OK(scanner.SetSnapshotRaw(ts1 - 1));
+  vector<string> row_strings;
+  client::ScanToStrings(&scanner, &row_strings);
+  ASSERT_EQ(1, row_strings.size());
+  ASSERT_EQ("(int32 c0=0, int32 c1=0, int32 c2=12345)", row_strings[0]);
+}
+
 // Thread which inserts rows into the table.
-// After each batch of rows is inserted, inserted_idx_ is updated
+// After each batch of rows is inserted, next_idx_ is updated
 // to communicate how much data has been written (and should now be
 // updateable)
 void AlterTableTest::InserterThread() {
   shared_ptr<KuduSession> session = client_->NewSession();
-  shared_ptr<KuduTable> table;
   CHECK_OK(session->SetFlushMode(KuduSession::MANUAL_FLUSH));
   session->SetTimeoutMillis(15 * 1000);
 
+  shared_ptr<KuduTable> table;
   CHECK_OK(client_->OpenTable(kTableName, &table));
-  int32_t i = 0;
-  while (!stop_threads_.Load()) {
-    gscoped_ptr<KuduInsert> insert(table->NewInsert());
+  uint32_t i = 0;
+  while (!stop_threads_) {
+    unique_ptr<KuduInsert> insert(table->NewInsert());
     // Endian-swap the key so that we spew inserts randomly
     // instead of just a sequential write pattern. This way
     // compactions may actually be triggered.
@@ -805,30 +960,28 @@ void AlterTableTest::InserterThread() {
 
     if (i % 50 == 0) {
       FlushSessionOrDie(session);
-      inserted_idx_.Store(i);
+      next_idx_ = i;
     }
   }
 
   FlushSessionOrDie(session);
-  inserted_idx_.Store(i);
+  next_idx_ = i;
 }
 
 // Thread which follows behind the InserterThread and generates random
 // updates across the previously inserted rows.
 void AlterTableTest::UpdaterThread() {
   shared_ptr<KuduSession> session = client_->NewSession();
-  shared_ptr<KuduTable> table;
   CHECK_OK(session->SetFlushMode(KuduSession::MANUAL_FLUSH));
   session->SetTimeoutMillis(15 * 1000);
 
+  shared_ptr<KuduTable> table;
   CHECK_OK(client_->OpenTable(kTableName, &table));
 
   Random rng(1);
-  int32_t i = 0;
-  while (!stop_threads_.Load()) {
-    gscoped_ptr<KuduUpdate> update(table->NewUpdate());
-
-    int32_t max = inserted_idx_.Load();
+  uint32_t i = 0;
+  while (!stop_threads_) {
+    const uint32_t max = next_idx_;
     if (max == 0) {
       // Inserter hasn't inserted anything yet, so we have nothing to update.
       SleepFor(MonoDelta::FromMicroseconds(100));
@@ -836,10 +989,12 @@ void AlterTableTest::UpdaterThread() {
     }
     // Endian-swap the key to match the way the InserterThread generates
     // keys to insert.
-    int32_t key = bswap_32(rng.Uniform(max));
+    uint32_t key = bswap_32(rng.Uniform(max - 1));
+    unique_ptr<KuduUpdate> update(table->NewUpdate());
     CHECK_OK(update->mutable_row()->SetInt32(0, key));
     CHECK_OK(update->mutable_row()->SetInt32(1, i));
     CHECK_OK(session->Apply(update.release()));
+    ++update_ops_cnt_;
 
     if (i++ % 50 == 0) {
       FlushSessionOrDie(session);
@@ -854,9 +1009,9 @@ void AlterTableTest::UpdaterThread() {
 void AlterTableTest::ScannerThread() {
   shared_ptr<KuduTable> table;
   CHECK_OK(client_->OpenTable(kTableName, &table));
-  while (!stop_threads_.Load()) {
+  while (!stop_threads_) {
     KuduScanner scanner(table.get());
-    int inserted_at_scanner_start = inserted_idx_.Load();
+    uint32_t inserted_at_scanner_start = next_idx_;
     CHECK_OK(scanner.Open());
     int count = 0;
     vector<KuduRowResult> results;
@@ -909,10 +1064,13 @@ TEST_F(AlterTableTest, TestAlterUnderWriteLoad) {
                                      i));
   }
 
-  stop_threads_.Store(true);
+  stop_threads_ = true;
   writer->Join();
   updater->Join();
   scanner->Join();
+  // A sanity check: the updater should have generate at least one update
+  // given the parameters the test is running with.
+  CHECK_GE(update_ops_cnt_, 0U);
 }
 
 TEST_F(AlterTableTest, TestInsertAfterAlterTable) {
@@ -929,7 +1087,7 @@ TEST_F(AlterTableTest, TestInsertAfterAlterTable) {
   ASSERT_OK(AddNewI32Column(kSplitTableName, "new-i32", 10));
   shared_ptr<KuduTable> table;
   ASSERT_OK(client_->OpenTable(kSplitTableName, &table));
-  gscoped_ptr<KuduInsert> insert(table->NewInsert());
+  unique_ptr<KuduInsert> insert(table->NewInsert());
   ASSERT_OK(insert->mutable_row()->SetInt32("c0", 1));
   ASSERT_OK(insert->mutable_row()->SetInt32("c1", 1));
   ASSERT_OK(insert->mutable_row()->SetInt32("new-i32", 1));
@@ -966,7 +1124,7 @@ TEST_F(AlterTableTest, TestMultipleAlters) {
 
   // Issue a bunch of new alters without waiting for them to finish.
   for (int i = 0; i < kNumNewCols; i++) {
-    gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kSplitTableName));
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kSplitTableName));
     table_alterer->AddColumn(strings::Substitute("new_col$0", i))
       ->Type(KuduColumnSchema::INT32)->NotNull()
       ->Default(KuduValue::FromInt(kDefaultValue));
@@ -982,6 +1140,774 @@ TEST_F(AlterTableTest, TestMultipleAlters) {
   ASSERT_EQ(kNumNewCols + schema_.num_columns(), new_schema.num_columns());
 }
 
+TEST_F(AlterTableTest, TestAlterRangePartitioning) {
+  unique_ptr<KuduTableAlterer> table_alterer;
+
+  // Create initial table with single range partition covering the entire key
+  // space, and two hash buckets.
+  string table_name = "test-alter-range-partitioning";
+  unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+  ASSERT_OK(table_creator->table_name(table_name)
+                          .schema(&schema_)
+                          .set_range_partition_columns({ "c0" })
+                          .add_hash_partitions({ "c0" }, 2)
+                          .num_replicas(1)
+                          .Create());
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(client_->OpenTable(table_name, &table));
+
+  // Insert some rows, and then drop the partition and ensure that the table is empty.
+  ASSERT_OK(InsertRowsSequential(table_name, 0, 100));
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  ASSERT_OK(table_alterer->DropRangePartition(schema_.NewRow(),
+                                              schema_.NewRow())->Alter());
+  ASSERT_EQ(0, CountTableRows(table.get()));
+
+  // Add new range partition and insert rows.
+  unique_ptr<KuduPartialRow> lower(schema_.NewRow());
+  unique_ptr<KuduPartialRow> upper(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 0));
+  ASSERT_OK(upper->SetInt32("c0", 100));
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  ASSERT_OK(table_alterer->AddRangePartition(lower.release(), upper.release())->Alter());
+  ASSERT_OK(InsertRowsSequential(table_name, 0, 100));
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // Replace the range partition with a different one.
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 0));
+  ASSERT_OK(upper->SetInt32("c0", 100));
+  table_alterer->DropRangePartition(lower.release(), upper.release());
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 49));
+  ASSERT_OK(upper->SetInt32("c0", 149));
+  table_alterer->AddRangePartition(lower.release(), upper.release(),
+                                   KuduTableCreator::EXCLUSIVE_BOUND,
+                                   KuduTableCreator::INCLUSIVE_BOUND);
+  ASSERT_OK(table_alterer->wait(false)->Alter());
+  ASSERT_OK(InsertRowsSequential(table_name, 50, 100));
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // Replace the range partition with the same one.
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 50));
+  ASSERT_OK(upper->SetInt32("c0", 150));
+  table_alterer->DropRangePartition(lower.release(), upper.release());
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 50));
+  ASSERT_OK(upper->SetInt32("c0", 150));
+  table_alterer->AddRangePartition(lower.release(), upper.release());
+  ASSERT_OK(table_alterer->Alter());
+  ASSERT_EQ(0, CountTableRows(table.get()));
+  ASSERT_OK(InsertRowsSequential(table_name, 50, 75));
+  ASSERT_EQ(75, CountTableRows(table.get()));
+
+  // Alter table partitioning + alter table schema
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 200));
+  ASSERT_OK(upper->SetInt32("c0", 300));
+  table_name += "-renamed";
+  table_alterer->AddRangePartition(lower.release(), upper.release())
+               ->RenameTo(table_name)
+               ->AddColumn("c2")->Type(KuduColumnSchema::INT32);
+  ASSERT_OK(table_alterer->Alter());
+  ASSERT_OK(InsertRowsSequential(table_name, 200, 100));
+  ASSERT_EQ(175, CountTableRows(table.get()));
+  ASSERT_OK(client_->OpenTable(table_name, &table));
+  ASSERT_EQ(3, table->schema().num_columns());
+
+  // Drop all range partitions + alter table schema. This also serves to test
+  // specifying range bounds with a subset schema (since a column was
+  // previously added).
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 50));
+  ASSERT_OK(upper->SetInt32("c0", 150));
+  table_alterer->DropRangePartition(lower.release(), upper.release());
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 200));
+  ASSERT_OK(upper->SetInt32("c0", 300));
+  table_alterer->DropRangePartition(lower.release(), upper.release());
+  table_alterer->AddColumn("c3")->Type(KuduColumnSchema::STRING);
+  ASSERT_OK(table_alterer->Alter());
+  ASSERT_EQ(0, CountTableRows(table.get()));
+}
+
+TEST_F(AlterTableTest, TestAlterRangePartitioningInvalid) {
+  unique_ptr<KuduTableAlterer> table_alterer;
+  Status s;
+
+  // Create initial table with single range partition covering [0, 100).
+  string table_name = "test-alter-range-partitioning-invalid";
+  unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+  unique_ptr<KuduPartialRow> lower(schema_.NewRow());
+  unique_ptr<KuduPartialRow> upper(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 0));
+  ASSERT_OK(upper->SetInt32("c0", 100));
+  ASSERT_OK(table_creator->table_name(table_name)
+                          .schema(&schema_)
+                          .set_range_partition_columns({ "c0" })
+                          .add_range_partition(lower.release(), upper.release())
+                          .num_replicas(1)
+                          .Create());
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(client_->OpenTable(table_name, &table));
+  ASSERT_OK(InsertRowsSequential(table_name, 0, 100));
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // ADD [0, 100) <- illegal (duplicate)
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 0));
+  ASSERT_OK(upper->SetInt32("c0", 100));
+  table_alterer->AddRangePartition(lower.release(), upper.release());
+  s = table_alterer->wait(false)->Alter();
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "New range partition conflicts with existing range partition");
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // ADD [50, 150) <- illegal (overlap)
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 50));
+  ASSERT_OK(upper->SetInt32("c0", 150));
+  table_alterer->AddRangePartition(lower.release(), upper.release());
+  s = table_alterer->wait(false)->Alter();
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "New range partition conflicts with existing range partition");
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // ADD (-50, 50] <- illegal (overlap)
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", -50));
+  ASSERT_OK(upper->SetInt32("c0", 50));
+  table_alterer->AddRangePartition(lower.release(), upper.release(),
+                                   KuduTableCreator::EXCLUSIVE_BOUND,
+                                   KuduTableCreator::INCLUSIVE_BOUND);
+  s = table_alterer->wait(false)->Alter();
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "New range partition conflicts with existing range partition");
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // ADD [200, 300)
+  // ADD [-50, 150) <- illegal (overlap)
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 200));
+  ASSERT_OK(upper->SetInt32("c0", 300));
+  table_alterer->AddRangePartition(lower.release(), upper.release());
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", -50));
+  ASSERT_OK(upper->SetInt32("c0", 150));
+  table_alterer->AddRangePartition(lower.release(), upper.release());
+  s = table_alterer->wait(false)->Alter();
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "New range partition conflicts with existing range partition");
+  ASSERT_FALSE(InsertRowsSequential(table_name, 200, 100).ok());
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // DROP [<start>, <end>)
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  table_alterer->DropRangePartition(schema_.NewRow(), schema_.NewRow());
+  s = table_alterer->Alter();
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "No range partition found for drop range partition step");
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // DROP [50, 150)
+  // RENAME foo
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 50));
+  ASSERT_OK(upper->SetInt32("c0", 150));
+  table_alterer->DropRangePartition(lower.release(), upper.release());
+  table_alterer->RenameTo("foo");
+  s = table_alterer->Alter();
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "No range partition found for drop range partition step");
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // DROP [-50, 50)
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", -50));
+  ASSERT_OK(upper->SetInt32("c0", 50));
+  table_alterer->DropRangePartition(lower.release(), upper.release());
+  s = table_alterer->Alter();
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "No range partition found for drop range partition step");
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // DROP [0, 100)
+  // ADD  [100, 200)
+  // DROP [100, 200)
+  // ADD  [150, 250)
+  // DROP [0, 10)    <- illegal
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 0));
+  ASSERT_OK(upper->SetInt32("c0", 100));
+  table_alterer->DropRangePartition(lower.release(), upper.release());
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 100));
+  ASSERT_OK(upper->SetInt32("c0", 200));
+  table_alterer->AddRangePartition(lower.release(), upper.release());
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 100));
+  ASSERT_OK(upper->SetInt32("c0", 200));
+  table_alterer->DropRangePartition(lower.release(), upper.release());
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 150));
+  ASSERT_OK(upper->SetInt32("c0", 250));
+  table_alterer->AddRangePartition(lower.release(), upper.release());
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 0));
+  ASSERT_OK(upper->SetInt32("c0", 10));
+  table_alterer->DropRangePartition(lower.release(), upper.release());
+  s = table_alterer->wait(false)->Alter();
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "No range partition found for drop range partition step");
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // KUDU-1750 Regression cases:
+
+  // DROP [0, 50)  <- illegal
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 0));
+  ASSERT_OK(upper->SetInt32("c0", 50));
+  table_alterer->DropRangePartition(lower.release(), upper.release());
+  s = table_alterer->Alter();
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "No range partition found for drop range partition step");
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // DROP [50, 100)  <- illegal
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 50));
+  ASSERT_OK(upper->SetInt32("c0", 100));
+  table_alterer->DropRangePartition(lower.release(), upper.release());
+  s = table_alterer->Alter();
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "No range partition found for drop range partition step");
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // ADD [100, 200)
+  // DROP [100, 150) <- illegal
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 100));
+  ASSERT_OK(upper->SetInt32("c0", 200));
+  table_alterer->AddRangePartition(lower.release(), upper.release());
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 100));
+  ASSERT_OK(upper->SetInt32("c0", 150));
+  table_alterer->DropRangePartition(lower.release(), upper.release());
+  s = table_alterer->Alter();
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "No range partition found for drop range partition step");
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // ADD [100, 200)
+  // DROP [150, 200)  <- illegal
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 100));
+  ASSERT_OK(upper->SetInt32("c0", 200));
+  table_alterer->AddRangePartition(lower.release(), upper.release());
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 150));
+  ASSERT_OK(upper->SetInt32("c0", 200));
+  table_alterer->DropRangePartition(lower.release(), upper.release());
+  s = table_alterer->Alter();
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "No range partition found for drop range partition step");
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // ADD [<min>, 0)
+  // DROP [<min>, -50] <- illegal
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(upper->SetInt32("c0", 0));
+  table_alterer->AddRangePartition(lower.release(), upper.release());
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(upper->SetInt32("c0", -50));
+  table_alterer->DropRangePartition(lower.release(), upper.release());
+  s = table_alterer->Alter();
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "No range partition found for drop range partition step");
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // ADD [<min>, 0)
+  // DROP [<min>, 50] <- illegal
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(upper->SetInt32("c0", 0));
+  table_alterer->AddRangePartition(lower.release(), upper.release());
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(upper->SetInt32("c0", 50));
+  table_alterer->DropRangePartition(lower.release(), upper.release());
+  s = table_alterer->Alter();
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "No range partition found for drop range partition step");
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // ADD [100, <max>)
+  // DROP [150, <max>] <- illegal
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 100));
+  table_alterer->AddRangePartition(lower.release(), upper.release());
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 150));
+  table_alterer->DropRangePartition(lower.release(), upper.release());
+  s = table_alterer->Alter();
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "No range partition found for drop range partition step");
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // ADD [100, <max>)
+  // DROP [50, <max>] <- illegal
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 100));
+  table_alterer->AddRangePartition(lower.release(), upper.release());
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 50));
+  table_alterer->DropRangePartition(lower.release(), upper.release());
+  s = table_alterer->Alter();
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "No range partition found for drop range partition step");
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // Setup for the next few test cases:
+  // ADD [<min>, 0)
+  // ADD [100, <max>)
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(upper->SetInt32("c0", 0));
+  table_alterer->AddRangePartition(lower.release(), upper.release());
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 100));
+  table_alterer->AddRangePartition(lower.release(), upper.release());
+  ASSERT_OK(table_alterer->Alter());
+
+  // DROP [<min>, -50] <- illegal
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(upper->SetInt32("c0", -50));
+  table_alterer->DropRangePartition(lower.release(), upper.release());
+  s = table_alterer->Alter();
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "No range partition found for drop range partition step");
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // DROP [<min>, 50] <- illegal
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(upper->SetInt32("c0", 50));
+  table_alterer->DropRangePartition(lower.release(), upper.release());
+  s = table_alterer->Alter();
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "No range partition found for drop range partition step");
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // DROP [150, <max>] <- illegal
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 150));
+  table_alterer->DropRangePartition(lower.release(), upper.release());
+  s = table_alterer->Alter();
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "No range partition found for drop range partition step");
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // DROP [50, <max>] <- illegal
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  ASSERT_OK(lower->SetInt32("c0", 50));
+  table_alterer->DropRangePartition(lower.release(), upper.release());
+  s = table_alterer->Alter();
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "No range partition found for drop range partition step");
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // DROP [<min>, <max>] <- illegal
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  lower.reset(schema_.NewRow());
+  upper.reset(schema_.NewRow());
+  table_alterer->DropRangePartition(lower.release(), upper.release());
+  s = table_alterer->Alter();
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "No range partition found for drop range partition step");
+  ASSERT_EQ(100, CountTableRows(table.get()));
+
+  // Bad arguments (null ranges)
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  table_alterer->DropRangePartition(nullptr, nullptr);
+  s = table_alterer->Alter();
+  ASSERT_FALSE(s.ok());
+  ASSERT_STR_CONTAINS(s.ToString(), "range partition bounds may not be null");
+}
+
+// Attempts to exhaustively check all cases of single-column range partition
+// conflicts for ALTER TABLE ADD RANGE PARTITION ops involving two ranges.
+//
+// Also tests some cases of DROP RANGE PARTITION where possible, but the
+// coverage is not exhaustive (the state space for invalid add/drop combinations
+// is much bigger than for add/add combinations).
+//
+// Regression test for KUDU-1792
+TEST_F(AlterTableTest, TestAddRangePartitionConflictExhaustive) {
+  unique_ptr<KuduTableAlterer> table_alterer;
+
+  // CREATE TABLE t (c0 INT PRIMARY KEY)
+  // PARTITION BY
+  //    RANGE (c0) ();
+  string table_name = "test-alter-range-partitioning-invalid-unbounded";
+  unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+  ASSERT_OK(table_creator->table_name(table_name)
+                          .schema(&schema_)
+                          .set_range_partition_columns({ "c0" })
+                          .num_replicas(1)
+                          .Create());
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(client_->OpenTable(table_name, &table));
+
+  // Drop the default UNBOUNDED tablet in order to start with a table with no ranges.
+  table_alterer.reset(client_->NewTableAlterer(table_name));
+  ASSERT_OK(table_alterer->DropRangePartition(schema_.NewRow(), schema_.NewRow())
+                         ->wait(true)->Alter());
+
+  // Turns an optional value into a row for the table.
+  auto fill_row = [&] (boost::optional<int32_t> value) -> unique_ptr<KuduPartialRow> {
+    unique_ptr<KuduPartialRow> row(schema_.NewRow());
+    if (value) {
+      CHECK_OK(row->SetInt32("c0", *value));
+    }
+    return row;
+  };
+
+  // Attempts to add a range partition to the table with the specified bounds.
+  auto add_range_partition = [&] (boost::optional<int32_t> lower_bound,
+                                  boost::optional<int32_t> upper_bound) -> Status {
+    table_alterer.reset(client_->NewTableAlterer(table_name));
+    return table_alterer->AddRangePartition(fill_row(lower_bound).release(),
+                                            fill_row(upper_bound).release())
+                        ->wait(false)
+                        ->Alter();
+  };
+
+  // Attempts to drop a range partition to the table with the specified bounds.
+  auto drop_range_partition = [&] (boost::optional<int32_t> lower_bound,
+                                   boost::optional<int32_t> upper_bound) -> Status {
+    table_alterer.reset(client_->NewTableAlterer(table_name));
+    return table_alterer->DropRangePartition(fill_row(lower_bound).release(),
+                                             fill_row(upper_bound).release())
+                        ->wait(false)
+                        ->Alter();
+  };
+
+  // Attempts to add two range partitions to the table in a single transaction.
+  auto add_range_partitions = [&] (boost::optional<int32_t> a_lower_bound,
+                                   boost::optional<int32_t> a_upper_bound,
+                                   boost::optional<int32_t> b_lower_bound,
+                                   boost::optional<int32_t> b_upper_bound) -> Status {
+    table_alterer.reset(client_->NewTableAlterer(table_name));
+    return table_alterer->AddRangePartition(fill_row(a_lower_bound).release(),
+                                            fill_row(a_upper_bound).release())
+                        ->AddRangePartition(fill_row(b_lower_bound).release(),
+                                            fill_row(b_upper_bound).release())
+                        ->wait(false)
+                        ->Alter();
+  };
+
+  // Attempts to add and drop two range partitions in a single transaction.
+  auto add_drop_range_partitions = [&] (boost::optional<int32_t> a_lower_bound,
+                                        boost::optional<int32_t> a_upper_bound,
+                                        boost::optional<int32_t> b_lower_bound,
+                                        boost::optional<int32_t> b_upper_bound) -> Status {
+    table_alterer.reset(client_->NewTableAlterer(table_name));
+    return table_alterer->AddRangePartition(fill_row(a_lower_bound).release(),
+                                            fill_row(a_upper_bound).release())
+                        ->DropRangePartition(fill_row(b_lower_bound).release(),
+                                             fill_row(b_upper_bound).release())
+                        ->wait(false)
+                        ->Alter();
+  };
+
+  auto bounds_to_string = [] (boost::optional<int32_t> lower_bound,
+                              boost::optional<int32_t> upper_bound) -> string {
+    if (!lower_bound && !upper_bound) {
+      return "UNBOUNDED";
+    }
+    if (!lower_bound) {
+      return strings::Substitute("VALUES < $0", *upper_bound);
+    }
+    if (!upper_bound) {
+      return strings::Substitute("VALUES >= $0", *lower_bound);
+    }
+    return strings::Substitute("$0 <= VALUES < $1", *lower_bound, *upper_bound);
+  };
+
+  // Checks that b conflicts with a, when added in that order.
+  auto do_expect_range_partitions_conflict = [&] (boost::optional<int32_t> a_lower_bound,
+                                                  boost::optional<int32_t> a_upper_bound,
+                                                  boost::optional<int32_t> b_lower_bound,
+                                                  boost::optional<int32_t> b_upper_bound) {
+    SCOPED_TRACE(strings::Substitute("b: $0", bounds_to_string(b_lower_bound, b_upper_bound)));
+    SCOPED_TRACE(strings::Substitute("a: $0", bounds_to_string(a_lower_bound, a_upper_bound)));
+
+    // Add a then add b.
+    ASSERT_OK(add_range_partition(a_lower_bound, a_upper_bound));
+    Status s = add_range_partition(b_lower_bound, b_upper_bound);
+    ASSERT_FALSE(s.ok());
+    ASSERT_STR_CONTAINS(s.ToString(),
+                        "New range partition conflicts with existing range partition");
+    // Clean up by removing a.
+    ASSERT_OK(drop_range_partition(a_lower_bound, a_upper_bound));
+
+    // Add a and b in the same transaction.
+    s = add_range_partitions(a_lower_bound, a_upper_bound,
+                             b_lower_bound, b_upper_bound);
+    ASSERT_FALSE(s.ok());
+    ASSERT_STR_CONTAINS(s.ToString(),
+                        "New range partition conflicts with another new range partition");
+
+    // To get some extra coverage of DROP RANGE PARTITION, check if the two
+    // ranges are not equal, and if so, check that adding one and dropping the
+    // other fails.
+
+    if (a_lower_bound != b_lower_bound || a_upper_bound != b_upper_bound) {
+      // Add a then drop b.
+      ASSERT_OK(add_range_partition(a_lower_bound, a_upper_bound));
+      Status s = drop_range_partition(b_lower_bound, b_upper_bound);
+      ASSERT_FALSE(s.ok());
+      ASSERT_STR_CONTAINS(s.ToString(), "No range partition found for drop range partition step");
+      // Clean up by removing a.
+      ASSERT_OK(drop_range_partition(a_lower_bound, a_upper_bound));
+
+      // Add a and drop b in a single transaction.
+      s = add_drop_range_partitions(a_lower_bound, a_upper_bound,
+                                    b_lower_bound, b_upper_bound);
+      ASSERT_FALSE(s.ok());
+      ASSERT_STR_CONTAINS(s.ToString(),
+                          "No range partition found for drop range partition step");
+    }
+  };
+
+  // Checks that two range partitions conflict.
+  auto expect_range_partitions_conflict = [&] (boost::optional<int32_t> a_lower_bound,
+                                               boost::optional<int32_t> a_upper_bound,
+                                               boost::optional<int32_t> b_lower_bound,
+                                               boost::optional<int32_t> b_upper_bound) {
+    do_expect_range_partitions_conflict(a_lower_bound, a_upper_bound,
+                                        b_lower_bound, b_upper_bound);
+    do_expect_range_partitions_conflict(b_lower_bound, b_upper_bound,
+                                        a_lower_bound, a_upper_bound);
+  };
+
+  /// Bounded / Bounded
+
+  // [----------)
+  // [----------)
+  expect_range_partitions_conflict(0, 100, 0, 100);
+
+  // [----------)
+  //      [----------)
+  expect_range_partitions_conflict(0, 100, 50, 150);
+
+  // [----------)
+  // [------)
+  expect_range_partitions_conflict(0, 100, 0, 50);
+
+  // [----------)
+  //     [------)
+  expect_range_partitions_conflict(0, 100, 50, 100);
+
+  // [----------)
+  //   [------)
+  expect_range_partitions_conflict(0, 100, 25, 75);
+
+  /// Bounded / Unbounded Above
+
+  //  [----------)
+  // [-------------->
+  expect_range_partitions_conflict(0, 100, -1, boost::none);
+
+  // [----------)
+  // [-------------->
+  expect_range_partitions_conflict(0, 100, 0, boost::none);
+
+  // [----------)
+  //  [------------->
+  expect_range_partitions_conflict(0, 100, 1, boost::none);
+
+  // [----------)
+  //      [------------->
+  expect_range_partitions_conflict(0, 100, 50, boost::none);
+
+  // [----------)
+  //           [--------->
+  expect_range_partitions_conflict(0, 100, 99, boost::none);
+
+  /// Bounded / Unbounded Below
+
+  //        [----------)
+  // <-------)
+  expect_range_partitions_conflict(0, 100, boost::none, 1);
+
+  //        [----------)
+  // <------------)
+  expect_range_partitions_conflict(0, 100, boost::none, 50);
+
+  //        [----------)
+  // <-----------------)
+  expect_range_partitions_conflict(0, 100, boost::none, 100);
+
+  //        [----------)
+  // <-------------------)
+  expect_range_partitions_conflict(0, 100, boost::none, 125);
+
+  /// Bounded / Unbounded
+
+  //     [----------)
+  // <------------------->
+  expect_range_partitions_conflict(0, 100, boost::none, boost::none);
+
+  /// Bounded / Single Value
+
+  // [----------)
+  // |
+  expect_range_partitions_conflict(0, 100, 0, 1);
+
+  // [----------)
+  //      |
+  expect_range_partitions_conflict(0, 100, 25, 26);
+
+  // [----------)
+  //           |
+  expect_range_partitions_conflict(0, 100, 99, 100);
+
+  /// Unbounded Above / Unbounded Above
+
+  //    [---------->
+  // [---------->
+  expect_range_partitions_conflict(0, boost::none, -10, boost::none);
+
+  // [---------->
+  // [---------->
+  expect_range_partitions_conflict(0, boost::none, 0, boost::none);
+
+  /// Unbounded Above / Unbounded Below
+
+  // [---------->
+  // <----------)
+  expect_range_partitions_conflict(0, boost::none, boost::none, 100);
+
+  //        [---------->
+  // <-------)
+  expect_range_partitions_conflict(0, boost::none, boost::none, 1);
+
+  /// Unbounded Above / Unbounded
+
+  // [---------->
+  // <---------->
+  expect_range_partitions_conflict(0, boost::none, boost::none, boost::none);
+
+  /// Unbounded Above / Single Value
+
+  // [---------->
+  // |
+  expect_range_partitions_conflict(0, boost::none, 0, 1);
+
+  // [---------->
+  //   |
+  expect_range_partitions_conflict(0, boost::none, 100, 101);
+
+  /// Unbounded Below / Unbounded Below
+
+  // <----------)
+  // <----------)
+  expect_range_partitions_conflict(boost::none, 100, boost::none, 100);
+
+  // <----------)
+  // <-----)
+  expect_range_partitions_conflict(boost::none, 100, boost::none, 50);
+
+  /// Unbounded Below / Unbounded
+
+  // <----------)
+  // <---------->
+  expect_range_partitions_conflict(boost::none, 100, boost::none, boost::none);
+
+  /// Unbounded Below / Single Value
+
+  // <----------)
+  //       |
+  expect_range_partitions_conflict(boost::none, 100, 50, 51);
+
+  // <----------)
+  //           |
+  expect_range_partitions_conflict(boost::none, 100, 99, 100);
+
+  /// Unbounded / Unbounded
+
+  // <---------->
+  // <---------->
+  expect_range_partitions_conflict(boost::none, boost::none, boost::none, boost::none);
+
+  /// Single Value / Single Value
+
+  // |
+  // |
+  expect_range_partitions_conflict(0, 1, 0, 1);
+}
+
 TEST_F(ReplicatedAlterTableTest, TestReplicatedAlter) {
   const int kNumRows = 100;
   InsertRows(0, kNumRows);
@@ -990,7 +1916,7 @@ TEST_F(ReplicatedAlterTableTest, TestReplicatedAlter) {
   VerifyRows(0, kNumRows, C1_MATCHES_INDEX);
 
   LOG(INFO) << "Dropping and adding back c1";
-  gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+  unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
   ASSERT_OK(table_alterer->DropColumn("c1")->Alter());
 
   ASSERT_OK(AddNewI32Column(kTableName, "c1", 0xdeadbeef));

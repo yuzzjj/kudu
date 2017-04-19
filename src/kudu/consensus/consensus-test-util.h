@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <boost/thread/locks.hpp>
+#include <boost/bind.hpp>
 #include <gmock/gmock.h>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -36,6 +37,7 @@
 #include "kudu/server/clock.h"
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/locks.h"
+#include "kudu/util/pb_util.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/threadpool.h"
 
@@ -46,8 +48,8 @@
   OpId TOKENPASTE2(_left, __LINE__) = (left); \
   OpId TOKENPASTE2(_right, __LINE__) = (right); \
   if (!consensus::OpIdEquals(TOKENPASTE2(_left, __LINE__), TOKENPASTE2(_right,__LINE__))) \
-    FAIL() << "Expected: " << TOKENPASTE2(_right,__LINE__).ShortDebugString() << "\n" \
-           << "Value: " << TOKENPASTE2(_left,__LINE__).ShortDebugString() << "\n"
+    FAIL() << "Expected: " << SecureShortDebugString(TOKENPASTE2(_right,__LINE__)) << "\n" \
+           << "Value: " << SecureShortDebugString(TOKENPASTE2(_left,__LINE__)) << "\n"
 
 namespace kudu {
 namespace consensus {
@@ -55,10 +57,10 @@ namespace consensus {
 using log::Log;
 using strings::Substitute;
 
-static gscoped_ptr<ReplicateMsg> CreateDummyReplicate(int term,
-                                                      int index,
+inline gscoped_ptr<ReplicateMsg> CreateDummyReplicate(int64_t term,
+                                                      int64_t index,
                                                       const Timestamp& timestamp,
-                                                      int payload_size) {
+                                                      int64_t payload_size) {
     gscoped_ptr<ReplicateMsg> msg(new ReplicateMsg);
     OpId* id = msg->mutable_id();
     id->set_term(term);
@@ -67,11 +69,11 @@ static gscoped_ptr<ReplicateMsg> CreateDummyReplicate(int term,
     msg->set_op_type(NO_OP);
     msg->mutable_noop_request()->mutable_payload_for_tests()->resize(payload_size);
     msg->set_timestamp(timestamp.ToUint64());
-    return msg.Pass();
+    return std::move(msg);
 }
 
 // Returns RaftPeerPB with given UUID and obviously-fake hostname / port combo.
-RaftPeerPB FakeRaftPeerPB(const std::string& uuid) {
+inline RaftPeerPB FakeRaftPeerPB(const std::string& uuid) {
   RaftPeerPB peer_pb;
   peer_pb.set_permanent_uuid(uuid);
   peer_pb.mutable_last_known_addr()->set_host(Substitute("$0-fake-hostname", CURRENT_TEST_NAME()));
@@ -84,25 +86,24 @@ RaftPeerPB FakeRaftPeerPB(const std::string& uuid) {
 // An operation will only be considered done (TestOperationStatus::IsDone()
 // will become true) once at least 'n_majority' peers have called
 // TestOperationStatus::AckPeer().
-static inline void AppendReplicateMessagesToQueue(
+inline void AppendReplicateMessagesToQueue(
     PeerMessageQueue* queue,
     const scoped_refptr<server::Clock>& clock,
-    int first,
-    int count,
-    int payload_size = 0) {
+    int64_t first,
+    int64_t count,
+    int64_t payload_size = 0) {
 
-  for (int i = first; i < first + count; i++) {
-    int term = i / 7;
-    int index = i;
+  for (int64_t i = first; i < first + count; i++) {
+    int64_t term = i / 7;
+    int64_t index = i;
     CHECK_OK(queue->AppendOperation(make_scoped_refptr_replicate(
         CreateDummyReplicate(term, index, clock->Now(), payload_size).release())));
   }
 }
 
 // Builds a configuration of 'num' voters.
-RaftConfigPB BuildRaftConfigPBForTests(int num) {
+inline RaftConfigPB BuildRaftConfigPBForTests(int num) {
   RaftConfigPB raft_config;
-  raft_config.set_local(false);
   for (int i = 0; i < num; i++) {
     RaftPeerPB* peer_pb = raft_config.add_peers();
     peer_pb->set_member_type(RaftPeerPB::VOTER);
@@ -131,7 +132,7 @@ class TestPeerProxy : public PeerProxy {
   // Register the RPC callback in order to call later.
   // We currently only support one request of each method being in flight at a time.
   virtual void RegisterCallback(Method method, const rpc::ResponseCallback& callback) {
-    boost::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard<simple_spinlock> lock(lock_);
     InsertOrDie(&callbacks_, method, callback);
   }
 
@@ -139,13 +140,15 @@ class TestPeerProxy : public PeerProxy {
   virtual void Respond(Method method) {
     rpc::ResponseCallback callback;
     {
-      boost::lock_guard<simple_spinlock> lock(lock_);
+      std::lock_guard<simple_spinlock> lock(lock_);
       callback = FindOrDie(callbacks_, method);
       CHECK_EQ(1, callbacks_.erase(method));
       // Drop the lock before submitting to the pool, since the callback itself may
       // destroy this instance.
     }
-    CHECK_OK(pool_->SubmitFunc(callback));
+    // If the peer has been closed while a response was in-flight, this can
+    // return a bad Status, but that's fine.
+    ignore_result(pool_->SubmitFunc(callback));
   }
 
   virtual void RegisterCallbackAndRespond(Method method, const rpc::ResponseCallback& callback) {
@@ -173,14 +176,14 @@ class DelayablePeerProxy : public TestPeerProxy {
   // Delay the answer to the next response to this remote
   // peer. The response callback will only be called on Respond().
   virtual void DelayResponse() {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     delay_response_ = true;
     latch_.Reset(1); // Reset for the next time.
   }
 
   virtual void RespondUnlessDelayed(Method method) {
     {
-      lock_guard<simple_spinlock> l(&lock_);
+      std::lock_guard<simple_spinlock> l(lock_);
       if (delay_response_) {
         latch_.CountDown();
         delay_response_ = false;
@@ -235,16 +238,16 @@ class MockedPeerProxy : public TestPeerProxy {
   }
 
   virtual void set_update_response(const ConsensusResponsePB& update_response) {
-    CHECK(update_response.IsInitialized()) << update_response.ShortDebugString();
+    CHECK(update_response.IsInitialized()) << SecureShortDebugString(update_response);
     {
-      lock_guard<simple_spinlock> l(&lock_);
+      std::lock_guard<simple_spinlock> l(lock_);
       update_response_ = update_response;
     }
   }
 
   virtual void set_vote_response(const VoteResponsePB& vote_response) {
     {
-      lock_guard<simple_spinlock> l(&lock_);
+      std::lock_guard<simple_spinlock> l(lock_);
       vote_response_ = vote_response;
     }
   }
@@ -254,7 +257,7 @@ class MockedPeerProxy : public TestPeerProxy {
                            rpc::RpcController* controller,
                            const rpc::ResponseCallback& callback) OVERRIDE {
     {
-      lock_guard<simple_spinlock> l(&lock_);
+      std::lock_guard<simple_spinlock> l(lock_);
       update_count_++;
       *response = update_response_;
     }
@@ -271,7 +274,7 @@ class MockedPeerProxy : public TestPeerProxy {
 
   // Return the number of times that UpdateAsync() has been called.
   int update_count() const {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     return update_count_;
   }
 
@@ -299,7 +302,7 @@ class NoOpTestPeerProxy : public TestPeerProxy {
 
     response->Clear();
     {
-      boost::lock_guard<simple_spinlock> lock(lock_);
+      std::lock_guard<simple_spinlock> lock(lock_);
       if (OpIdLessThan(last_received_, request->preceding_id())) {
         ConsensusErrorPB* error = response->mutable_status()->mutable_error();
         error->set_code(ConsensusErrorPB::PRECEDING_ENTRY_DIDNT_MATCH);
@@ -325,7 +328,7 @@ class NoOpTestPeerProxy : public TestPeerProxy {
                                          rpc::RpcController* controller,
                                          const rpc::ResponseCallback& callback) OVERRIDE {
     {
-      boost::lock_guard<simple_spinlock> lock(lock_);
+      std::lock_guard<simple_spinlock> lock(lock_);
       response->set_responder_uuid(peer_pb_.permanent_uuid());
       response->set_responder_term(request->candidate_term());
       response->set_vote_granted(true);
@@ -334,7 +337,7 @@ class NoOpTestPeerProxy : public TestPeerProxy {
   }
 
   const OpId& last_received() {
-    boost::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard<simple_spinlock> lock(lock_);
     return last_received_;
   }
 
@@ -367,7 +370,7 @@ class TestPeerMapManager {
   explicit TestPeerMapManager(const RaftConfigPB& config) : config_(config) {}
 
   void AddPeer(const std::string& peer_uuid, const scoped_refptr<RaftConsensus>& peer) {
-    boost::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard<simple_spinlock> lock(lock_);
     InsertOrDie(&peers_, peer_uuid, peer);
   }
 
@@ -378,7 +381,7 @@ class TestPeerMapManager {
 
   Status GetPeerByUuid(const std::string& peer_uuid,
                        scoped_refptr<RaftConsensus>* peer_out) const {
-    boost::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard<simple_spinlock> lock(lock_);
     if (!FindCopy(peers_, peer_uuid, peer_out)) {
       return Status::NotFound("Other consensus instance was destroyed");
     }
@@ -386,12 +389,12 @@ class TestPeerMapManager {
   }
 
   void RemovePeer(const std::string& peer_uuid) {
-    boost::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard<simple_spinlock> lock(lock_);
     peers_.erase(peer_uuid);
   }
 
   TestPeerMap GetPeerMapCopy() const {
-    boost::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard<simple_spinlock> lock(lock_);
     return peers_;
   }
 
@@ -402,7 +405,7 @@ class TestPeerMapManager {
     // destroys the test proxies which in turn reach into this class.
     TestPeerMap copy = peers_;
     {
-      boost::lock_guard<simple_spinlock> lock(lock_);
+      std::lock_guard<simple_spinlock> lock(lock_);
       peers_.clear();
     }
 
@@ -460,12 +463,12 @@ class LocalTestPeerProxy : public TestPeerProxy {
 
     bool miss_comm_copy;
     {
-      boost::lock_guard<simple_spinlock> lock(lock_);
+      std::lock_guard<simple_spinlock> lock(lock_);
       miss_comm_copy = miss_comm_;
       miss_comm_ = false;
     }
     if (PREDICT_FALSE(miss_comm_copy)) {
-      VLOG(2) << this << ": injecting fault on " << request->ShortDebugString();
+      VLOG(2) << this << ": injecting fault on " << SecureShortDebugString(*request);
       SetResponseError(Status::IOError("Artificial error caused by communication "
           "failure injection."), final_response);
     } else {
@@ -495,7 +498,7 @@ class LocalTestPeerProxy : public TestPeerProxy {
     }
     if (!s.ok()) {
       LOG(WARNING) << "Could not Update replica with request: "
-                   << other_peer_req.ShortDebugString()
+                   << SecureShortDebugString(other_peer_req)
                    << " Status: " << s.ToString();
       SetResponseError(s, &other_peer_resp);
     }
@@ -524,7 +527,7 @@ class LocalTestPeerProxy : public TestPeerProxy {
     }
     if (!s.ok()) {
       LOG(WARNING) << "Could not RequestVote from replica with request: "
-                   << other_peer_req.ShortDebugString()
+                   << SecureShortDebugString(other_peer_req)
                    << " Status: " << s.ToString();
       SetResponseError(s, &other_peer_resp);
     }
@@ -535,7 +538,7 @@ class LocalTestPeerProxy : public TestPeerProxy {
 
   void InjectCommFaultLeaderSide() {
     VLOG(2) << this << ": injecting fault next time";
-    boost::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard<simple_spinlock> lock(lock_);
     miss_comm_ = true;
   }
 
@@ -618,7 +621,7 @@ class TestDriver {
     gscoped_ptr<CommitMsg> msg(new CommitMsg);
     msg->set_op_type(round_->replicate_msg()->op_type());
     msg->mutable_commited_op_id()->CopyFrom(round_->id());
-    CHECK_OK(log_->AsyncAppendCommit(msg.Pass(),
+    CHECK_OK(log_->AsyncAppendCommit(std::move(msg),
                                      Bind(&TestDriver::CommitCallback, Unretained(this))));
   }
 
@@ -631,20 +634,10 @@ class TestDriver {
   Log* log_;
 };
 
-// Fake ReplicaTransactionFactory that allows for instantiating and unit
-// testing RaftConsensusState. Does not actually support running transactions.
-class MockTransactionFactory : public ReplicaTransactionFactory {
- public:
-  virtual Status StartReplicaTransaction(const scoped_refptr<ConsensusRound>& round) OVERRIDE {
-    return StartReplicaTransactionMock(round.get());
-  }
-  MOCK_METHOD1(StartReplicaTransactionMock, Status(ConsensusRound* round));
-};
-
 // A transaction factory for tests, usually this is implemented by TabletPeer.
 class TestTransactionFactory : public ReplicaTransactionFactory {
  public:
-  explicit TestTransactionFactory(Log* log) : consensus_(NULL),
+  explicit TestTransactionFactory(Log* log) : consensus_(nullptr),
                                               log_(log) {
 
     CHECK_OK(ThreadPoolBuilder("test-txn-factory").set_max_threads(1).Build(&pool_));
@@ -682,187 +675,6 @@ class TestTransactionFactory : public ReplicaTransactionFactory {
   gscoped_ptr<ThreadPool> pool_;
   Consensus* consensus_;
   Log* log_;
-};
-
-// Consensus fault hooks impl. that simply counts the number of calls to
-// each method.
-// Allows passing another hook instance so that we can use both.
-// If non-null, the passed hook instance will be called first for all methods.
-class CounterHooks : public Consensus::ConsensusFaultHooks {
- public:
-  explicit CounterHooks(
-      std::shared_ptr<Consensus::ConsensusFaultHooks> current_hook)
-      : current_hook_(std::move(current_hook)),
-        pre_start_calls_(0),
-        post_start_calls_(0),
-        pre_config_change_calls_(0),
-        post_config_change_calls_(0),
-        pre_replicate_calls_(0),
-        post_replicate_calls_(0),
-        pre_update_calls_(0),
-        post_update_calls_(0),
-        pre_shutdown_calls_(0),
-        post_shutdown_calls_(0) {}
-
-  virtual Status PreStart() OVERRIDE {
-    if (current_hook_.get()) RETURN_NOT_OK(current_hook_->PreStart());
-    boost::lock_guard<simple_spinlock> lock(lock_);
-    pre_start_calls_++;
-    return Status::OK();
-  }
-
-  virtual Status PostStart() OVERRIDE {
-    if (current_hook_.get()) RETURN_NOT_OK(current_hook_->PostStart());
-    boost::lock_guard<simple_spinlock> lock(lock_);
-    post_start_calls_++;
-    return Status::OK();
-  }
-
-  virtual Status PreConfigChange() OVERRIDE {
-    if (current_hook_.get()) RETURN_NOT_OK(current_hook_->PreConfigChange());
-    boost::lock_guard<simple_spinlock> lock(lock_);
-    pre_config_change_calls_++;
-    return Status::OK();
-  }
-
-  virtual Status PostConfigChange() OVERRIDE {
-    if (current_hook_.get()) RETURN_NOT_OK(current_hook_->PostConfigChange());
-    boost::lock_guard<simple_spinlock> lock(lock_);
-    post_config_change_calls_++;
-    return Status::OK();
-  }
-
-  virtual Status PreReplicate() OVERRIDE {
-    if (current_hook_.get()) RETURN_NOT_OK(current_hook_->PreReplicate());
-    boost::lock_guard<simple_spinlock> lock(lock_);
-    pre_replicate_calls_++;
-    return Status::OK();
-  }
-
-  virtual Status PostReplicate() OVERRIDE {
-    if (current_hook_.get()) RETURN_NOT_OK(current_hook_->PostReplicate());
-    boost::lock_guard<simple_spinlock> lock(lock_);
-    post_replicate_calls_++;
-    return Status::OK();
-  }
-
-  virtual Status PreUpdate() OVERRIDE {
-    if (current_hook_.get()) RETURN_NOT_OK(current_hook_->PreUpdate());
-    boost::lock_guard<simple_spinlock> lock(lock_);
-    pre_update_calls_++;
-    return Status::OK();
-  }
-
-  virtual Status PostUpdate() OVERRIDE {
-    if (current_hook_.get()) RETURN_NOT_OK(current_hook_->PostUpdate());
-    boost::lock_guard<simple_spinlock> lock(lock_);
-    post_update_calls_++;
-    return Status::OK();
-  }
-
-  virtual Status PreShutdown() OVERRIDE {
-    if (current_hook_.get()) RETURN_NOT_OK(current_hook_->PreShutdown());
-    boost::lock_guard<simple_spinlock> lock(lock_);
-    pre_shutdown_calls_++;
-    return Status::OK();
-  }
-
-  virtual Status PostShutdown() OVERRIDE {
-    if (current_hook_.get()) RETURN_NOT_OK(current_hook_->PostShutdown());
-    boost::lock_guard<simple_spinlock> lock(lock_);
-    post_shutdown_calls_++;
-    return Status::OK();
-  }
-
-  int num_pre_start_calls() {
-    boost::lock_guard<simple_spinlock> lock(lock_);
-    return pre_start_calls_;
-  }
-
-  int num_post_start_calls() {
-    boost::lock_guard<simple_spinlock> lock(lock_);
-    return post_start_calls_;
-  }
-
-  int num_pre_config_change_calls() {
-    boost::lock_guard<simple_spinlock> lock(lock_);
-    return pre_config_change_calls_;
-  }
-
-  int num_post_config_change_calls() {
-    boost::lock_guard<simple_spinlock> lock(lock_);
-    return post_config_change_calls_;
-  }
-
-  int num_pre_replicate_calls() {
-    boost::lock_guard<simple_spinlock> lock(lock_);
-    return pre_replicate_calls_;
-  }
-
-  int num_post_replicate_calls() {
-    boost::lock_guard<simple_spinlock> lock(lock_);
-    return post_replicate_calls_;
-  }
-
-  int num_pre_update_calls() {
-    boost::lock_guard<simple_spinlock> lock(lock_);
-    return pre_update_calls_;
-  }
-
-  int num_post_update_calls() {
-    boost::lock_guard<simple_spinlock> lock(lock_);
-    return post_update_calls_;
-  }
-
-  int num_pre_shutdown_calls() {
-    boost::lock_guard<simple_spinlock> lock(lock_);
-    return pre_shutdown_calls_;
-  }
-
-  int num_post_shutdown_calls() {
-    boost::lock_guard<simple_spinlock> lock(lock_);
-    return post_shutdown_calls_;
-  }
-
- private:
-  std::shared_ptr<Consensus::ConsensusFaultHooks> current_hook_;
-  int pre_start_calls_;
-  int post_start_calls_;
-  int pre_config_change_calls_;
-  int post_config_change_calls_;
-  int pre_replicate_calls_;
-  int post_replicate_calls_;
-  int pre_update_calls_;
-  int post_update_calls_;
-  int pre_shutdown_calls_;
-  int post_shutdown_calls_;
-
-  // Lock that protects updates to the counters.
-  mutable simple_spinlock lock_;
-};
-
-class TestRaftConsensusQueueIface : public PeerMessageQueueObserver {
- public:
-  bool IsMajorityReplicated(int64_t index) {
-    boost::lock_guard<simple_spinlock> lock(lock_);
-    return index <= majority_replicated_index_;
-  }
-
- protected:
-  virtual void UpdateMajorityReplicated(const OpId& majority_replicated,
-                                        OpId* committed_index) OVERRIDE {
-    boost::lock_guard<simple_spinlock> lock(lock_);
-    majority_replicated_index_ = majority_replicated.index();
-    committed_index->CopyFrom(majority_replicated);
-  }
-  virtual void NotifyTermChange(int64_t term) OVERRIDE {}
-  virtual void NotifyFailedFollower(const std::string& uuid,
-                                    int64_t term,
-                                    const std::string& reason) OVERRIDE {}
-
- private:
-  mutable simple_spinlock lock_;
-  int64_t majority_replicated_index_;
 };
 
 }  // namespace consensus

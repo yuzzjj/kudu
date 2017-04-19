@@ -65,6 +65,7 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   static Status CreateNew(FsManager* fs_manager,
                           const std::string& tablet_id,
                           const std::string& table_name,
+                          const std::string& table_id,
                           const Schema& schema,
                           const PartitionSchema& partition_schema,
                           const Partition& partition,
@@ -84,14 +85,17 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   static Status LoadOrCreate(FsManager* fs_manager,
                              const std::string& tablet_id,
                              const std::string& table_name,
+                             const std::string& table_id,
                              const Schema& schema,
                              const PartitionSchema& partition_schema,
                              const Partition& partition,
                              const TabletDataState& initial_tablet_data_state,
                              scoped_refptr<TabletMetadata>* metadata);
 
-  static void CollectBlockIdPBs(const TabletSuperBlockPB& superblock,
-                                std::vector<BlockIdPB>* block_ids);
+  static std::vector<BlockIdPB> CollectBlockIdPBs(
+      const TabletSuperBlockPB& superblock);
+
+  std::vector<BlockId> CollectBlockIds();
 
   const std::string& tablet_id() const {
     DCHECK_NE(state_, kNotLoadedYet);
@@ -130,7 +134,7 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
     return partition_schema_;
   }
 
-  // Set / get the remote bootstrap / tablet data state.
+  // Set / get the tablet copy / tablet data state.
   void set_tablet_data_state(TabletDataState state);
   TabletDataState tablet_data_state() const;
 
@@ -171,7 +175,9 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   // then delete all of the rowsets in this tablet.
   // The metadata (superblock) is not deleted. For that, call DeleteSuperBlock().
   //
-  // 'delete_type' must be one of TABLET_DATA_DELETED or TABLET_DATA_TOMBSTONED.
+  // 'delete_type' must be one of TABLET_DATA_DELETED, TABLET_DATA_TOMBSTONED,
+  // or TABLET_DATA_COPYING.
+  //
   // 'last_logged_opid' should be set to the last opid in the log, if any is known.
   // If 'last_logged_opid' is not set, then the current value of
   // last_logged_opid is not modified. This is important for roll-forward of
@@ -180,6 +186,11 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   // Returns only once all data has been removed.
   Status DeleteTabletData(TabletDataState delete_type,
                           const boost::optional<consensus::OpId>& last_logged_opid);
+
+  // Return true if this metadata references no blocks (either live or orphaned) and is
+  // already marked as tombstoned. If this is the case, then calling DeleteTabletData
+  // would be a no-op.
+  bool IsTombstonedWithNoBlocks() const;
 
   // Permanently deletes the superblock from the disk.
   // DeleteTabletData() must first be called and the tablet data state must be
@@ -233,8 +244,9 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   // TODO: get rid of this many-arg constructor in favor of just passing in a
   // SuperBlock, which already contains all of these fields.
   TabletMetadata(FsManager* fs_manager, std::string tablet_id,
-                 std::string table_name, const Schema& schema,
-                 PartitionSchema partition_schema, Partition partition,
+                 std::string table_name, std::string table_id,
+                 const Schema& schema, PartitionSchema partition_schema,
+                 Partition partition,
                  const TabletDataState& tablet_data_state);
 
   // Constructor for loading an existing tablet.
@@ -318,9 +330,9 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   std::vector<Schema*> old_schemas_;
 
   // Protected by 'data_lock_'.
-  std::unordered_set<BlockId, BlockIdHash, BlockIdEqual> orphaned_blocks_;
+  BlockIdSet orphaned_blocks_;
 
-  // The current state of remote bootstrap for the tablet.
+  // The current state of tablet copy for the tablet.
   TabletDataState tablet_data_state_;
 
   // Record of the last opid logged by the tablet before it was last

@@ -16,7 +16,7 @@
 // under the License.
 package kudu.consensus;
 
-option java_package = "org.kududb.consensus";
+option java_package = "org.apache.kudu.consensus";
 
 import "kudu/common/common.proto";
 
@@ -86,9 +86,11 @@ message RaftConfigPB {
   // It is left undefined if the operation isn't committed.
   optional int64 opid_index = 1;
 
-  // Whether this is a local or distributed configuration (i.e. whether to use a local or dist
-  // implementation of consensus).
-  optional bool local = 2 [default = true];
+  // Obsolete. This parameter has been retired.
+  optional bool OBSOLETE_local = 2;
+
+  // Flag to allow unsafe config change operations.
+  optional bool unsafe_config_change = 4 [ default = false ];
 
   // The set of peers in the configuration.
   repeated RaftPeerPB peers = 3;

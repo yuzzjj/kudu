@@ -16,6 +16,7 @@
 // under the License.
 #include "kudu/consensus/consensus_meta.h"
 
+#include <memory>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -25,8 +26,8 @@
 #include "kudu/consensus/opid_util.h"
 #include "kudu/consensus/quorum_util.h"
 #include "kudu/fs/fs_manager.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/util/net/net_util.h"
+#include "kudu/util/pb_util.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
@@ -37,6 +38,7 @@ namespace kudu {
 namespace consensus {
 
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 const char* kTabletId = "test-consensus-metadata";
@@ -45,7 +47,7 @@ const int64_t kInitialTerm = 3;
 class ConsensusMetadataTest : public KuduTest {
  public:
   ConsensusMetadataTest()
-    : fs_manager_(env_.get(), GetTestPath("fs_root")) {
+    : fs_manager_(env_, GetTestPath("fs_root")) {
   }
 
   virtual void SetUp() OVERRIDE {
@@ -54,9 +56,10 @@ class ConsensusMetadataTest : public KuduTest {
     ASSERT_OK(fs_manager_.Open());
 
     // Initialize test configuration.
-    config_.set_local(true);
-    config_.add_peers()->set_permanent_uuid(fs_manager_.uuid());
     config_.set_opid_index(kInvalidOpIdIndex);
+    RaftPeerPB* peer = config_.add_peers();
+    peer->set_permanent_uuid(fs_manager_.uuid());
+    peer->set_member_type(RaftPeerPB::VOTER);
   }
 
  protected:
@@ -73,7 +76,6 @@ void ConsensusMetadataTest::AssertValuesEqual(const ConsensusMetadata& cmeta,
                                               const string& permanant_uuid,
                                               int64_t term) {
   // Sanity checks.
-  ASSERT_TRUE(cmeta.committed_config().local());
   ASSERT_EQ(1, cmeta.committed_config().peers_size());
 
   // Value checks.
@@ -86,20 +88,20 @@ void ConsensusMetadataTest::AssertValuesEqual(const ConsensusMetadata& cmeta,
 TEST_F(ConsensusMetadataTest, TestCreateLoad) {
   // Create the file.
   {
-    gscoped_ptr<ConsensusMetadata> cmeta;
+    unique_ptr<ConsensusMetadata> cmeta;
     ASSERT_OK(ConsensusMetadata::Create(&fs_manager_, kTabletId, fs_manager_.uuid(),
                                         config_, kInitialTerm, &cmeta));
   }
 
   // Load the file.
-  gscoped_ptr<ConsensusMetadata> cmeta;
+  unique_ptr<ConsensusMetadata> cmeta;
   ASSERT_OK(ConsensusMetadata::Load(&fs_manager_, kTabletId, fs_manager_.uuid(), &cmeta));
   ASSERT_VALUES_EQUAL(*cmeta, kInvalidOpIdIndex, fs_manager_.uuid(), kInitialTerm);
 }
 
 // Ensure that we get an error when loading a file that doesn't exist.
 TEST_F(ConsensusMetadataTest, TestFailedLoad) {
-  gscoped_ptr<ConsensusMetadata> cmeta;
+  unique_ptr<ConsensusMetadata> cmeta;
   Status s = ConsensusMetadata::Load(&fs_manager_, kTabletId, fs_manager_.uuid(), &cmeta);
   ASSERT_TRUE(s.IsNotFound()) << "Unexpected status: " << s.ToString();
   LOG(INFO) << "Expected failure: " << s.ToString();
@@ -108,7 +110,7 @@ TEST_F(ConsensusMetadataTest, TestFailedLoad) {
 // Check that changes are not written to disk until Flush() is called.
 TEST_F(ConsensusMetadataTest, TestFlush) {
   const int64_t kNewTerm = 4;
-  gscoped_ptr<ConsensusMetadata> cmeta;
+  unique_ptr<ConsensusMetadata> cmeta;
   ASSERT_OK(ConsensusMetadata::Create(&fs_manager_, kTabletId, fs_manager_.uuid(),
                                       config_, kInitialTerm, &cmeta));
   cmeta->set_current_term(kNewTerm);
@@ -117,7 +119,7 @@ TEST_F(ConsensusMetadataTest, TestFlush) {
   // objects in flight that point to the same file, but for a test this is fine
   // since it's read-only.
   {
-    gscoped_ptr<ConsensusMetadata> cmeta_read;
+    unique_ptr<ConsensusMetadata> cmeta_read;
     ASSERT_OK(ConsensusMetadata::Load(&fs_manager_, kTabletId, fs_manager_.uuid(), &cmeta_read));
     ASSERT_VALUES_EQUAL(*cmeta_read, kInvalidOpIdIndex, fs_manager_.uuid(), kInitialTerm);
   }
@@ -125,7 +127,7 @@ TEST_F(ConsensusMetadataTest, TestFlush) {
   ASSERT_OK(cmeta->Flush());
 
   {
-    gscoped_ptr<ConsensusMetadata> cmeta_read;
+    unique_ptr<ConsensusMetadata> cmeta_read;
     ASSERT_OK(ConsensusMetadata::Load(&fs_manager_, kTabletId, fs_manager_.uuid(), &cmeta_read));
     ASSERT_VALUES_EQUAL(*cmeta_read, kInvalidOpIdIndex, fs_manager_.uuid(), kNewTerm);
   }
@@ -134,7 +136,6 @@ TEST_F(ConsensusMetadataTest, TestFlush) {
 // Builds a distributed configuration of voters with the given uuids.
 RaftConfigPB BuildConfig(const vector<string>& uuids) {
   RaftConfigPB config;
-  config.set_local(false);
   for (const string& uuid : uuids) {
     RaftPeerPB* peer = config.add_peers();
     peer->set_permanent_uuid(uuid);
@@ -151,7 +152,7 @@ TEST_F(ConsensusMetadataTest, TestActiveRole) {
   RaftConfigPB config1 = BuildConfig(uuids); // We aren't a member of this config...
   config1.set_opid_index(1);
 
-  gscoped_ptr<ConsensusMetadata> cmeta;
+  unique_ptr<ConsensusMetadata> cmeta;
   ASSERT_OK(ConsensusMetadata::Create(&fs_manager_, kTabletId, peer_uuid,
                                       config1, kInitialTerm, &cmeta));
 
@@ -196,12 +197,13 @@ TEST_F(ConsensusMetadataTest, TestToConsensusStatePB) {
 
   RaftConfigPB committed_config = BuildConfig(uuids); // We aren't a member of this config...
   committed_config.set_opid_index(1);
-  gscoped_ptr<ConsensusMetadata> cmeta;
+  unique_ptr<ConsensusMetadata> cmeta;
   ASSERT_OK(ConsensusMetadata::Create(&fs_manager_, kTabletId, peer_uuid,
                                       committed_config, kInitialTerm, &cmeta));
 
   uuids.push_back(peer_uuid);
   RaftConfigPB pending_config = BuildConfig(uuids);
+  pending_config.set_opid_index(2);
 
   // Set the pending configuration to be one containing the current leader (who is not
   // in the committed configuration). Ensure that the leader shows up when we ask for
@@ -228,14 +230,15 @@ TEST_F(ConsensusMetadataTest, TestToConsensusStatePB) {
 }
 
 // Helper for TestMergeCommittedConsensusStatePB.
-static void AssertConsensusMergeExpected(const gscoped_ptr<ConsensusMetadata>& cmeta,
+static void AssertConsensusMergeExpected(const unique_ptr<ConsensusMetadata>& cmeta,
                                          const ConsensusStatePB& cstate,
                                          int64_t expected_term,
                                          const string& expected_voted_for) {
   // See header docs for ConsensusMetadata::MergeCommittedConsensusStatePB() for
   // a "spec" of these assertions.
   ASSERT_TRUE(!cmeta->has_pending_config());
-  ASSERT_EQ(cmeta->committed_config().ShortDebugString(), cstate.config().ShortDebugString());
+  ASSERT_EQ(SecureShortDebugString(cmeta->committed_config()),
+            SecureShortDebugString(cstate.config()));
   ASSERT_EQ("", cmeta->leader_uuid());
   ASSERT_EQ(expected_term, cmeta->current_term());
   if (expected_voted_for.empty()) {
@@ -251,11 +254,11 @@ TEST_F(ConsensusMetadataTest, TestMergeCommittedConsensusStatePB) {
 
   RaftConfigPB committed_config = BuildConfig(uuids); // We aren't a member of this config...
   committed_config.set_opid_index(1);
-  gscoped_ptr<ConsensusMetadata> cmeta;
+  unique_ptr<ConsensusMetadata> cmeta;
   ASSERT_OK(ConsensusMetadata::Create(&fs_manager_, kTabletId, "e",
                                       committed_config, 1, &cmeta));
 
-  uuids.push_back("e");
+  uuids.emplace_back("e");
   RaftConfigPB pending_config = BuildConfig(uuids);
   cmeta->set_pending_config(pending_config);
   cmeta->set_leader_uuid("e");

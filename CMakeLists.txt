@@ -15,12 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Require cmake that supports BYPRODUCTS in add_custom_command() [1].
+# Require cmake that can build LLVM [1].
 #
 # Note: cmake in thirdparty/ will always meet this minimum.
 #
-# 1. https://cmake.org/Bug/view.php?id=14963
-cmake_minimum_required(VERSION 3.2.0)
+# 1. http://llvm.org/releases/3.9.0/docs/ReleaseNotes.html
+cmake_minimum_required(VERSION 3.4.3)
 
 # Prevent builds from the top-level source directory. This ensures that build
 # output is well isolated from the source tree.
@@ -45,22 +45,22 @@ endif()
 # build/<first build directory>
 # build/<second build directory>
 # ...
-if ("${CMAKE_CURRENT_BINARY_DIR}" MATCHES "^${CMAKE_CURRENT_SOURCE_DIR}/build/[^/]+$")
-  if ("${CMAKE_CURRENT_BINARY_DIR}" MATCHES "^${CMAKE_CURRENT_SOURCE_DIR}/build/latest")
-    message(FATAL_ERROR "Should not run cmake inside the build/latest symlink. "
-            "First change directories into the destination of the symlink.")
-  endif()
-  if (NOT APPLE)
-    set(MORE_ARGS "-T")
-  endif()
-
+if ("${CMAKE_CURRENT_BINARY_DIR}" STREQUAL
+    "${CMAKE_CURRENT_SOURCE_DIR}/build/latest")
+  message(FATAL_ERROR "Should not run cmake inside the build/latest symlink. "
+    "First change directories into the destination of the symlink.")
+endif()
+string(REPLACE "${CMAKE_CURRENT_SOURCE_DIR}/build/" ""
+  BLESSED_BUILD_SUBDIR "${CMAKE_CURRENT_BINARY_DIR}")
+string(FIND "${BLESSED_BUILD_SUBDIR}" "/" SLASH_POS)
+if (SLASH_POS EQUAL -1)
   # Create the symlink both during cmake invocation and when the default target
   # ('all') is built. The former is useful for scripts that, after running
   # cmake, only build a single target (i.e. "make lint").
-  execute_process(COMMAND ln ${MORE_ARGS} -sf ${CMAKE_CURRENT_BINARY_DIR}
+  execute_process(COMMAND ln ${MORE_ARGS} -nsf ${CMAKE_CURRENT_BINARY_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/build/latest)
   add_custom_target(latest_symlink ALL
-    ln ${MORE_ARGS} -sf ${CMAKE_CURRENT_BINARY_DIR}
+    ln ${MORE_ARGS} -nsf ${CMAKE_CURRENT_BINARY_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/build/latest
     COMMENT "Recreating ../build/latest symlink")
 
@@ -81,16 +81,32 @@ set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake_modules")
 include(CMakeParseArguments)
 
 set(BUILD_SUPPORT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/build-support)
+set(THIRDPARTY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty)
+set(THIRDPARTY_INSTALL_DIR ${THIRDPARTY_DIR}/installed)
+set(THIRDPARTY_INSTALL_COMMON_DIR ${THIRDPARTY_INSTALL_DIR}/common)
+set(THIRDPARTY_INSTALL_UNINSTRUMENTED_DIR ${THIRDPARTY_INSTALL_DIR}/uninstrumented)
+set(THIRDPARTY_INSTALL_TSAN_DIR ${THIRDPARTY_INSTALL_DIR}/tsan)
 
 # Allow "make install" to not depend on all targets.
 #
 # Must be declared in the top-level CMakeLists.txt.
 set(CMAKE_SKIP_INSTALL_ALL_DEPENDENCY true)
 
+# Codegen-dependent executables need to be linked with -rdynamic; otherwise LLVM
+# can't find dependent Kudu symbols at runtime.
+#
+# Setting the ENABLE_EXPORTS target property for each codegen-dependent
+# executable is more precise, but that's a rather long target list, so we'll
+# just do it once here for all Kudu executables.
+set(CMAKE_ENABLE_EXPORTS true)
+
 # Make sure thirdparty stuff is up-to-date.
 if ("$ENV{NO_REBUILD_THIRDPARTY}" STREQUAL "")
+  if (${KUDU_USE_TSAN})
+    set(TP_ARGS "tsan")
+  endif()
   execute_process(
-    COMMAND ${CMAKE_SOURCE_DIR}/thirdparty/build-if-necessary.sh
+    COMMAND ${THIRDPARTY_DIR}/build-if-necessary.sh ${TP_ARGS}
     RESULT_VARIABLE THIRDPARTY_SCRIPT_RESULT)
   if (NOT (${THIRDPARTY_SCRIPT_RESULT} EQUAL 0))
     message(FATAL_ERROR "Thirdparty was built unsuccessfully, terminating.")
@@ -110,29 +126,27 @@ endif()
 
 # compiler flags that are common across debug/release builds
 #  - msse4.2: Enable sse4.2 compiler intrinsics.
+set(CXX_COMMON_FLAGS "-msse4.2")
 #  - Wall: Enable all warnings.
+set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wall")
 #  - Wno-sign-compare: suppress warnings for comparison between signed and unsigned
 #    integers
+set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wno-sign-compare")
 #  -Wno-deprecated: some of the gutil code includes old things like ext/hash_set, ignore that
+set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wno-deprecated")
 #  - pthread: enable multithreaded malloc
+set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -pthread")
 #  -fno-strict-aliasing
 #     Assume programs do not follow strict aliasing rules.
 #     GCC cannot always verify whether strict aliasing rules are indeed followed due to
 #     fundamental limitations in escape analysis, which can result in subtle bad code generation.
 #     This has a small perf hit but worth it to avoid hard to debug crashes.
-set(CXX_COMMON_FLAGS "-fno-strict-aliasing -msse4.2 -Wall -Wno-sign-compare -Wno-deprecated -pthread")
+set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -fno-strict-aliasing")
+#  -DBOOST_DATE_TIME_POSIX_TIME_STD_CONFIG: enable nanosecond precision for boost
+set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -DBOOST_DATE_TIME_POSIX_TIME_STD_CONFIG")
 
 # We want access to the PRI* print format macros.
 add_definitions(-D__STDC_FORMAT_MACROS)
-
-# Explicitly disable the new gcc5 ABI. Until clang supports abi tags [1], Kudu's
-# generated code (which always uses clang) must be built against the old ABI.
-# There's no recourse for using both ABIs in the same process; gcc's advice [2]
-# is to build everything against the old ABI.
-#
-# 1. https://llvm.org/bugs/show_bug.cgi?id=23529
-# 2. https://gcc.gnu.org/onlinedocs/libstdc++/manual/using_dual_abi.html
-add_definitions(-D_GLIBCXX_USE_CXX11_ABI=0)
 
 # We want short macros from util/status.h.
 add_definitions(-DKUDU_HEADERS_USE_SHORT_STATUS_MACROS=1)
@@ -169,7 +183,9 @@ set(CXX_FLAGS_FASTDEBUG "-ggdb -O1 -fno-omit-frame-pointer")
 set(CXX_FLAGS_RELEASE "-O3 -g -DNDEBUG -fno-omit-frame-pointer")
 
 if (NOT "${KUDU_USE_LTO}" STREQUAL "")
-  set(CXX_FLAGS_RELEASE "${CXX_FLAGS_RELEASE} flto -fno-use-linker-plugin")
+  set(CXX_FLAGS_RELEASE "${CXX_FLAGS_RELEASE} -flto -fuse-ld=lld")
+  set(CMAKE_AR "llvm-ar")
+  set(CMAKE_RANLIB "llvm-ranlib")
 endif()
 
 set(CXX_FLAGS_PROFILE_GEN "${CXX_FLAGS_RELEASE} -fprofile-generate")
@@ -221,26 +237,44 @@ if ("${COMPILER_FAMILY}" STREQUAL "clang")
   # Clang generates ambiguous member template warnings when calling the ev++ api.
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-ambiguous-member-template")
 
+  # Emit a warning when the method/function marked as deprecated
+  # in its in-line documentation but lacks the deprecated attribute
+  # ATTRIBUTE_DEPRECATED in its signature.
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wdocumentation-deprecated-sync")
+
   # Only hardcode -fcolor-diagnostics if stderr is opened on a terminal. Otherwise
   # the color codes show up as noisy artifacts.
   #
   # This test is imperfect because 'cmake' and 'make' can be run independently
   # (with different terminal options), and we're testing during the former.
+  #
+  # We also provide a manual override as -DKUDU_FORCE_COLOR_DIAGNOSTICS=1 or
+  # by setting an environment variable of the same name.
   execute_process(COMMAND test -t 2 RESULT_VARIABLE KUDU_IS_TTY)
-  if ((${KUDU_IS_TTY} EQUAL 0) AND (NOT ("$ENV{TERM}" STREQUAL "dumb")))
+  if ((NOT "${KUDU_FORCE_COLOR_DIAGNOSTICS}" STREQUAL "") OR
+      (NOT "$ENV{KUDU_FORCE_COLOR_DIAGNOSTICS}" STREQUAL "") OR
+      ((${KUDU_IS_TTY} EQUAL 0) AND (NOT ("$ENV{TERM}" STREQUAL "dumb"))))
     message("Running in a controlling terminal")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fcolor-diagnostics")
   else()
     message("Running without a controlling terminal or in a dumb terminal")
   endif()
 elseif("${COMPILER_FAMILY}" STREQUAL "gcc")
-  # Blacklist gcc versions known to generate broken optimized code.
-  #
-  # See KUDU-1030 for more details.
-  if ("${COMPILER_VERSION}" MATCHES "^4.[67]")
-    message(FATAL_ERROR "Building with gcc version ${COMPILER_VERSION} is "
-      "forbidden as it is known to produce broken code in release mode. "
-      "Upgrade gcc, or build with clang from the thirdparty directory.")
+  # Disallow GCC < 4.8, since it doesn't support the C++11 standard
+  # well enough for us.
+  if ("${COMPILER_VERSION}" VERSION_LESS "4.8")
+    message(FATAL_ERROR "GCC <4.8 not supported. Consider using "
+        "thirdparty/clang-toolchain/ to build on older hosts.")
+  endif()
+
+  # GCC 4.8's tree vectorizer has a bug which causes hard-to-debug incorrect
+  # code. Disable this option on release builds, where it would otherwise
+  # be enabled by -O3.
+  if ("${COMPILER_VERSION}" MATCHES "^4.8" AND
+      "${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE")
+    message("Running release build on gcc 4.8. The tree-vectorize optimization "
+      "in this version of gcc is known to be buggy. Disabling it.")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-tree-vectorize")
   endif()
 endif()
 
@@ -327,11 +361,12 @@ if (${KUDU_USE_TSAN})
   add_definitions("-D_GLIBCXX_EXTERN_TEMPLATE=0")
 
   # Compile and link against the thirdparty TSAN instrumented libstdcxx.
-  set(TSAN_GCC_DIR "${CMAKE_SOURCE_DIR}/thirdparty/installed-deps-tsan/gcc")
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-rpath,${TSAN_GCC_DIR}/lib -fsanitize=thread")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -nostdinc++ -L${TSAN_GCC_DIR}/lib")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -isystem ${TSAN_GCC_DIR}/include/c++/4.9.3")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -isystem ${TSAN_GCC_DIR}/include/c++/4.9.3/backward")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-rpath,${THIRDPARTY_INSTALL_TSAN_DIR}/lib")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=thread")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -nostdinc++")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -L${THIRDPARTY_INSTALL_TSAN_DIR}/lib")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -isystem ${THIRDPARTY_INSTALL_TSAN_DIR}/include/c++/v1")
 
   # Strictly speaking, TSAN doesn't require dynamic linking. But it does
   # require all code to be position independent, and the easiest way to
@@ -364,22 +399,13 @@ endif()
 
 # Code coverage
 if ("${KUDU_GENERATE_COVERAGE}")
-  if("${CMAKE_CXX_COMPILER}" MATCHES ".*clang.*")
-    # There appears to be some bugs in clang 3.3 which cause code coverage
-    # to have link errors, not locating the llvm_gcda_* symbols.
-    # This should be fixed in llvm 3.4 with http://llvm.org/viewvc/llvm-project?view=revision&revision=184666
-    message(SEND_ERROR "Cannot currently generate coverage with clang")
-  endif()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --coverage -DCOVERAGE_BUILD")
 
-  # For coverage to work properly, we need to use static linkage. Otherwise,
-  # __gcov_flush() doesn't properly flush coverage from every module.
-  # See http://stackoverflow.com/questions/28164543/using-gcov-flush-within-a-library-doesnt-force-the-other-modules-to-yield-gc
-  if("${KUDU_LINK}" STREQUAL "a")
-    message("Using static linking for coverage build")
-    set(KUDU_LINK "s")
-  elseif("${KUDU_LINK}" STREQUAL "d")
-    message(SEND_ERROR "Cannot use coverage with static linking")
+  if(NOT "${COMPILER_FAMILY}" STREQUAL "clang")
+    # Use clang for coverage builds so that we can standardize on a single
+    # compiler. clang also handles flushing coverage from shared libraries
+    # better than gcc.
+    message(SEND_ERROR "Must use clang for coverage build")
   endif()
 endif()
 
@@ -444,12 +470,22 @@ file(MAKE_DIRECTORY "${EXECUTABLE_OUTPUT_PATH}")
 
 include_directories(${CMAKE_CURRENT_BINARY_DIR}/src)
 include_directories(src)
+include_directories(SYSTEM ${THIRDPARTY_INSTALL_COMMON_DIR}/include)
 
 ############################################################
 # Visibility
 ############################################################
 # For generate_export_header() and add_compiler_export_flags().
 include(GenerateExportHeader)
+
+# Honor visibility properties for all target types. See
+# "cmake --help-policy CMP0063" for details.
+#
+# This policy was only added to cmake in version 3.3, so until the cmake in
+# thirdparty is updated, we must check if the policy exists before setting it.
+if(POLICY CMP0063)
+  cmake_policy(SET CMP0063 NEW)
+endif()
 
 # add_library() wrapper that adds a second variant of the library for use in the
 # exported Kudu C++ client. This variant is suffixed with "_exported" and is
@@ -526,7 +562,16 @@ function(ADD_EXPORTABLE_LIBRARY LIB_NAME)
   # - default for classes annotated with KUDU_EXPORT.
   # - hidden for classes annotated with KUDU_NO_EXPORT.
   # - hidden for everything else.
+if(POLICY CMP0063)
+  set_target_properties(${EXPORTED_LIB_NAME}
+    PROPERTIES C_VISIBILITY_PRESET hidden)
+  set_target_properties(${EXPORTED_LIB_NAME}
+    PROPERTIES CXX_VISIBILITY_PRESET hidden)
+  set_target_properties(${EXPORTED_LIB_NAME}
+    PROPERTIES VISIBILITY_INLINES_HIDDEN 1)
+else()
   add_compiler_export_flags(EXPORTED_FLAGS)
+endif()
 
   # Exported variants are either static archives that will be linked to a shared
   # object, or shared objects. Either way, -fPIC is needed.
@@ -584,6 +629,15 @@ endfunction()
 # Testing
 ############################################################
 
+# Add a new binary that is compiled just like a unit test but is not executed
+# by or registered with "ctest". Useful for writing tests that use the Google
+# Test infrastructure but cannot or should not be run pre-commit.
+function(ADD_KUDU_TEST_NO_CTEST REL_TEST_NAME)
+  get_filename_component(TEST_NAME ${REL_TEST_NAME} NAME_WE)
+  add_executable(${TEST_NAME} "${REL_TEST_NAME}.cc")
+  target_link_libraries(${TEST_NAME} ${KUDU_TEST_LINK_LIBS})
+endfunction()
+
 # Add a new test case, with or without an executable that should be built.
 #
 # REL_TEST_NAME is the name of the test. It may be a single component
@@ -596,14 +650,14 @@ function(ADD_KUDU_TEST REL_TEST_NAME)
   if(NO_TESTS)
     return()
   endif()
+
   get_filename_component(TEST_NAME ${REL_TEST_NAME} NAME_WE)
 
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${REL_TEST_NAME}.cc)
     # This test has a corresponding .cc file, set it up as an executable.
     set(TEST_PATH "${EXECUTABLE_OUTPUT_PATH}/${TEST_NAME}")
-    add_executable(${TEST_NAME} "${REL_TEST_NAME}.cc")
-    target_link_libraries(${TEST_NAME} ${KUDU_TEST_LINK_LIBS})
-  else()
+    ADD_KUDU_TEST_NO_CTEST(${REL_TEST_NAME})
+  elseif(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${REL_TEST_NAME})
     # No executable, just invoke the test (probably a script) directly.
     get_filename_component(TEST_NAME_WITH_EXT ${REL_TEST_NAME} NAME)
     set(TEST_PATH "${EXECUTABLE_OUTPUT_PATH}/${TEST_NAME_WITH_EXT}")
@@ -613,6 +667,8 @@ function(ADD_KUDU_TEST REL_TEST_NAME)
     # on an add_custom_command() that copies the test file into place).
     execute_process(COMMAND ln -sf ${CMAKE_CURRENT_SOURCE_DIR}/${REL_TEST_NAME}
       ${EXECUTABLE_OUTPUT_PATH})
+  else()
+    message(FATAL_ERROR "Neither ${REL_TEST_NAME} nor ${REL_TEST_NAME}.cc were found in ${CMAKE_CURRENT_SOURCE_DIR}/")
   endif()
 
   add_test(${TEST_NAME}
@@ -691,14 +747,11 @@ function(ADD_THIRDPARTY_LIB LIB_NAME)
 endfunction()
 
 # Look in thirdparty prefix paths before anywhere else for system dependencies.
-set(THIRDPARTY_PREFIX ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/installed)
-set(CMAKE_PREFIX_PATH ${THIRDPARTY_PREFIX} ${CMAKE_PREFIX_PATH})
+set(CMAKE_PREFIX_PATH ${THIRDPARTY_INSTALL_COMMON_DIR} ${CMAKE_PREFIX_PATH})
 if (${KUDU_USE_TSAN})
-  set(CMAKE_PREFIX_PATH ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/installed-deps-tsan
-      ${CMAKE_PREFIX_PATH})
+  set(CMAKE_PREFIX_PATH ${THIRDPARTY_INSTALL_TSAN_DIR} ${CMAKE_PREFIX_PATH})
 else()
-  set(CMAKE_PREFIX_PATH ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/installed-deps
-      ${CMAKE_PREFIX_PATH})
+  set(CMAKE_PREFIX_PATH ${THIRDPARTY_INSTALL_UNINSTRUMENTED_DIR} ${CMAKE_PREFIX_PATH})
 endif()
 
 ## Cyrus SASL
@@ -791,6 +844,40 @@ include_directories(SYSTEM ${SQUEASEL_INCLUDE_DIR})
 ADD_THIRDPARTY_LIB(squeasel
   STATIC_LIB "${SQUEASEL_STATIC_LIB}")
 
+## OpenSSL
+##
+## Version 1.0.0 or higher is required because we are using the following
+## features introduced started OpenSSL 1.0.0:
+##   * The new breed of functions to work with the X509_EXTENSION stack
+##   * automatic usage of &errno as a safe per-thread identifier
+##
+## If having multiple OpenSSL libraries installed on the system,
+## use the OPENSSL_ROOT_DIR cmake flag to specify where to look for the proper
+## version of the OpenSSL framework/library, e.g.
+##
+##   cmake -DOPENSSL_ROOT_DIR=/usr/local/opt/openssl ...
+##
+## If no such OPENSSL_ROOT_DIR is specified, and we see that there is an OpenSSL
+## binary in thirdparty (deposited there by thirdparty/install-openssl-el6-workaround.sh)
+## then we'll use that one. See that script for more information.
+set(CENTOS_6_4_OPENSSL_DIR "${THIRDPARTY_INSTALL_DIR}/openssl-el6-workaround/usr/")
+if (NOT "${OPENSSL_ROOT_DIR}" AND
+    EXISTS "${CENTOS_6_4_OPENSSL_DIR}")
+  set(OPENSSL_ROOT_DIR "${CENTOS_6_4_OPENSSL_DIR}")
+endif()
+find_package(OpenSSL 1.0.0 REQUIRED)
+include_directories(${OPENSSL_INCLUDE_DIR})
+ADD_THIRDPARTY_LIB(openssl_ssl
+  SHARED_LIB "${OPENSSL_SSL_LIBRARY}")
+ADD_THIRDPARTY_LIB(openssl_crypto
+  SHARED_LIB "${OPENSSL_CRYPTO_LIBRARY}")
+
+## Kerberos
+find_package(Kerberos REQUIRED)
+include_directories(${KERBEROS_INCLUDE_DIR})
+ADD_THIRDPARTY_LIB(krb5
+  SHARED_LIB "${KERBEROS_LIBRARY}")
+
 ## Google PerfTools
 ##
 ## Disabled with TSAN/ASAN as well as with gold+dynamic linking (see comment
@@ -810,13 +897,20 @@ if (NOT "${KUDU_USE_ASAN}" AND
   set(KUDU_TCMALLOC_AVAILABLE 1)
 endif()
 
-# libvmem
+# Required pmem libraries
 if (NOT APPLE)
-  find_package(Vmem REQUIRED)
-  include_directories(SYSTEM ${VMEM_INCLUDE_DIR})
-  ADD_THIRDPARTY_LIB(vmem
-    STATIC_LIB "${VMEM_STATIC_LIB}"
-    SHARED_LIB "${VMEM_SHARED_LIB}")
+find_package(Pmem REQUIRED)
+include_directories(${PMEM_INCLUDE_DIR})
+ADD_THIRDPARTY_LIB(vmem
+  STATIC_LIB "${VMEM_STATIC_LIB}"
+  SHARED_LIB "${VMEM_SHARED_LIB}")
+ADD_THIRDPARTY_LIB(pmem
+  STATIC_LIB "${PMEM_STATIC_LIB}"
+  SHARED_LIB "${PMEM_SHARED_LIB}")
+ADD_THIRDPARTY_LIB(pmemobj
+  STATIC_LIB "${PMEMOBJ_STATIC_LIB}"
+  SHARED_LIB "${PMEMOBJ_SHARED_LIB}"
+  DEPS ${PMEMOBJ_DEPS})
 endif()
 
 ## curl
@@ -829,10 +923,18 @@ ADD_THIRDPARTY_LIB(crcutil
   STATIC_LIB "${CRCUTIL_STATIC_LIB}"
   SHARED_LIB "${CRCUTIL_SHARED_LIB}")
 
+## breakpad
+if (NOT APPLE)
+  find_package(BreakpadClient REQUIRED)
+  include_directories(SYSTEM ${BREAKPAD_CLIENT_INCLUDE_DIR})
+  ADD_THIRDPARTY_LIB(breakpad_client
+    STATIC_LIB "${BREAKPAD_CLIENT_STATIC_LIB}"
+    SHARED_LIB "${BREAKPAD_CLIENT_SHARED_LIB}")
+endif()
+
 ## llvm
 # Note that llvm has a unique cmake setup. See kudu/codegen/CMakeLists.txt
 # for details.
-set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${THIRDPARTY_PREFIX}/share/llvm)
 find_package(LLVM REQUIRED CONFIG)
 if(${LLVM_PACKAGE_VERSION} VERSION_LESS 3.4)
   message(FATAL_ERROR "LLVM version (${LLVM_PACKAGE_VERSION}) must be at least 3.4")
@@ -848,58 +950,41 @@ if (NOT APPLE)
   endif()
   ADD_THIRDPARTY_LIB(rt
     SHARED_LIB "${RT_LIB_PATH}")
+
+  find_library(DL_LIB_PATH dl)
+  if(NOT DL_LIB_PATH)
+    message(FATAL_ERROR "Could not find libdl on the system path")
+  endif()
+  ADD_THIRDPARTY_LIB(dl
+    SHARED_LIB "${DL_LIB_PATH}")
+endif()
+
+## Kerberos binaries (kinit, kadmin, etc).
+if (NOT NO_TESTS)
+  ## We rely on the Kerberos binaries for testing security.
+  find_package(KerberosPrograms)
+endif()
+
+# The tests as well as any binaries which are run as subprocesses by tests (eg tserver,
+# master, and the 'kudu' CLI tool) need to link this in. We have to set it
+# here so it's accessible by all targets.
+#
+# OSX doesn't support the linker flag below, but also has a new enough krb5 that the
+# override library isn't necessary.
+if (NOT APPLE)
+set(KRB5_REALM_OVERRIDE -Wl,--undefined=krb5_realm_override_loaded krb5_realm_override)
 endif()
 
 ## Boost
-# It's important that Boost come last in the list of packages, because it's the only
-# dependency that we don't currently bundle in thirdparty/. If we put this earlier
-# in list, then we might end up with /usr/local/include taking precedence over
-# thirdparty/installed/include and pulling in the wrong version of other dependencies
-# that might be installed in the system.
 
-### Workaround for http://stackoverflow.com/questions/9948375/cmake-find-package-succeeds-but-returns-wrong-path
-set(Boost_NO_BOOST_CMAKE ON)
+# We use a custom cmake module and not cmake's FindBoost.
+# see: cmake_modules/FindKuduBoost.cmake
+find_package(KuduBoost REQUIRED)
+include_directories(SYSTEM ${BOOST_INCLUDE_DIR})
 
-# Find Boost static libraries.
-set(Boost_USE_STATIC_LIBS ON)
-find_package(Boost COMPONENTS system thread REQUIRED)
-set(BOOST_STATIC_LIBS ${Boost_LIBRARIES})
-list(LENGTH BOOST_STATIC_LIBS BOOST_STATIC_LIBS_LEN)
-list(SORT BOOST_STATIC_LIBS)
-
-# Find Boost shared libraries.
-set(Boost_USE_STATIC_LIBS OFF)
-find_package(Boost COMPONENTS system thread REQUIRED)
-set(BOOST_SHARED_LIBS ${Boost_LIBRARIES})
-list(LENGTH BOOST_SHARED_LIBS BOOST_SHARED_LIBS_LEN)
-list(SORT BOOST_SHARED_LIBS)
-
-# We should have found the same number of libraries both times.
-if(NOT ${BOOST_SHARED_LIBS_LEN} EQUAL ${BOOST_STATIC_LIBS_LEN})
-  set(ERROR_MSG "Boost static and shared libraries are inconsistent.")
-  set(ERROR_MSG "${ERROR_MSG} Static libraries: ${BOOST_STATIC_LIBS}.")
-  set(ERROR_MSG "${ERROR_MSG} Shared libraries: ${BOOST_SHARED_LIBS}.")
-  message(FATAL_ERROR "${ERROR_MSG}")
-endif()
-
-# Add each pair of static/shared libraries.
-math(EXPR LAST_IDX "${BOOST_STATIC_LIBS_LEN} - 1")
-foreach(IDX RANGE ${LAST_IDX})
-  list(GET BOOST_STATIC_LIBS ${IDX} BOOST_STATIC_LIB)
-  list(GET BOOST_SHARED_LIBS ${IDX} BOOST_SHARED_LIB)
-
-  # Remove the prefix/suffix from the library name.
-  #
-  # e.g. libboost_system-mt --> boost_system
-  get_filename_component(LIB_NAME ${BOOST_STATIC_LIB} NAME_WE)
-  string(REGEX REPLACE "lib([^-]*)(-mt)?" "\\1" LIB_NAME_NO_PREFIX_SUFFIX ${LIB_NAME})
-  ADD_THIRDPARTY_LIB(${LIB_NAME_NO_PREFIX_SUFFIX}
-    STATIC_LIB "${BOOST_STATIC_LIB}"
-    SHARED_LIB "${BOOST_SHARED_LIB}")
-  list(APPEND KUDU_BASE_LIBS ${LIB_NAME_NO_PREFIX_SUFFIX})
-endforeach()
-include_directories(SYSTEM ${Boost_INCLUDE_DIR})
-
+ADD_THIRDPARTY_LIB(boost_date_time
+    STATIC_LIB "${BOOST_DATE_TIME_STATIC_LIB}"
+    SHARED_LIB "${BOOST_DATE_TIME_SHARED_LIB}")
 
 ############################################################
 # Linker setup
@@ -963,33 +1048,79 @@ if (UNIX)
 endif (UNIX)
 
 ############################################################
-# "make site" target
+# "make doxygen" target
+# Needs the doxygen system package to work.
 ############################################################
 if (UNIX)
-  add_custom_target(site
-    ${CMAKE_CURRENT_SOURCE_DIR}/docs/support/scripts/make_site.sh)
+  find_package(Doxygen)
+  if (NOT (DOXYGEN_FOUND AND DOXYGEN_DOT_FOUND))
+    message(WARNING "Doxygen with Dot support (graphviz) not found: 'doxygen' target is not available")
+  else ()
+    set(DOXY_SUBDIR ${CMAKE_CURRENT_BINARY_DIR}/docs/doxygen)
+    set(DOXY_CLIENT_DESTDIR ${DOXY_SUBDIR}/tmp.client)
+    set(DOXY_CLIENT_API_CFG ${DOXY_SUBDIR}/client_api.doxy)
+    set(DOXY_CLIENT_API_FOOTER ${DOXY_SUBDIR}/client_api.footer)
+    set(DOXY_CLIENT_API_OUTDIR ${DOXY_SUBDIR}/client_api)
+    list(APPEND DOXY_CLIENT_API_EXCLUDE
+      "share/doc/kuduClient/samples/sample.cc")
+    # NOTE: DOXY_CLIENT_API_OUTDIR and DOXY_CLIENT_API_FOOTER are used
+    #       in client_api.doxy.in template file
+    configure_file(docs/support/doxygen/client_api.doxy.in ${DOXY_CLIENT_API_CFG} @ONLY)
+    configure_file(docs/support/doxygen/client_api.footer.in ${DOXY_CLIENT_API_FOOTER} @ONLY)
+    add_custom_target(doxy_install_client_alt_destdir
+      COMMAND ${CMAKE_COMMAND} -E remove_directory ${DOXY_CLIENT_DESTDIR}
+      COMMAND DESTDIR=${DOXY_CLIENT_DESTDIR} ${CMAKE_MAKE_PROGRAM} install
+      COMMENT "Installing Kudu client files into temporary destroot"
+    )
+    add_custom_target(doxygen
+      COMMAND ${DOXYGEN_EXECUTABLE} ${DOXY_CLIENT_API_CFG}
+      WORKING_DIRECTORY ${DOXY_CLIENT_DESTDIR}/${CMAKE_INSTALL_PREFIX}
+      COMMENT "Generating Kudu C++ client API documentation"
+    )
+    add_dependencies(doxy_install_client_alt_destdir kudu_client_exported)
+    add_dependencies(doxygen doxy_install_client_alt_destdir)
+    # If doxygen is present, generate doxygen documentation along with 'docs'.
+    add_dependencies(docs doxygen)
+  endif ()
+endif (UNIX)
+
+############################################################
+# "make site" target
+#
+# NOTE: It's supposed find_package(Doxygen) has already
+# been run at this point.
+############################################################
+if (UNIX)
+  if (NOT DOXYGEN_FOUND)
+    add_custom_target(site
+      ${CMAKE_CURRENT_SOURCE_DIR}/docs/support/scripts/make_site.sh --no-doxygen)
+  else ()
+    add_custom_target(site
+      ${CMAKE_CURRENT_SOURCE_DIR}/docs/support/scripts/make_site.sh)
+  endif ()
 endif (UNIX)
 
 ############################################################
 # Subdirectories
 ############################################################
 
+add_subdirectory(src/kudu/benchmarks)
+add_subdirectory(src/kudu/cfile)
+add_subdirectory(src/kudu/client)
+add_subdirectory(src/kudu/codegen)
+add_subdirectory(src/kudu/common)
+add_subdirectory(src/kudu/consensus)
+add_subdirectory(src/kudu/experiments)
+add_subdirectory(src/kudu/fs)
 # Google util libraries borrowed from supersonic, tcmalloc, Chromium, etc.
 add_subdirectory(src/kudu/gutil)
-add_subdirectory(src/kudu/util)
-add_subdirectory(src/kudu/common)
-add_subdirectory(src/kudu/cfile)
-add_subdirectory(src/kudu/fs)
+add_subdirectory(src/kudu/integration-tests)
+add_subdirectory(src/kudu/master)
+add_subdirectory(src/kudu/rpc)
+add_subdirectory(src/kudu/security)
 add_subdirectory(src/kudu/server)
 add_subdirectory(src/kudu/tablet)
-add_subdirectory(src/kudu/rpc)
-add_subdirectory(src/kudu/tserver)
-add_subdirectory(src/kudu/consensus)
-add_subdirectory(src/kudu/master)
-add_subdirectory(src/kudu/client)
-add_subdirectory(src/kudu/integration-tests)
-add_subdirectory(src/kudu/experiments)
-add_subdirectory(src/kudu/benchmarks)
-add_subdirectory(src/kudu/twitter-demo)
 add_subdirectory(src/kudu/tools)
-add_subdirectory(src/kudu/codegen)
+add_subdirectory(src/kudu/tserver)
+add_subdirectory(src/kudu/twitter-demo)
+add_subdirectory(src/kudu/util)

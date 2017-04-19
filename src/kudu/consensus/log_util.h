@@ -18,6 +18,7 @@
 #ifndef KUDU_CONSENSUS_LOG_UTIL_H_
 #define KUDU_CONSENSUS_LOG_UTIL_H_
 
+#include <deque>
 #include <gtest/gtest.h>
 #include <iosfwd>
 #include <map>
@@ -38,21 +39,17 @@ DECLARE_bool(log_force_fsync_all);
 
 namespace kudu {
 
+class CompressionCodec;
+
 namespace consensus {
 struct OpIdBiggerThanFunctor;
 } // namespace consensus
 
 namespace log {
 
-// Suffix for temprorary files
-extern const char kTmpSuffix[];
-
-// Each log entry is prefixed by its length (4 bytes), CRC (4 bytes),
-// and checksum of the other two fields (see EntryHeader struct below).
-extern const size_t kEntryHeaderSize;
-
-extern const int kLogMajorVersion;
-extern const int kLogMinorVersion;
+// Each log entry is prefixed by a header. See DecodeEntryHeader()
+// implementation for details.
+extern const size_t kEntryHeaderSizeV2;
 
 class ReadableLogSegment;
 
@@ -78,6 +75,75 @@ struct LogOptions {
 
 // A sequence of segments, ordered by increasing sequence number.
 typedef std::vector<scoped_refptr<ReadableLogSegment> > SegmentSequence;
+
+// LogEntryReader provides iterator-style access to read the entries
+// from an open log segment.
+class LogEntryReader {
+ public:
+
+  // Construct a LogEntryReader to read from the provided segment.
+  // 'seg' must outlive the LogEntryReader.
+  explicit LogEntryReader(ReadableLogSegment* seg);
+
+  ~LogEntryReader();
+
+  // Read the next entry from the log, replacing the contents of 'entry'.
+  //
+  // When there are no more entries to read, returns Status::EndOfFile().
+  Status ReadNextEntry(LogEntryPB* entry);
+
+  // Return the offset of the next entry to be read from the file.
+  int64_t offset() const {
+    return offset_;
+  }
+
+  // Return the offset at which this reader will stop reading.
+  int64_t read_up_to_offset() const {
+    return read_up_to_;
+  }
+
+ private:
+  friend class ReadableLogSegment;
+
+  // Handle an error reading an entry.
+  Status HandleReadError(const Status& s) const;
+
+  // Format a nice error message to report on a corruption in a log file.
+  Status MakeCorruptionStatus(const Status& status) const;
+
+  // The segment being read.
+  ReadableLogSegment* seg_;
+
+  // The last several entries which were successfully read.
+  struct RecentEntry {
+    int64_t offset;
+    LogEntryTypePB type;
+    consensus::OpId op_id;
+  };
+  std::deque<RecentEntry> recent_entries_;
+  static const int kNumRecentEntries = 4;
+
+  // Entries which have been read from the file and not yet returned to
+  // the caller.
+  std::deque<std::unique_ptr<LogEntryPB>> pending_entries_;
+
+  // The total number of log entry batches read from the file.
+  int64_t num_batches_read_;
+
+  // The total number of LogEntryPBs read from the file.
+  int64_t num_entries_read_;
+
+  // The offset of the next entry to be read.
+  int64_t offset_;
+
+  // The offset at which this reader will stop reading entries.
+  int64_t read_up_to_;
+
+  // Temporary buffer used for deserialization.
+  faststring tmp_buf_;
+
+  DISALLOW_COPY_AND_ASSIGN(LogEntryReader);
+};
 
 // A segment of the log can either be a ReadableLogSegment (for replay and
 // consensus catch-up) or a WritableLogSegment (where the Log actually stores
@@ -122,11 +188,7 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
   // If the log is corrupted (i.e. the returned 'Status' is 'Corruption') all
   // the log entries read up to the corrupted one are returned in the 'entries'
   // vector.
-  //
-  // If 'end_offset' is not NULL, then returns the file offset following the last
-  // successfully read entry.
-  Status ReadEntries(std::vector<LogEntryPB*>* entries,
-                     int64_t* end_offset = NULL);
+  Status ReadEntries(std::vector<LogEntryPB*>* entries);
 
   // Rebuilds this segment's footer by scanning its entries.
   // This is an expensive operation as it reads and parses the whole segment
@@ -184,16 +246,26 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
   // ends.
   const int64_t readable_up_to() const;
 
+  // Return the expected length of entry headers in this log segment.
+  // Versions of Kudu older than 1.3 used a different log entry header format.
+  size_t entry_header_size() const;
+
  private:
   friend class RefCountedThreadSafe<ReadableLogSegment>;
+  friend class LogEntryReader;
   friend class LogReader;
   FRIEND_TEST(LogTest, TestWriteAndReadToAndFromInProgressSegment);
 
   struct EntryHeader {
-    // The length of the batch data.
+    // The length of the batch data (uncompressed)
     uint32_t msg_length;
 
+    // The compressed length of the entry. If compression is disabled,
+    // equal to msg_length.
+    uint32_t msg_length_compressed;
+
     // The CRC32C of the batch data.
+    // If compression is enabled, this is the checksum of the compressed data.
     uint32_t msg_crc;
 
     // The CRC32C of this EntryHeader.
@@ -206,10 +278,25 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
 
   Status ReadFileSize();
 
+  Status InitCompressionCodec();
+
+  // Read the log file magic and header protobuf into 'header_'. Sets 'first_entry_offset_'
+  // to indicate the start of the actual log data.
+  //
+  // Returns Uninitialized() if the file appears to be preallocated but never
+  // written.
   Status ReadHeader();
 
+  // Read the magic and header length from the top of the file, returning
+  // the header length in 'len'.
+  //
+  // Returns Uninitialized() if the file appears to be preallocated but never
+  // written.
   Status ReadHeaderMagicAndHeaderLength(uint32_t *len);
 
+  // Parse the magic and the PB-header length prefix from 'data'.
+  // In the case that 'data' is all '\0' bytes, indicating a preallocated
+  // but never-written segment, returns Status::Uninitialized().
   Status ParseHeaderMagicAndHeaderLength(const Slice &data, uint32_t *parsed_len);
 
   Status ReadFooter();
@@ -225,12 +312,9 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
   // file.
   Status ScanForValidEntryHeaders(int64_t offset, bool* has_valid_entries);
 
-  // Format a nice error message to report on a corruption in a log file.
-  Status MakeCorruptionStatus(int batch_number, int64_t batch_offset,
-                              std::vector<int64_t>* recent_offsets,
-                              const std::vector<LogEntryPB*>& entries,
-                              const Status& status) const;
-
+  // Read an entry header and its associated batch at the given offset.
+  // If successful, updates '*offset' to point to the next batch
+  // in the file. If unsuccessful, '*offset' is not updated.
   Status ReadEntryHeaderAndBatch(int64_t* offset, faststring* tmp_buf,
                                  gscoped_ptr<LogEntryBatchPB>* batch);
 
@@ -238,8 +322,9 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
   // Also increments the passed offset* by the length of the entry.
   Status ReadEntryHeader(int64_t *offset, EntryHeader* header);
 
-  // Decode a log entry header from the given slice, which must be kEntryHeaderSize
-  // bytes long. Returns true if successful, false if corrupt.
+  // Decode a log entry header from the given slice. The header length is
+  // determined by 'entry_header_size()'.
+  // Returns true if successful, false if corrupt.
   //
   // NOTE: this is performance-critical since it is used by ScanForValidEntryHeaders
   // and thus returns bool instead of Status.
@@ -273,6 +358,9 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
 
   // a readable file for a log segment (used on replay)
   const std::shared_ptr<RandomAccessFile> readable_file_;
+
+  // Compression codec used to decompress entries in this file.
+  const CompressionCodec* codec_;
 
   bool is_initialized_;
 
@@ -311,9 +399,10 @@ class WritableLogSegment {
   }
 
   // Appends the provided batch of data, including a header
-  // and checksum.
+  // and checksum. If 'codec' is not NULL, compresses the batch.
   // Makes sure that the log segment has not been closed.
-  Status WriteEntryBatch(const Slice& entry_batch_data);
+  // Write a compressed entry to the log.
+  Status WriteEntryBatch(const Slice& data, const CompressionCodec* codec);
 
   // Makes sure the I/O buffers in the underlying writable file are flushed.
   Status Sync() {
@@ -378,18 +467,24 @@ class WritableLogSegment {
   // The offset where the last written entry ends.
   int64_t written_offset_;
 
+  // Buffer used for output when compressing.
+  faststring compress_buf_;
+
   DISALLOW_COPY_AND_ASSIGN(WritableLogSegment);
 };
 
-// Sets 'batch' to a newly created batch that contains the pre-allocated
+// Return a newly created batch that contains the pre-allocated
 // ReplicateMsgs in 'msgs'.
-// We use C-style passing here to avoid having to allocate a vector
-// in some hot paths.
-void CreateBatchFromAllocatedOperations(const std::vector<consensus::ReplicateRefPtr>& msgs,
-                                        gscoped_ptr<LogEntryBatchPB>* batch);
+std::unique_ptr<LogEntryBatchPB> CreateBatchFromAllocatedOperations(
+    const std::vector<consensus::ReplicateRefPtr>& msgs);
 
 // Checks if 'fname' is a correctly formatted name of log segment file.
 bool IsLogFileName(const std::string& fname);
+
+// Update 'footer' to reflect the given REPLICATE message 'entry_pb'.
+// In particular, updates the min/max seen replicate OpID.
+void UpdateFooterForReplicateEntry(
+    const LogEntryPB& entry_pb, LogSegmentFooterPB* footer);
 
 }  // namespace log
 }  // namespace kudu

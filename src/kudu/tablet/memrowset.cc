@@ -17,10 +17,12 @@
 
 #include "kudu/tablet/memrowset.h"
 
-#include <gflags/gflags.h>
-#include <glog/logging.h>
+#include <memory>
 #include <string>
 #include <vector>
+
+#include <gflags/gflags.h>
+#include <glog/logging.h>
 
 #include "kudu/codegen/compilation_manager.h"
 #include "kudu/codegen/row_projector.h"
@@ -33,6 +35,7 @@
 #include "kudu/tablet/compaction.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/mem_tracker.h"
+#include "kudu/util/memory/overwrite.h"
 
 DEFINE_bool(mrs_use_codegen, true, "whether the memrowset should use code "
             "generation for iteration");
@@ -82,21 +85,31 @@ shared_ptr<MemTracker> CreateMemTrackerForMemRowSet(
 
 } // anonymous namespace
 
+Status MemRowSet::Create(int64_t id,
+                         const Schema &schema,
+                         LogAnchorRegistry* log_anchor_registry,
+                         shared_ptr<MemTracker> parent_tracker,
+                         shared_ptr<MemRowSet>* mrs) {
+  shared_ptr<MemRowSet> local_mrs(new MemRowSet(
+      id, schema, log_anchor_registry, std::move(parent_tracker)));
+
+  mrs->swap(local_mrs);
+  return Status::OK();
+}
+
 MemRowSet::MemRowSet(int64_t id,
                      const Schema &schema,
                      LogAnchorRegistry* log_anchor_registry,
-                     const shared_ptr<MemTracker>& parent_tracker)
+                     shared_ptr<MemTracker> parent_tracker)
   : id_(id),
     schema_(schema),
-    parent_tracker_(parent_tracker),
-    mem_tracker_(CreateMemTrackerForMemRowSet(id, parent_tracker)),
-    allocator_(new MemoryTrackingBufferAllocator(HeapBufferAllocator::Get(), mem_tracker_)),
+    allocator_(new MemoryTrackingBufferAllocator(HeapBufferAllocator::Get(),
+                                                 CreateMemTrackerForMemRowSet(id, parent_tracker))),
     arena_(new ThreadSafeMemoryTrackingArena(kInitialArenaSize, kMaxArenaBufferSize,
                                              allocator_)),
     tree_(arena_),
     debug_insert_count_(0),
     debug_update_count_(0),
-    has_logged_throttling_(false),
     anchorer_(log_anchor_registry, Substitute("MemRowSet-$0", id_)) {
   CHECK(schema.has_column_ids());
   ANNOTATE_BENIGN_RACE(&debug_insert_count_, "insert count isnt accurate");
@@ -104,7 +117,6 @@ MemRowSet::MemRowSet(int64_t id,
 }
 
 MemRowSet::~MemRowSet() {
-  mem_tracker_->UnregisterFromParent();
 }
 
 Status MemRowSet::DebugDump(vector<string> *lines) {
@@ -148,7 +160,7 @@ Status MemRowSet::Insert(Timestamp timestamp,
       // row is deleted.
       MRSRow ms_row(this, mutation.current_mutable_value());
       if (!ms_row.IsGhost()) {
-        return Status::AlreadyPresent("entry already present in memrowset");
+        return Status::AlreadyPresent("key already present");
       }
 
       // Insert a "reinsert" mutation.
@@ -176,19 +188,10 @@ Status MemRowSet::Insert(Timestamp timestamp,
 Status MemRowSet::Reinsert(Timestamp timestamp, const ConstContiguousRow& row, MRSRow *ms_row) {
   DCHECK_SCHEMA_EQ(schema_, *row.schema());
 
-  // TODO(perf): This path makes some unnecessary copies that could be reduced,
-  // but let's assume that REINSERT is really rare and code for clarity over speed
-  // here.
-
-  // Make a copy of the row, and relocate any of its indirected data into
-  // our Arena.
-  DEFINE_MRSROW_ON_STACK(this, row_copy, row_copy_slice);
-  RETURN_NOT_OK(row_copy.CopyRow(row, arena_.get()));
-
-  // Encode the REINSERT mutation from the relocated row copy.
+  // Encode the REINSERT mutation
   faststring buf;
   RowChangeListEncoder encoder(&buf);
-  encoder.SetToReinsert(row_copy.row_slice());
+  encoder.SetToReinsert(row);
 
   // Move the REINSERT mutation itself into our Arena.
   Mutation *mut = Mutation::CreateInArena(arena_.get(), timestamp, encoder.as_changelist());
@@ -285,6 +288,7 @@ MemRowSet::Iterator *MemRowSet::NewIterator() const {
 
 Status MemRowSet::NewRowIterator(const Schema *projection,
                                  const MvccSnapshot &snap,
+                                 OrderMode /*order*/,
                                  gscoped_ptr<RowwiseIterator>* out) const {
   out->reset(NewIterator(projection, snap));
   return Status::OK();
@@ -297,8 +301,8 @@ Status MemRowSet::NewCompactionInput(const Schema* projection,
   return Status::OK();
 }
 
-Status MemRowSet::GetBounds(Slice *min_encoded_key,
-                            Slice *max_encoded_key) const {
+Status MemRowSet::GetBounds(string *min_encoded_key,
+                            string *max_encoded_key) const {
   return Status::NotSupported("");
 }
 
@@ -314,7 +318,6 @@ class MemRowSet::Iterator::MRSRowProjector {
                                    RowBlockRow* dst_row,
                                    Arena* arena) = 0;
   virtual const vector<ProjectionIdxMapping>& base_cols_mapping() const = 0;
-  virtual const vector<ProjectionIdxMapping>& adapter_cols_mapping() const = 0;
   virtual Status Init() = 0;
 };
 
@@ -326,7 +329,7 @@ template<class ActualProjector>
 class MRSRowProjectorImpl : public MRSRowProjector {
  public:
   explicit MRSRowProjectorImpl(gscoped_ptr<ActualProjector> actual)
-    : actual_(actual.Pass()) {}
+    : actual_(std::move(actual)) {}
 
   Status Init() override { return actual_->Init(); }
 
@@ -343,9 +346,6 @@ class MRSRowProjectorImpl : public MRSRowProjector {
   const vector<ProjectionIdxMapping>& base_cols_mapping() const override {
     return actual_->base_cols_mapping();
   }
-  const vector<ProjectionIdxMapping>& adapter_cols_mapping() const override {
-    return actual_->adapter_cols_mapping();
-  }
 
  private:
   gscoped_ptr<ActualProjector> actual_;
@@ -361,14 +361,14 @@ gscoped_ptr<MRSRowProjector> GenerateAppropriateProjector(
     if (codegen::CompilationManager::GetSingleton()->RequestRowProjector(
           base, projection, &actual)) {
       return gscoped_ptr<MRSRowProjector>(
-        new MRSRowProjectorImpl<codegen::RowProjector>(actual.Pass()));
+        new MRSRowProjectorImpl<codegen::RowProjector>(std::move(actual)));
     }
   }
 
   // Proceed with default implementation
   gscoped_ptr<RowProjector> actual(new RowProjector(base, projection));
   return gscoped_ptr<MRSRowProjector>(
-    new MRSRowProjectorImpl<RowProjector>(actual.Pass()));
+    new MRSRowProjectorImpl<RowProjector>(std::move(actual)));
 }
 
 } // anonymous namespace
@@ -495,9 +495,11 @@ Status MemRowSet::Iterator::FetchRows(RowBlock* dst, size_t* fetched) {
       } else {
         RETURN_NOT_OK(projector_->ProjectRowForRead(row, &dst_row, dst->arena()));
 
+        Mutation* redo_head = reinterpret_cast<Mutation*>(
+            base::subtle::Acquire_Load(reinterpret_cast<AtomicWord*>(&row.header_->redo_head)));
         // Roll-forward MVCC for committed updates.
         RETURN_NOT_OK(ApplyMutationsToProjectedRow(
-            row.header_->redo_head, &dst_row, dst->arena()));
+            redo_head, &dst_row, dst->arena()));
       }
     } else {
       // This row was not yet committed in the current MVCC snapshot
@@ -531,7 +533,7 @@ Status MemRowSet::Iterator::ApplyMutationsToProjectedRow(
 
   for (const Mutation *mut = mutation_head;
        mut != nullptr;
-       mut = mut->next_) {
+       mut = mut->acquire_next()) {
     if (!mvcc_snap_.IsCommitted(mut->timestamp_)) {
       // Transaction which wasn't committed yet in the reader's snapshot.
       continue;
@@ -544,19 +546,13 @@ Status MemRowSet::Iterator::ApplyMutationsToProjectedRow(
     RETURN_NOT_OK(decoder.Init());
     if (decoder.is_delete()) {
       decoder.TwiddleDeleteStatus(&is_deleted);
-    } else if (decoder.is_reinsert()) {
-      decoder.TwiddleDeleteStatus(&is_deleted);
-
-      Slice reinserted_slice;
-      RETURN_NOT_OK(decoder.GetReinsertedRowSlice(memrowset_->schema_nonvirtual(),
-                                                  &reinserted_slice));
-      ConstContiguousRow reinserted(&memrowset_->schema_nonvirtual(),
-                                    reinserted_slice);
-      RETURN_NOT_OK(projector_->ProjectRowForRead(reinserted, dst_row, dst_arena));
     } else {
-      DCHECK(decoder.is_update());
+      DCHECK(decoder.is_update() || decoder.is_reinsert());
+      if (decoder.is_reinsert()) {
+        decoder.TwiddleDeleteStatus(&is_deleted);
+      }
 
-      // TODO: this is slow, since it makes multiple passes through the rowchangelist.
+      // TODO(todd): this is slow, since it makes multiple passes through the rowchangelist.
       // Instead, we should keep the backwards mapping of columns.
       for (const RowProjector::ProjectionIdxMapping& mapping : projector_->base_cols_mapping()) {
         RowChangeListDecoder decoder(mut->changelist());
@@ -566,9 +562,6 @@ Status MemRowSet::Iterator::ApplyMutationsToProjectedRow(
                                                memrowset_->schema_nonvirtual(),
                                                mapping.second, dst_arena));
       }
-
-      // TODO: Handle Delta Apply on projector_.adapter_cols_mapping()
-      DCHECK_EQ(projector_->adapter_cols_mapping().size(), 0) << "alter type is not supported";
     }
   }
 
@@ -584,31 +577,36 @@ Status MemRowSet::Iterator::ApplyMutationsToProjectedRow(
 // Copy the current MRSRow to the 'dst_row' provided using the iterator projection schema.
 Status MemRowSet::Iterator::GetCurrentRow(RowBlockRow* dst_row,
                                           Arena* row_arena,
-                                          const Mutation** redo_head,
+                                          Mutation** redo_head,
                                           Arena* mutation_arena,
                                           Timestamp* insertion_timestamp) {
 
   DCHECK(redo_head != nullptr);
 
   // Get the row from the MemRowSet. It may have a different schema from the iterator projection.
-  const MRSRow src_row = GetCurrentRow();
+  MRSRow src_row = GetCurrentRow();
 
   *insertion_timestamp = src_row.insertion_timestamp();
 
   // Project the RowChangeList if required
-  *redo_head = src_row.redo_head();
+  *redo_head = src_row.acquire_redo_head();
   if (!delta_projector_.is_identity()) {
     DCHECK(mutation_arena != nullptr);
 
     Mutation *prev_redo = nullptr;
     *redo_head = nullptr;
-    for (const Mutation *mut = src_row.redo_head(); mut != nullptr; mut = mut->next()) {
-      RETURN_NOT_OK(RowChangeListDecoder::ProjectUpdate(delta_projector_,
-                                                        mut->changelist(),
-                                                        &delta_buf_));
+    for (const Mutation *mut = src_row.redo_head();
+         mut != nullptr;
+         mut = mut->acquire_next()) {
+
+      delta_buf_.clear();
+      RowChangeListEncoder enc(&delta_buf_);
+      RETURN_NOT_OK(RowChangeListDecoder::ProjectChangeList(delta_projector_,
+                                                            mut->changelist(),
+                                                            &enc));
 
       // The projection resulted in an empty mutation (e.g. update of a removed column)
-      if (delta_buf_.size() == 0) continue;
+      if (enc.is_empty()) continue;
 
       Mutation *mutation = Mutation::CreateInArena(mutation_arena,
                                                    mut->timestamp(),

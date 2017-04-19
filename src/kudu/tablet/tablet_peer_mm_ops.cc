@@ -18,21 +18,28 @@
 #include "kudu/tablet/tablet_peer_mm_ops.h"
 
 #include <algorithm>
+#include <gflags/gflags.h>
 #include <map>
+#include <mutex>
 #include <string>
 
-#include <gflags/gflags.h>
-
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/tablet/maintenance_manager.h"
 #include "kudu/tablet/tablet_metrics.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/maintenance_manager.h"
 #include "kudu/util/metrics.h"
 
-DEFINE_int32(flush_threshold_mb, 64,
+DEFINE_int32(flush_threshold_mb, 1024,
              "Size at which MemRowSet flushes are triggered. "
-             "A MRS can still flush below this threshold if it if hasn't flushed in a while");
+             "A MRS can still flush below this threshold if it if hasn't flushed in a while, "
+             "or if the server-wide memory limit has been reached.");
 TAG_FLAG(flush_threshold_mb, experimental);
+
+DEFINE_int32(flush_threshold_secs, 2 * 60,
+             "Number of seconds after which a non-empty MemRowSet will become flushable "
+             "even if it is not large.");
+TAG_FLAG(flush_threshold_secs, experimental);
+
 
 METRIC_DEFINE_gauge_uint32(tablet, log_gc_running,
                            "Log GCs Running",
@@ -49,8 +56,6 @@ namespace tablet {
 using std::map;
 using strings::Substitute;
 
-// How long we wait before considering a time-based flush.
-const double kFlushDueToTimeMs = 2 * 60 * 1000;
 // Upper bound for how long it takes to reach "full perf improvement" in time-based flushing.
 const double kFlushUpperBoundMs = 60 * 60 * 1000;
 
@@ -70,7 +75,7 @@ void FlushOpPerfImprovementPolicy::SetPerfImprovementForFlush(MaintenanceOpStats
     double extra_mb =
         static_cast<double>(FLAGS_flush_threshold_mb - (stats->ram_anchored()) / (1024 * 1024));
     stats->set_perf_improvement(extra_mb);
-  } else if (elapsed_ms > kFlushDueToTimeMs) {
+  } else if (elapsed_ms > FLAGS_flush_threshold_secs * 1000) {
     // Even if we aren't over the threshold, consider flushing if we haven't flushed
     // in a long time. But, don't give it a large perf_improvement score. We should
     // only do this if we really don't have much else to do, and if we've already waited a bit.
@@ -89,25 +94,24 @@ void FlushOpPerfImprovementPolicy::SetPerfImprovementForFlush(MaintenanceOpStats
 //
 
 void FlushMRSOp::UpdateStats(MaintenanceOpStats* stats) {
-  boost::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard<simple_spinlock> l(lock_);
 
-  map<int64_t, int64_t> max_idx_to_segment_size;
+  map<int64_t, int64_t> replay_size_map;
   if (tablet_peer_->tablet()->MemRowSetEmpty() ||
-      !tablet_peer_->GetMaxIndexesToSegmentSizeMap(&max_idx_to_segment_size).ok()) {
+      !tablet_peer_->GetReplaySizeMap(&replay_size_map).ok()) {
     return;
   }
 
   {
-    boost::unique_lock<Semaphore> lock(tablet_peer_->tablet()->rowsets_flush_sem_,
-                                       boost::defer_lock);
+    std::unique_lock<Semaphore> lock(tablet_peer_->tablet()->rowsets_flush_sem_, std::defer_lock);
     stats->set_runnable(lock.try_lock());
   }
 
   stats->set_ram_anchored(tablet_peer_->tablet()->MemRowSetSize());
   stats->set_logs_retained_bytes(
-      tablet_peer_->tablet()->MemRowSetLogRetentionSize(max_idx_to_segment_size));
+      tablet_peer_->tablet()->MemRowSetLogReplaySize(replay_size_map));
 
-  // TODO: use workload statistics here to find out how "hot" the tablet has
+  // TODO(todd): use workload statistics here to find out how "hot" the tablet has
   // been in the last 5 minutes.
   FlushOpPerfImprovementPolicy::SetPerfImprovementForFlush(
       stats,
@@ -124,10 +128,11 @@ bool FlushMRSOp::Prepare() {
 void FlushMRSOp::Perform() {
   CHECK(!tablet_peer_->tablet()->rowsets_flush_sem_.try_lock());
 
-  tablet_peer_->tablet()->FlushUnlocked();
+  KUDU_CHECK_OK_PREPEND(tablet_peer_->tablet()->FlushUnlocked(),
+                        Substitute("FlushMRS failed on $0", tablet_peer_->tablet_id()));
 
   {
-    boost::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     time_since_flush_.start();
   }
   tablet_peer_->tablet()->rowsets_flush_sem_.unlock();
@@ -146,15 +151,15 @@ scoped_refptr<AtomicGauge<uint32_t> > FlushMRSOp::RunningGauge() const {
 //
 
 void FlushDeltaMemStoresOp::UpdateStats(MaintenanceOpStats* stats) {
-  boost::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard<simple_spinlock> l(lock_);
   int64_t dms_size;
   int64_t retention_size;
-  map<int64_t, int64_t> max_idx_to_segment_size;
+  map<int64_t, int64_t> max_idx_to_replay_size;
   if (tablet_peer_->tablet()->DeltaMemRowSetEmpty() ||
-      !tablet_peer_->GetMaxIndexesToSegmentSizeMap(&max_idx_to_segment_size).ok()) {
+      !tablet_peer_->GetReplaySizeMap(&max_idx_to_replay_size).ok()) {
     return;
   }
-  tablet_peer_->tablet()->GetInfoForBestDMSToFlush(max_idx_to_segment_size,
+  tablet_peer_->tablet()->GetInfoForBestDMSToFlush(max_idx_to_replay_size,
                                                    &dms_size, &retention_size);
 
   stats->set_ram_anchored(dms_size);
@@ -167,16 +172,17 @@ void FlushDeltaMemStoresOp::UpdateStats(MaintenanceOpStats* stats) {
 }
 
 void FlushDeltaMemStoresOp::Perform() {
-  map<int64_t, int64_t> max_idx_to_segment_size;
-  if (!tablet_peer_->GetMaxIndexesToSegmentSizeMap(&max_idx_to_segment_size).ok()) {
+  map<int64_t, int64_t> max_idx_to_replay_size;
+  if (!tablet_peer_->GetReplaySizeMap(&max_idx_to_replay_size).ok()) {
     LOG(WARNING) << "Won't flush deltas since tablet shutting down: " << tablet_peer_->tablet_id();
     return;
   }
-  WARN_NOT_OK(tablet_peer_->tablet()->FlushDMSWithHighestRetention(max_idx_to_segment_size),
-                  Substitute("Failed to flush DMS on $0",
-                             tablet_peer_->tablet()->tablet_id()));
+  KUDU_CHECK_OK_PREPEND(tablet_peer_->tablet()->FlushDMSWithHighestRetention(
+                            max_idx_to_replay_size),
+                        Substitute("Failed to flush DMS on $0",
+                                   tablet_peer_->tablet()->tablet_id()));
   {
-    boost::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     time_since_flush_.start();
   }
 }

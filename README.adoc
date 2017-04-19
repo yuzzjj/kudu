@@ -57,9 +57,9 @@ between two commits which may have different dependencies.
 
 [source,bash]
 ----
-# Add <root of kudu tree>/thirdparty/installed/bin to your $PATH
+# Add <root of kudu tree>/thirdparty/installed/common/bin to your $PATH
 # before other parts of $PATH that may contain cmake, such as /usr/bin
-# For example: "export PATH=$HOME/git/kudu/thirdparty/installed/bin:$PATH"
+# For example: "export PATH=$HOME/git/kudu/thirdparty/installed/common/bin:$PATH"
 # if using bash.
 $ mkdir -p build/debug
 $ cd build/debug
@@ -173,7 +173,7 @@ $ mkdir -p build/tsan
 $ cd build/tsan
 $ CC=../../thirdparty/clang-toolchain/bin/clang \
     CXX=../../thirdparty/clang-toolchain/bin/clang++ \
-    cmake -DKUDU_USE_TSAN=1 .
+    cmake -DKUDU_USE_TSAN=1 ../..
 $ make -j8
 $ ctest -j8
 ----
@@ -197,7 +197,6 @@ or
 $ build-support/run-test.sh build/tsan/bin/foo-test [--test-arguments-here]
 ----
 
-
 ...and then view the logs in _build/tsan/test-logs/_
 
 ====
@@ -218,34 +217,33 @@ $ gdb -ex 'set disable-randomization off' -ex 'b __tsan::PrintReport' ./some-tes
 === Generating code coverage reports
 
 
-In order to generate a code coverage report, you must build with gcc (not clang)
-and use the following flags:
+In order to generate a code coverage report, you must use the following flags:
 
 [source,bash]
 ----
 $ mkdir -p build/coverage
 $ cd build/coverage
-$ cmake -DKUDU_GENERATE_COVERAGE=1 ../..
+$ CC=../../thirdparty/clang-toolchain/bin/clang \
+  CXX=../../thirdparty/clang-toolchain/bin/clang++ \
+  cmake -DKUDU_GENERATE_COVERAGE=1 ../..
 $ make -j4
 $ ctest -j4
 ----
 
 This will generate the code coverage files with extensions .gcno and .gcda. You can then
-use a tool like `lcov` or `gcovr` to visualize the results. For example, using gcovr:
+use a tool like `gcovr` or `llvm-cov gcov` to visualize the results. For example, using
+gcovr:
 
 [source,bash]
 ----
+$ cd build/coverage
 $ mkdir cov_html
-$ ./thirdparty/gcovr-3.0/scripts/gcovr -r src/
+$ ../../thirdparty/installed/common/bin/gcovr \
+      --gcov-executable=$(pwd)/../../build-support/llvm-gcov-wrapper \
+      --html --html-details -o cov_html/coverage.html
 ----
 
-Or using `lcov` (which seems to produce better HTML output):
-
-[source,bash]
-----
-$ lcov  --capture --directory src --output-file coverage.info
-$ genhtml coverage.info --output-directory out
-----
+Then open `cov_html/coverage.html` in your web browser.
 
 === Running lint checks
 
@@ -287,7 +285,7 @@ including Javadoc documentation, you may run the following command:
 
 [source,bash]
 ----
-$ ./docs/support/script/make_site.sh
+$ ./docs/support/scripts/make_site.sh
 ----
 
 This script will use your local Git repository to check out a shallow clone of
@@ -378,9 +376,9 @@ Either way, these complicated source files must be excluded from indexing. To do
 this, right click on the project in the Project Explorer and select Properties. In
 the dialog box, select "C/C++ Project Paths", select the Source tab, highlight
 "Exclusion filter: (None)", and click "Edit...". In the new dialog box, click
-"Add Multiple...". Select every subdirectory inside _thirdparty_ except _installed_
-and _installed-deps_. Click OK all the way out and rebuild the project index by
-right clicking the project in the Project Explorer and selecting Index -> Rebuild.
+"Add Multiple...". Select every subdirectory inside _thirdparty_ except _installed_.
+Click OK all the way out and rebuild the project index by right clicking the project
+in the Project Explorer and selecting Index -> Rebuild.
 
 With this exclusion, the only false positives (shown as "red squigglies") that
 CDT presents appear to be in atomicops functions (`NoBarrier_CompareAndSwap` for
@@ -395,3 +393,8 @@ on writing code, though it may affect your ability to build from within Eclipse.
 
 1. https://cmake.org/pipermail/cmake-developers/2011-November/014153.html
 2. http://public.kitware.com/Bug/view.php?id=15102
+
+= Export Control Notice
+
+This distribution uses cryptographic software and may be subject to export controls.
+Please refer to docs/export_control.adoc for more information.

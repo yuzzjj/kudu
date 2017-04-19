@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "kudu/common/column_predicate.h"
 #include "kudu/common/row.h"
 #include "kudu/common/rowblock.h"
 #include "kudu/gutil/port.h"
@@ -27,8 +28,10 @@
 #include "kudu/gutil/strings/fastmem.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/faststring.h"
+#include "kudu/util/memory/arena.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
+#include "kudu/util/pb_util.h"
 #include "kudu/util/safe_math.h"
 #include "kudu/util/slice.h"
 
@@ -145,7 +148,7 @@ Status StatusFromPB(const AppStatusPB& pb) {
       return Status::EndOfFile(pb.message(), "", posix_code);
     case AppStatusPB::UNKNOWN_ERROR:
     default:
-      LOG(WARNING) << "Unknown error code in status: " << pb.ShortDebugString();
+      LOG(WARNING) << "Unknown error code in status: " << SecureShortDebugString(pb);
       return Status::RuntimeError("(unknown error code)", pb.message(), posix_code);
   }
 }
@@ -181,11 +184,6 @@ Status SchemaToPB(const Schema& schema, SchemaPB *pb, int flags) {
   return SchemaToColumnPBs(schema, pb->mutable_columns(), flags);
 }
 
-Status SchemaToPBWithoutIds(const Schema& schema, SchemaPB *pb) {
-  pb->Clear();
-  return SchemaToColumnPBs(schema, pb->mutable_columns(), SCHEMA_PB_WITHOUT_IDS);
-}
-
 Status SchemaFromPB(const SchemaPB& pb, Schema *schema) {
   return ColumnPBsToSchema(pb.columns(), schema);
 }
@@ -209,7 +207,7 @@ void ColumnSchemaToPB(const ColumnSchema& col_schema, ColumnSchemaPB *pb, int fl
       pb->set_read_default_value(read_value, col_schema.type_info()->size());
     }
   }
-  if (col_schema.has_write_default()) {
+  if (col_schema.has_write_default() && !(flags & SCHEMA_PB_WITHOUT_WRITE_DEFAULT)) {
     if (col_schema.type_info()->physical_type() == BINARY) {
       const Slice *write_slice = static_cast<const Slice *>(col_schema.write_default_value());
       pb->set_write_default_value(write_slice->data(), write_slice->size());
@@ -271,7 +269,7 @@ Status ColumnPBsToSchema(const RepeatedPtrField<ColumnSchemaPB>& column_pbs,
     if (pb.is_key()) {
       if (!is_handling_key) {
         return Status::InvalidArgument(
-          "Got out-of-order key column", pb.ShortDebugString());
+          "Got out-of-order key column", SecureShortDebugString(pb));
       }
       num_key_columns++;
     } else {
@@ -297,7 +295,7 @@ Status SchemaToColumnPBs(const Schema& schema,
   int idx = 0;
   for (const ColumnSchema& col : schema.columns()) {
     ColumnSchemaPB* col_pb = cols->Add();
-    ColumnSchemaToPB(col, col_pb);
+    ColumnSchemaToPB(col, col_pb, flags);
     col_pb->set_is_key(idx < schema.num_key_columns());
 
     if (schema.has_column_ids() && !(flags & SCHEMA_PB_WITHOUT_IDS)) {
@@ -305,6 +303,169 @@ Status SchemaToColumnPBs(const Schema& schema,
     }
 
     idx++;
+  }
+  return Status::OK();
+}
+
+namespace {
+// Copies a predicate lower or upper bound from 'bound_src' into 'bound_dst'.
+void CopyPredicateBoundToPB(const ColumnSchema& col, const void* bound_src, string* bound_dst) {
+  const void* src;
+  size_t size;
+  if (col.type_info()->physical_type() == BINARY) {
+    // Copying a string involves an extra level of indirection through its
+    // owning slice.
+    const Slice* s = reinterpret_cast<const Slice*>(bound_src);
+    src = s->data();
+    size = s->size();
+  } else {
+    src = bound_src;
+    size = col.type_info()->size();
+  }
+  bound_dst->assign(reinterpret_cast<const char*>(src), size);
+}
+
+// Extract a void* pointer suitable for use in a ColumnRangePredicate from the
+// string protobuf bound. This validates that the pb_value has the correct
+// length, copies the data into 'arena', and sets *result to point to it.
+// Returns bad status if the user-specified value is the wrong length.
+Status CopyPredicateBoundFromPB(const ColumnSchema& schema,
+                                const string& pb_value,
+                                Arena* arena,
+                                const void** result) {
+  // Copy the data from the protobuf into the Arena.
+  uint8_t* data_copy = static_cast<uint8_t*>(arena->AllocateBytes(pb_value.size()));
+  memcpy(data_copy, &pb_value[0], pb_value.size());
+
+  // If the type is of variable length, then we need to return a pointer to a Slice
+  // element pointing to the string. Otherwise, just verify that the provided
+  // value was the right size.
+  if (schema.type_info()->physical_type() == BINARY) {
+    *result = arena->NewObject<Slice>(data_copy, pb_value.size());
+  } else {
+    // TODO: add test case for this invalid request
+    size_t expected_size = schema.type_info()->size();
+    if (pb_value.size() != expected_size) {
+      return Status::InvalidArgument(
+          strings::Substitute("Bad predicate on $0. Expected value size $1, got $2",
+                              schema.ToString(), expected_size, pb_value.size()));
+    }
+    *result = data_copy;
+  }
+
+  return Status::OK();
+}
+} // anonymous namespace
+
+void ColumnPredicateToPB(const ColumnPredicate& predicate,
+                         ColumnPredicatePB* pb) {
+  pb->set_column(predicate.column().name());
+  switch (predicate.predicate_type()) {
+    case PredicateType::Equality: {
+      CopyPredicateBoundToPB(predicate.column(),
+                             predicate.raw_lower(),
+                             pb->mutable_equality()->mutable_value());
+      return;
+    };
+    case PredicateType::Range: {
+      auto range_pred = pb->mutable_range();
+      if (predicate.raw_lower() != nullptr) {
+        CopyPredicateBoundToPB(predicate.column(),
+                               predicate.raw_lower(),
+                               range_pred->mutable_lower());
+      }
+      if (predicate.raw_upper() != nullptr) {
+        CopyPredicateBoundToPB(predicate.column(),
+                               predicate.raw_upper(),
+                               range_pred->mutable_upper());
+      }
+      return;
+    };
+    case PredicateType::IsNotNull: {
+      pb->mutable_is_not_null();
+      return;
+    };
+    case PredicateType::IsNull: {
+      pb->mutable_is_null();
+      return;
+    }
+    case PredicateType::InList: {
+      auto* values = pb->mutable_in_list()->mutable_values();
+      for (const void* value : predicate.raw_values()) {
+        CopyPredicateBoundToPB(predicate.column(), value, values->Add());
+      }
+      return;
+    };
+    case PredicateType::None: LOG(FATAL) << "None predicate may not be converted to protobuf";
+  }
+  LOG(FATAL) << "unknown predicate type";
+}
+
+Status ColumnPredicateFromPB(const Schema& schema,
+                             Arena* arena,
+                             const ColumnPredicatePB& pb,
+                             optional<ColumnPredicate>* predicate) {
+  if (!pb.has_column()) {
+    return Status::InvalidArgument("Column predicate must include a column", SecureDebugString(pb));
+  }
+  const string& column = pb.column();
+  int32_t idx = schema.find_column(column);
+  if (idx == Schema::kColumnNotFound) {
+    return Status::InvalidArgument("unknown column in predicate", SecureDebugString(pb));
+  }
+  const ColumnSchema& col = schema.column(idx);
+
+  switch (pb.predicate_case()) {
+    case ColumnPredicatePB::kRange: {
+      const auto& range = pb.range();
+      if (!range.has_lower() && !range.has_upper()) {
+        return Status::InvalidArgument("Invalid range predicate on column: no bounds",
+                                        col.name());
+      }
+
+      const void* lower = nullptr;
+      const void* upper = nullptr;
+      if (range.has_lower()) {
+        RETURN_NOT_OK(CopyPredicateBoundFromPB(col, range.lower(), arena, &lower));
+      }
+      if (range.has_upper()) {
+        RETURN_NOT_OK(CopyPredicateBoundFromPB(col, range.upper(), arena, &upper));
+      }
+
+      *predicate = ColumnPredicate::Range(col, lower, upper);
+      break;
+    };
+    case ColumnPredicatePB::kEquality: {
+      const auto& equality = pb.equality();
+      if (!equality.has_value()) {
+        return Status::InvalidArgument("Invalid equality predicate on column: no value",
+                                        col.name());
+      }
+      const void* value = nullptr;
+      RETURN_NOT_OK(CopyPredicateBoundFromPB(col, equality.value(), arena, &value));
+      *predicate = ColumnPredicate::Equality(col, value);
+      break;
+    };
+    case ColumnPredicatePB::kInList: {
+      const auto& inlist = pb.in_list();
+      vector<const void*> values;
+      for (const string& pb_value : inlist.values()) {
+        const void* value = nullptr;
+        RETURN_NOT_OK(CopyPredicateBoundFromPB(col, pb_value, arena, &value));
+        values.push_back(value);
+      }
+      *predicate = ColumnPredicate::InList(col, &values);
+      break;
+    };
+    case ColumnPredicatePB::kIsNotNull: {
+      *predicate = ColumnPredicate::IsNotNull(col);
+      break;
+    };
+    case ColumnPredicatePB::kIsNull: {
+        *predicate = ColumnPredicate::IsNull(col);
+        break;
+      }
+    default: return Status::InvalidArgument("Unknown predicate type for column", col.name());
   }
   return Status::OK();
 }
@@ -405,14 +566,14 @@ Status FindLeaderHostPort(const RepeatedPtrField<ServerEntryPB>& entries,
                           HostPort* leader_hostport) {
   for (const ServerEntryPB& entry : entries) {
     if (entry.has_error()) {
-      LOG(WARNING) << "Error encountered for server entry " << entry.ShortDebugString()
+      LOG(WARNING) << "Error encountered for server entry " << SecureShortDebugString(entry)
                    << ": " << StatusFromPB(entry.error()).ToString();
       continue;
     }
     if (!entry.has_role()) {
       return Status::IllegalState(
           strings::Substitute("Every server in must have a role, but entry ($0) has no role.",
-                              entry.ShortDebugString()));
+                              SecureShortDebugString(entry)));
     }
     if (entry.role() == consensus::RaftPeerPB::LEADER) {
       return HostPortFromPB(entry.registration().rpc_addresses(0), leader_hostport);
@@ -456,7 +617,7 @@ template<bool IS_NULLABLE, bool IS_VARLEN>
 static void CopyColumn(const RowBlock& block, int col_idx,
                        int dst_col_idx, uint8_t* dst_base,
                        faststring* indirect_data, const Schema* dst_schema) {
-  DCHECK_NOTNULL(dst_schema);
+  DCHECK(dst_schema);
   ColumnBlock cblock = block.column_block(col_idx);
   size_t row_stride = ContiguousRowHelper::row_size(*dst_schema);
   uint8_t* dst = dst_base + dst_schema->column_offset(dst_col_idx);

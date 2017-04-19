@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <boost/thread/thread.hpp>
 #include <memory>
 
 #include "kudu/gutil/atomicops.h"
@@ -93,6 +92,7 @@ class TestMultiThreadedRowSetDeltaCompaction : public TestRowSet {
     gscoped_ptr<RowwiseIterator> iter;
     ASSERT_OK(rs->NewRowIterator(&schema_,
                                  MvccSnapshot::CreateSnapshotIncludingAllTransactions(),
+                                 UNORDERED,
                                  &iter));
     uint32_t expected = NoBarrier_Load(&update_counter_);
     ASSERT_OK(iter->Init(nullptr));

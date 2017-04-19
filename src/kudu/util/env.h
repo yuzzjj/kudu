@@ -13,17 +13,18 @@
 #ifndef STORAGE_LEVELDB_INCLUDE_ENV_H_
 #define STORAGE_LEVELDB_INCLUDE_ENV_H_
 
-#include <stdint.h>
 #include <cstdarg>
+#include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "kudu/gutil/callback_forward.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
 
+class faststring;
 class FileLock;
 class RandomAccessFile;
 class RWFile;
@@ -34,6 +35,12 @@ class WritableFile;
 struct RandomAccessFileOptions;
 struct RWFileOptions;
 struct WritableFileOptions;
+
+// Returned by Env::GetSpaceInfo().
+struct SpaceInfo {
+  int64_t capacity_bytes; // Capacity of a filesystem, in bytes.
+  int64_t free_bytes;     // Bytes available to non-privileged processes.
+};
 
 class Env {
  public:
@@ -67,7 +74,7 @@ class Env {
   //
   // The returned file will only be accessed by one thread at a time.
   virtual Status NewSequentialFile(const std::string& fname,
-                                   gscoped_ptr<SequentialFile>* result) = 0;
+                                   std::unique_ptr<SequentialFile>* result) = 0;
 
   // Create a brand new random access read-only file with the
   // specified name.  On success, stores a pointer to the new file in
@@ -77,12 +84,12 @@ class Env {
   //
   // The returned file may be concurrently accessed by multiple threads.
   virtual Status NewRandomAccessFile(const std::string& fname,
-                                     gscoped_ptr<RandomAccessFile>* result) = 0;
+                                     std::unique_ptr<RandomAccessFile>* result) = 0;
 
   // Like the previous NewRandomAccessFile, but allows options to be specified.
   virtual Status NewRandomAccessFile(const RandomAccessFileOptions& opts,
                                      const std::string& fname,
-                                     gscoped_ptr<RandomAccessFile>* result) = 0;
+                                     std::unique_ptr<RandomAccessFile>* result) = 0;
 
   // Create an object that writes to a new file with the specified
   // name.  Deletes any existing file with the same name and creates a
@@ -92,14 +99,14 @@ class Env {
   //
   // The returned file will only be accessed by one thread at a time.
   virtual Status NewWritableFile(const std::string& fname,
-                                 gscoped_ptr<WritableFile>* result) = 0;
+                                 std::unique_ptr<WritableFile>* result) = 0;
 
 
   // Like the previous NewWritableFile, but allows options to be
   // specified.
   virtual Status NewWritableFile(const WritableFileOptions& opts,
                                  const std::string& fname,
-                                 gscoped_ptr<WritableFile>* result) = 0;
+                                 std::unique_ptr<WritableFile>* result) = 0;
 
   // Creates a new WritableFile provided the name_template parameter.
   // The last six characters of name_template must be "XXXXXX" and these are
@@ -112,7 +119,7 @@ class Env {
   virtual Status NewTempWritableFile(const WritableFileOptions& opts,
                                      const std::string& name_template,
                                      std::string* created_filename,
-                                     gscoped_ptr<WritableFile>* result) = 0;
+                                     std::unique_ptr<WritableFile>* result) = 0;
 
   // Creates a new readable and writable file. If a file with the same name
   // already exists on disk, it is deleted.
@@ -120,12 +127,18 @@ class Env {
   // Some of the methods of the new file may be accessed concurrently,
   // while others are only safe for access by one thread at a time.
   virtual Status NewRWFile(const std::string& fname,
-                           gscoped_ptr<RWFile>* result) = 0;
+                           std::unique_ptr<RWFile>* result) = 0;
 
   // Like the previous NewRWFile, but allows options to be specified.
   virtual Status NewRWFile(const RWFileOptions& opts,
                            const std::string& fname,
-                           gscoped_ptr<RWFile>* result) = 0;
+                           std::unique_ptr<RWFile>* result) = 0;
+
+  // Same as abovoe for NewTempWritableFile(), but for an RWFile.
+  virtual Status NewTempRWFile(const RWFileOptions& opts,
+                               const std::string& name_template,
+                               std::string* created_filename,
+                               std::unique_ptr<RWFile>* res) = 0;
 
   // Returns true iff the named file exists.
   virtual bool FileExists(const std::string& fname) = 0;
@@ -145,6 +158,12 @@ class Env {
   // Delete the specified directory.
   virtual Status DeleteDir(const std::string& dirname) = 0;
 
+  // Return the current working directory.
+  virtual Status GetCurrentWorkingDir(std::string* cwd) const = 0;
+
+  // Change the current working directory.
+  virtual Status ChangeDir(const std::string& dest) = 0;
+
   // Synchronize the entry for a specific directory.
   virtual Status SyncDir(const std::string& dirname) = 0;
 
@@ -161,9 +180,27 @@ class Env {
   // of space consumed by the file, not the user-facing file size.
   virtual Status GetFileSizeOnDisk(const std::string& fname, uint64_t* file_size) = 0;
 
+  // Walk 'root' recursively, looking up the amount of space used by each file
+  // as reported by GetFileSizeOnDisk(), storing the grand total in 'bytes_used'.
+  virtual Status GetFileSizeOnDiskRecursively(const std::string& root, uint64_t* bytes_used) = 0;
+
+  // Returns the modified time of the file in microseconds.
+  //
+  // The timestamp is a 'system' timestamp, and is not guaranteed to be
+  // monotonic, or have any other consistency properties. The granularity of the
+  // timestamp is not guaranteed, and may be as high as 1 second on some
+  // platforms. The timestamp is not guaranteed to be anchored to any particular
+  // epoch.
+  virtual Status GetFileModifiedTime(const std::string& fname, int64_t* timestamp) = 0;
+
   // Store the block size of the filesystem where fname resides in
   // *block_size. fname must exist but it may be a file or a directory.
   virtual Status GetBlockSize(const std::string& fname, uint64_t* block_size) = 0;
+
+  // Determine the capacity and number of bytes free on the filesystem
+  // specified by 'path'. "Free space" accounting on the underlying filesystem
+  // may be more coarse than single bytes.
+  virtual Status GetSpaceInfo(const std::string& path, SpaceInfo* space_info) = 0;
 
   // Rename file src to target.
   virtual Status RenameFile(const std::string& src,
@@ -228,7 +265,7 @@ class Env {
   //
   // Returning an error won't halt the walk, but it will cause it to return
   // with an error status when it's done.
-  typedef Callback<Status(FileType,const std::string&, const std::string&)> WalkCallback;
+  typedef Callback<Status(FileType, const std::string&, const std::string&)> WalkCallback;
 
   // Whether to walk directories in pre-order or post-order.
   enum DirectoryOrder {
@@ -245,6 +282,13 @@ class Env {
                       DirectoryOrder order,
                       const WalkCallback& cb) = 0;
 
+  // Finds paths on the filesystem matching a pattern.
+  //
+  // The found pathnames are added to the 'paths' vector. If no pathnames are
+  // found matching the pattern, no paths are added to the vector and an OK
+  // status is returned.
+  virtual Status Glob(const std::string& path_pattern, std::vector<std::string>* paths) = 0;
+
   // Canonicalize 'path' by applying the following conversions:
   // - Converts a relative path into an absolute one using the cwd.
   // - Converts '.' and '..' references.
@@ -255,6 +299,40 @@ class Env {
 
   // Get the total amount of RAM installed on this machine.
   virtual Status GetTotalRAMBytes(int64_t* ram) = 0;
+
+  // Get the max number of file descriptors that this process can open.
+  virtual int64_t GetOpenFileLimit() = 0;
+
+  // Increase the max number of file descriptors that this process can open as
+  // much as possible. On UNIX platforms, this means increasing the
+  // RLIMIT_NOFILE resource soft limit (the limit actually enforced by the
+  // kernel) to be equal to the hard limit.
+  virtual void IncreaseOpenFileLimit() = 0;
+
+  // Checks whether the given path resides on an ext2, ext3, or ext4
+  // filesystem.
+  //
+  // On success, 'result' contains the answer. On failure, 'result' is unset.
+  virtual Status IsOnExtFilesystem(const std::string& path, bool* result) = 0;
+
+  // Gets the kernel release string for this machine.
+  virtual std::string GetKernelRelease() = 0;
+
+  // Ensure that the file with the given path has permissions which adhere
+  // to the current configured umask (from flags.h). If the permissions are
+  // wider than the current umask, then a warning is logged and the permissions
+  // are fixed.
+  //
+  // Returns a bad Status if the file does not exist or the permissions cannot
+  // be changed.
+  virtual Status EnsureFileModeAdheresToUmask(const std::string& path) = 0;
+
+  // Special string injected into file-growing operations' random failures
+  // (if enabled).
+  //
+  // Only useful for tests.
+  static const char* const kInjectedFailureStatusMsg;
+
  private:
   // No copying allowed
   Env(const Env&);
@@ -350,12 +428,6 @@ class WritableFile {
   WritableFile() { }
   virtual ~WritableFile();
 
-  // Pre-allocates 'size' bytes for the file in the underlying filesystem.
-  // size bytes are added to the current pre-allocated size or to the current
-  // offset, whichever is bigger. In no case is the file truncated by this
-  // operation.
-  virtual Status PreAllocate(uint64_t size) = 0;
-
   virtual Status Append(const Slice& data) = 0;
 
   // If possible, uses scatter-gather I/O to efficiently append
@@ -364,6 +436,18 @@ class WritableFile {
   // For implementation specific quirks and details, see comments in
   // implementation source code (e.g., env_posix.cc)
   virtual Status AppendVector(const std::vector<Slice>& data_vector) = 0;
+
+  // Pre-allocates 'size' bytes for the file in the underlying filesystem.
+  // size bytes are added to the current pre-allocated size or to the current
+  // offset, whichever is bigger. In no case is the file truncated by this
+  // operation.
+  //
+  // On some implementations, preallocation is done without initializing the
+  // contents of the data blocks (as opposed to writing zeroes), requiring no
+  // IO to the data blocks.
+  //
+  // In no case is the file truncated by this operation.
+  virtual Status PreAllocate(uint64_t size) = 0;
 
   virtual Status Close() = 0;
 
@@ -403,8 +487,10 @@ struct RWFileOptions {
 // file offset is ever used; instead, all operations must provide an
 // explicit offset.
 //
-// All "read" operations are safe for concurrent use by multiple threads,
-// but "write" operations must be externally synchronized.
+// All operations are safe for concurrent use by multiple threads (unless
+// noted otherwise) bearing in mind the usual filesystem coherency guarantees
+// (e.g. two threads that write concurrently to the same file offset will
+// probably yield garbage).
 class RWFile {
  public:
   enum FlushMode {
@@ -423,8 +509,9 @@ class RWFile {
   // 'scratch[0..length-1]', which must be live when '*result' is used.
   // If an error was encountered, returns a non-OK status.
   //
-  // In the event of a "short read" (fewer bytes read than were requested),
-  // an IOError is returned.
+  // This method will internally retry on EINTR and "short reads" in order to
+  // fully read the requested number of bytes. In the event that it is not
+  // possible to read exactly 'length' bytes, an IOError is returned.
   //
   // Safe for concurrent use by multiple threads.
   virtual Status Read(uint64_t offset, size_t length,
@@ -437,8 +524,28 @@ class RWFile {
   // beginning at 'offset'. It is safe to preallocate the same range
   // repeatedly; this is an idempotent operation.
   //
+  // On some implementations, preallocation is done without initializing the
+  // contents of the data blocks (as opposed to writing zeroes), requiring no
+  // IO to the data blocks. On such implementations, this is much faster than
+  // using Truncate() to increase the file size.
+  //
   // In no case is the file truncated by this operation.
-  virtual Status PreAllocate(uint64_t offset, size_t length) = 0;
+  //
+  // 'mode' controls whether the file's logical size grows to include the
+  // preallocated space, or whether it remains the same.
+  enum PreAllocateMode {
+    CHANGE_FILE_SIZE,
+    DONT_CHANGE_FILE_SIZE
+  };
+  virtual Status PreAllocate(uint64_t offset,
+                             size_t length,
+                             PreAllocateMode mode) = 0;
+
+  // Truncate the file. If 'new_size' is less than the previous file size, the
+  // extra data will be lost. If 'new_size' is greater than the previous file
+  // size, the file length is extended, and the extended portion will contain
+  // null bytes ('\0').
+  virtual Status Truncate(uint64_t length) = 0;
 
   // Deallocates space given by 'offset' and length' from the file,
   // effectively "punching a hole" in it. The space will be reclaimed by
@@ -463,6 +570,8 @@ class RWFile {
 
   // Closes the file, optionally calling Sync() on it if the file was
   // created with the sync_on_close option enabled.
+  //
+  // Not thread-safe.
   virtual Status Close() = 0;
 
   // Retrieves the file's size.
@@ -493,109 +602,6 @@ extern Status WriteStringToFile(Env* env, const Slice& data,
 // A utility routine: read contents of named file into *data
 extern Status ReadFileToString(Env* env, const std::string& fname,
                                faststring* data);
-
-// An implementation of Env that forwards all calls to another Env.
-// May be useful to clients who wish to override just part of the
-// functionality of another Env.
-class EnvWrapper : public Env {
- public:
-  // Initialize an EnvWrapper that delegates all calls to *t
-  explicit EnvWrapper(Env* t) : target_(t) { }
-  virtual ~EnvWrapper();
-
-  // Return the target to which this Env forwards all calls
-  Env* target() const { return target_; }
-
-  // The following text is boilerplate that forwards all methods to target()
-  Status NewSequentialFile(const std::string& f, gscoped_ptr<SequentialFile>* r) OVERRIDE {
-    return target_->NewSequentialFile(f, r);
-  }
-  Status NewRandomAccessFile(const std::string& f,
-                             gscoped_ptr<RandomAccessFile>* r) OVERRIDE {
-    return target_->NewRandomAccessFile(f, r);
-  }
-  Status NewRandomAccessFile(const RandomAccessFileOptions& opts,
-                             const std::string& f,
-                             gscoped_ptr<RandomAccessFile>* r) OVERRIDE {
-    return target_->NewRandomAccessFile(opts, f, r);
-  }
-  Status NewWritableFile(const std::string& f, gscoped_ptr<WritableFile>* r) OVERRIDE {
-    return target_->NewWritableFile(f, r);
-  }
-  Status NewWritableFile(const WritableFileOptions& o,
-                         const std::string& f,
-                         gscoped_ptr<WritableFile>* r) OVERRIDE {
-    return target_->NewWritableFile(o, f, r);
-  }
-  Status NewTempWritableFile(const WritableFileOptions& o, const std::string& t,
-                             std::string* f, gscoped_ptr<WritableFile>* r) OVERRIDE {
-    return target_->NewTempWritableFile(o, t, f, r);
-  }
-  Status NewRWFile(const std::string& f, gscoped_ptr<RWFile>* r) OVERRIDE {
-    return target_->NewRWFile(f, r);
-  }
-  Status NewRWFile(const RWFileOptions& o,
-                   const std::string& f,
-                   gscoped_ptr<RWFile>* r) OVERRIDE {
-    return target_->NewRWFile(o, f, r);
-  }
-  bool FileExists(const std::string& f) OVERRIDE { return target_->FileExists(f); }
-  Status GetChildren(const std::string& dir, std::vector<std::string>* r) OVERRIDE {
-    return target_->GetChildren(dir, r);
-  }
-  Status DeleteFile(const std::string& f) OVERRIDE { return target_->DeleteFile(f); }
-  Status CreateDir(const std::string& d) OVERRIDE { return target_->CreateDir(d); }
-  Status SyncDir(const std::string& d) OVERRIDE { return target_->SyncDir(d); }
-  Status DeleteDir(const std::string& d) OVERRIDE { return target_->DeleteDir(d); }
-  Status DeleteRecursively(const std::string& d) OVERRIDE { return target_->DeleteRecursively(d); }
-  Status GetFileSize(const std::string& f, uint64_t* s) OVERRIDE {
-    return target_->GetFileSize(f, s);
-  }
-  Status GetFileSizeOnDisk(const std::string& f, uint64_t* s) OVERRIDE {
-    return target_->GetFileSizeOnDisk(f, s);
-  }
-  Status GetBlockSize(const std::string& f, uint64_t* s) OVERRIDE {
-    return target_->GetBlockSize(f, s);
-  }
-  Status RenameFile(const std::string& s, const std::string& t) OVERRIDE {
-    return target_->RenameFile(s, t);
-  }
-  Status LockFile(const std::string& f, FileLock** l) OVERRIDE {
-    return target_->LockFile(f, l);
-  }
-  Status UnlockFile(FileLock* l) OVERRIDE { return target_->UnlockFile(l); }
-  virtual Status GetTestDirectory(std::string* path) OVERRIDE {
-    return target_->GetTestDirectory(path);
-  }
-  uint64_t NowMicros() OVERRIDE {
-    return target_->NowMicros();
-  }
-  void SleepForMicroseconds(int micros) OVERRIDE {
-    target_->SleepForMicroseconds(micros);
-  }
-  uint64_t gettid() OVERRIDE {
-    return target_->gettid();
-  }
-  Status GetExecutablePath(std::string* path) OVERRIDE {
-    return target_->GetExecutablePath(path);
-  }
-  Status IsDirectory(const std::string& path, bool* is_dir) OVERRIDE {
-    return target_->IsDirectory(path, is_dir);
-  }
-  Status Walk(const std::string& root,
-              DirectoryOrder order,
-              const WalkCallback& cb) OVERRIDE {
-    return target_->Walk(root, order, cb);
-  }
-  Status Canonicalize(const std::string& path, std::string* result) OVERRIDE {
-    return target_->Canonicalize(path, result);
-  }
-  Status GetTotalRAMBytes(int64_t* ram) OVERRIDE {
-    return target_->GetTotalRAMBytes(ram);
-  }
- private:
-  Env* target_;
-};
 
 }  // namespace kudu
 

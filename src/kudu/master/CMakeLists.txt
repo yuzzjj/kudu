@@ -35,6 +35,7 @@ ADD_EXPORTABLE_LIBRARY(master_proto
 set(MASTER_SRCS
   catalog_manager.cc
   master.cc
+  master_cert_authority.cc
   master_options.cc
   master_service.cc
   master-path-handlers.cc
@@ -46,33 +47,28 @@ set(MASTER_SRCS
 
 add_library(master ${MASTER_SRCS})
 target_link_libraries(master
+  gutil
+  krpc
   kudu_common
-  tablet
+  kudu_util
+  master_proto
+  rpc_header_proto
+  security
   server_common
   server_process
-  krpc
-  gutil
-  kudu_util
+  tablet
+  token_proto
   tserver
-  tserver_service_proto
-  master_proto
-  rpc_header_proto)
-
-set(MASTER_RPC_SRCS
-  master_rpc.cc)
-set(MASTER_RPC_LIBS
-  kudu_common
-  krpc
-  gutil
-  kudu_util
-  master_proto
-  rpc_header_proto)
-ADD_EXPORTABLE_LIBRARY(master_rpc
-  SRCS ${MASTER_RPC_SRCS}
-  DEPS ${MASTER_RPC_LIBS})
+  tserver_service_proto)
 
 # Tests
-set(KUDU_TEST_LINK_LIBS master master_proto kudu_client ${KUDU_MIN_TEST_LIBS})
+set(KUDU_TEST_LINK_LIBS
+  ${KUDU_MIN_TEST_LIBS}
+  kudu_client
+  kudu_curl_util
+  master
+  master_proto)
+
 ADD_KUDU_TEST(catalog_manager-test)
 ADD_KUDU_TEST(master-test RESOURCE_LOCK "master-web-port")
 ADD_KUDU_TEST(sys_catalog-test RESOURCE_LOCK "master-web-port")
@@ -80,5 +76,6 @@ ADD_KUDU_TEST(sys_catalog-test RESOURCE_LOCK "master-web-port")
 # Actual master executable
 add_executable(kudu-master master_main.cc)
 target_link_libraries(kudu-master
+  ${KRB5_REALM_OVERRIDE}
   master
   ${KUDU_BASE_LIBS})

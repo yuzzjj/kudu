@@ -14,33 +14,22 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 #include "kudu/server/webserver.h"
 
-#include <algorithm>
-#include <stdio.h>
+#include <cstdio>
 #include <signal.h>
-#include <string>
+
+#include <algorithm>
+#include <functional>
 #include <map>
+#include <mutex>
+#include <sstream>
+#include <string>
 #include <vector>
-#include <boost/lexical_cast.hpp>
-#include <boost/bind.hpp>
-#include <boost/mem_fn.hpp>
+
 #include <boost/algorithm/string.hpp>
-#include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <gflags/gflags.h>
 #include <squeasel.h>
 
 #include "kudu/gutil/map-util.h"
@@ -50,9 +39,13 @@
 #include "kudu/gutil/strings/numbers.h"
 #include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/stringpiece.h"
+#include "kudu/gutil/strings/strip.h"
+#include "kudu/security/openssl_util.h"
 #include "kudu/util/env.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/locks.h"
 #include "kudu/util/net/net_util.h"
+#include "kudu/util/subprocess.h"
 #include "kudu/util/url-coding.h"
 #include "kudu/util/version_info.h"
 
@@ -60,10 +53,10 @@
 typedef sig_t sighandler_t;
 #endif
 
-using std::string;
-using std::stringstream;
-using std::vector;
 using std::make_pair;
+using std::ostringstream;
+using std::string;
+using std::vector;
 
 DEFINE_int32(webserver_max_post_length_bytes, 1024 * 1024,
              "The maximum length of a POST request that will be accepted by "
@@ -71,13 +64,18 @@ DEFINE_int32(webserver_max_post_length_bytes, 1024 * 1024,
 TAG_FLAG(webserver_max_post_length_bytes, advanced);
 TAG_FLAG(webserver_max_post_length_bytes, runtime);
 
+DEFINE_string(webserver_x_frame_options, "DENY",
+              "The webserver will add an 'X-Frame-Options' HTTP header with this value "
+              "to all responses. This can help prevent clickjacking attacks.");
+TAG_FLAG(webserver_x_frame_options, advanced);
+
 namespace kudu {
 
 Webserver::Webserver(const WebserverOptions& opts)
   : opts_(opts),
     context_(nullptr) {
   string host = opts.bind_interface.empty() ? "0.0.0.0" : opts.bind_interface;
-  http_address_ = host + ":" + boost::lexical_cast<string>(opts.port);
+  http_address_ = host + ":" + std::to_string(opts.port);
 }
 
 Webserver::~Webserver() {
@@ -85,7 +83,7 @@ Webserver::~Webserver() {
   STLDeleteValues(&path_handlers_);
 }
 
-void Webserver::RootHandler(const Webserver::WebRequest& args, stringstream* output) {
+void Webserver::RootHandler(const Webserver::WebRequest& args, ostringstream* output) {
   (*output) << "<h2>Status Pages</h2>";
   for (const PathHandlerMap::value_type& handler : path_handlers_) {
     if (handler.second->is_on_nav_bar()) {
@@ -134,12 +132,12 @@ Status Webserver::BuildListenSpec(string* spec) const {
 Status Webserver::Start() {
   LOG(INFO) << "Starting webserver on " << http_address_;
 
-  vector<const char*> options;
+  vector<string> options;
 
   if (static_pages_available()) {
     LOG(INFO) << "Document root: " << opts_.doc_root;
     options.push_back("document_root");
-    options.push_back(opts_.doc_root.c_str());
+    options.push_back(opts_.doc_root);
     options.push_back("enable_directory_listing");
     options.push_back("no");
   } else {
@@ -148,40 +146,65 @@ Status Webserver::Start() {
 
   if (IsSecure()) {
     LOG(INFO) << "Webserver: Enabling HTTPS support";
+
+    // Initialize OpenSSL, and prevent Squeasel from also performing global OpenSSL
+    // initialization.
+    security::InitializeOpenSSL();
+    options.push_back("ssl_global_init");
+    options.push_back("false");
+
     options.push_back("ssl_certificate");
-    options.push_back(opts_.certificate_file.c_str());
+    options.push_back(opts_.certificate_file);
+
+    if (!opts_.private_key_file.empty()) {
+      options.push_back("ssl_private_key");
+      options.push_back(opts_.private_key_file);
+
+      string key_password;
+      if (!opts_.private_key_password_cmd.empty()) {
+        vector<string> argv = strings::Split(opts_.private_key_password_cmd, " ",
+                                             strings::SkipEmpty());
+        if (argv.empty()) {
+          return Status::RuntimeError("invalid empty private key password command");
+        }
+        string stderr;
+        Status s = Subprocess::Call(argv, "" /* stdin */, &key_password, &stderr);
+        if (!s.ok()) {
+          return Status::RuntimeError("failed to run private key password command", stderr);
+        }
+        StripTrailingWhitespace(&key_password);
+      }
+      options.push_back("ssl_private_key_password");
+      options.push_back(key_password); // maybe empty if not configured.
+    }
   }
 
   if (!opts_.authentication_domain.empty()) {
     options.push_back("authentication_domain");
-    options.push_back(opts_.authentication_domain.c_str());
+    options.push_back(opts_.authentication_domain);
   }
 
   if (!opts_.password_file.empty()) {
     // Mongoose doesn't log anything if it can't stat the password file (but will if it
     // can't open it, which it tries to do during a request)
     if (!Env::Default()->FileExists(opts_.password_file)) {
-      stringstream ss;
+      ostringstream ss;
       ss << "Webserver: Password file does not exist: " << opts_.password_file;
       return Status::InvalidArgument(ss.str());
     }
     LOG(INFO) << "Webserver: Password file is " << opts_.password_file;
-    options.push_back("global_passwords_file");
-    options.push_back(opts_.password_file.c_str());
+    options.push_back("global_auth_file");
+    options.push_back(opts_.password_file);
   }
 
   options.push_back("listening_ports");
   string listening_str;
   RETURN_NOT_OK(BuildListenSpec(&listening_str));
-  options.push_back(listening_str.c_str());
+  options.push_back(listening_str);
 
   // Num threads
   options.push_back("num_threads");
-  string num_threads_str = SimpleItoa(opts_.num_worker_threads);
-  options.push_back(num_threads_str.c_str());
-
-  // Options must be a NULL-terminated list
-  options.push_back(nullptr);
+  options.push_back(std::to_string(opts_.num_worker_threads));
 
   // mongoose ignores SIGCHLD and we need it to run kinit. This means that since
   // mongoose does not reap its own children CGI programs must be avoided.
@@ -193,17 +216,24 @@ Status Webserver::Start() {
   callbacks.begin_request = &Webserver::BeginRequestCallbackStatic;
   callbacks.log_message = &Webserver::LogMessageCallbackStatic;
 
+  // Options must be a NULL-terminated list of C strings.
+  vector<const char*> c_options;
+  for (const auto& opt : options) {
+    c_options.push_back(opt.c_str());
+  }
+  c_options.push_back(nullptr);
+
   // To work around not being able to pass member functions as C callbacks, we store a
   // pointer to this server in the per-server state, and register a static method as the
   // default callback. That method unpacks the pointer to this and calls the real
   // callback.
-  context_ = sq_start(&callbacks, reinterpret_cast<void*>(this), &options[0]);
+  context_ = sq_start(&callbacks, reinterpret_cast<void*>(this), &c_options[0]);
 
   // Restore the child signal handler so wait() works properly.
   signal(SIGCHLD, sig_chld);
 
   if (context_ == nullptr) {
-    stringstream error_msg;
+    ostringstream error_msg;
     error_msg << "Webserver: Could not start on address " << http_address_;
     Sockaddr addr;
     addr.set_port(opts_.port);
@@ -212,7 +242,8 @@ Status Webserver::Start() {
   }
 
   PathHandlerCallback default_callback =
-    boost::bind<void>(boost::mem_fn(&Webserver::RootHandler), this, _1, _2);
+    std::bind<void>(std::mem_fn(&Webserver::RootHandler),
+                    this, std::placeholders::_1, std::placeholders::_2);
 
   RegisterPathHandler("/", "Home", default_callback);
 
@@ -279,7 +310,7 @@ int Webserver::BeginRequestCallback(struct sq_connection* connection,
                                     struct sq_request_info* request_info) {
   PathHandler* handler;
   {
-    boost::shared_lock<boost::shared_mutex> lock(lock_);
+    shared_lock<RWMutex> l(lock_);
     PathHandlerMap::const_iterator it = path_handlers_.find(request_info->uri);
     if (it == path_handlers_.end()) {
       // Let Mongoose deal with this request; returning NULL will fall through
@@ -350,7 +381,7 @@ int Webserver::RunPathHandler(const PathHandler& handler,
     use_style = false;
   }
 
-  stringstream output;
+  ostringstream output;
   if (use_style) BootstrapPageHeader(&output);
   for (const PathHandlerCallback& callback_ : handler.callbacks()) {
     callback_(req, &output);
@@ -359,26 +390,24 @@ int Webserver::RunPathHandler(const PathHandler& handler,
 
   string str = output.str();
   // Without styling, render the page as plain text
-  if (!use_style) {
-    sq_printf(connection, "HTTP/1.1 200 OK\r\n"
-              "Content-Type: text/plain\r\n"
-              "Content-Length: %zd\r\n"
-              "\r\n", str.length());
-  } else {
-    sq_printf(connection, "HTTP/1.1 200 OK\r\n"
-              "Content-Type: text/html\r\n"
-              "Content-Length: %zd\r\n"
-              "\r\n", str.length());
-  }
-
+  string headers = strings::Substitute(
+      "HTTP/1.1 200 OK\r\n"
+      "Content-Type: $0\r\n"
+      "Content-Length: $1\r\n"
+      "X-Frame-Options: $2\r\n"
+      "\r\n",
+      use_style ? "text/html" : "text/plain",
+      str.length(),
+      FLAGS_webserver_x_frame_options);
   // Make sure to use sq_write for printing the body; sq_printf truncates at 8kb
+  sq_write(connection, headers.c_str(), headers.length());
   sq_write(connection, str.c_str(), str.length());
   return 1;
 }
 
 void Webserver::RegisterPathHandler(const string& path, const string& alias,
     const PathHandlerCallback& callback, bool is_styled, bool is_on_nav_bar) {
-  boost::lock_guard<boost::shared_mutex> lock(lock_);
+  std::lock_guard<RWMutex> l(lock_);
   auto it = path_handlers_.find(path);
   if (it == path_handlers_.end()) {
     it = path_handlers_.insert(
@@ -390,6 +419,7 @@ void Webserver::RegisterPathHandler(const string& path, const string& alias,
 const char* const PAGE_HEADER = "<!DOCTYPE html>"
 " <html>"
 "   <head><title>Kudu</title>"
+" <meta charset='utf-8'/>"
 " <link href='/bootstrap/css/bootstrap.min.css' rel='stylesheet' media='screen' />"
 " <link href='/kudu.css' rel='stylesheet' />"
 " </head>"
@@ -413,7 +443,7 @@ static const char* const NAVIGATION_BAR_SUFFIX =
 "    </div>"
 "    <div class='container-fluid'>";
 
-void Webserver::BootstrapPageHeader(stringstream* output) {
+void Webserver::BootstrapPageHeader(ostringstream* output) {
   (*output) << PAGE_HEADER;
   (*output) << NAVIGATION_BAR_PREFIX;
   for (const PathHandlerMap::value_type& handler : path_handlers_) {
@@ -436,12 +466,12 @@ bool Webserver::static_pages_available() const {
 }
 
 void Webserver::set_footer_html(const std::string& html) {
-  boost::lock_guard<boost::shared_mutex> l(lock_);
+  std::lock_guard<RWMutex> l(lock_);
   footer_html_ = html;
 }
 
-void Webserver::BootstrapPageFooter(stringstream* output) {
-  boost::shared_lock<boost::shared_mutex> l(lock_);
+void Webserver::BootstrapPageFooter(ostringstream* output) {
+  shared_lock<RWMutex> l(lock_);
   *output << "</div>\n"; // end bootstrap 'container' div
   if (!footer_html_.empty()) {
     *output << "<footer class=\"footer\"><div class=\"container text-muted\">";

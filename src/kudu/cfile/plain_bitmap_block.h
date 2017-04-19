@@ -22,6 +22,7 @@
 #include <string>
 
 #include "kudu/cfile/block_encodings.h"
+#include "kudu/cfile/cfile_util.h"
 #include "kudu/common/columnblock.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -40,15 +41,16 @@ struct WriterOptions;
 // A plain encoder for the BOOL datatype: stores a column of BOOL values
 // as a packed bitmap.
 //
-class PlainBitMapBlockBuilder : public BlockBuilder {
+class PlainBitMapBlockBuilder final : public BlockBuilder {
  public:
-  PlainBitMapBlockBuilder()
-      : writer_(&buf_) {
+  explicit PlainBitMapBlockBuilder(const WriterOptions* options)
+      : writer_(&buf_),
+        options_(options) {
     Reset();
   }
 
-  virtual bool IsBlockFull(size_t limit) const OVERRIDE {
-    return writer_.bytes_written() > limit;
+  virtual bool IsBlockFull() const override {
+    return writer_.bytes_written() > options_->storage_attributes.cfile_block_size;
   }
 
   virtual int Add(const uint8_t* vals, size_t count) OVERRIDE  {
@@ -87,17 +89,24 @@ class PlainBitMapBlockBuilder : public BlockBuilder {
     return Status::NotSupported("BOOL keys not supported");
   }
 
+  // TODO Implement this method
+  virtual Status GetLastKey(void* key) const OVERRIDE {
+    return Status::NotSupported("BOOL keys not supported");
+  }
+
  private:
   faststring buf_;
   BitWriter writer_;
   size_t count_;
+
+  const WriterOptions* const options_;
 };
 
 
 //
 // Plain decoder for the BOOL datatype
 //
-class PlainBitMapBlockDecoder : public BlockDecoder {
+class PlainBitMapBlockDecoder final : public BlockDecoder {
  public:
   explicit PlainBitMapBlockDecoder(Slice slice)
       : data_(std::move(slice)),

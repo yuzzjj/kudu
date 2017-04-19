@@ -17,12 +17,13 @@
 
 #include "kudu/cfile/binary_plain_block.h"
 
-#include <glog/logging.h>
 #include <algorithm>
+#include <glog/logging.h>
 
 #include "kudu/cfile/cfile_util.h"
 #include "kudu/cfile/cfile_writer.h"
 #include "kudu/common/columnblock.h"
+#include "kudu/common/rowblock.h"
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/util/coding.h"
 #include "kudu/util/coding-inl.h"
@@ -51,8 +52,8 @@ void BinaryPlainBlockBuilder::Reset() {
   finished_ = false;
 }
 
-bool BinaryPlainBlockBuilder::IsBlockFull(size_t limit) const {
-  return size_estimate_ > limit;
+bool BinaryPlainBlockBuilder::IsBlockFull() const {
+  return size_estimate_ > options_->storage_attributes.cfile_block_size;
 }
 
 Slice BinaryPlainBlockBuilder::Finish(rowid_t ordinal_pos) {
@@ -79,10 +80,10 @@ int BinaryPlainBlockBuilder::Add(const uint8_t *vals, size_t count) {
   size_t i = 0;
 
   // If the block is full, should stop adding more items.
-  while (!IsBlockFull(options_->storage_attributes.cfile_block_size) && i < count) {
+  while (!IsBlockFull() && i < count) {
 
     // Every fourth entry needs a gvint selector byte
-    // TODO: does it cost a lot to account these things specifically?
+    // TODO(todd): does it cost a lot to account these things specifically?
     // maybe cheaper to just over-estimate - allocation is cheaper than math?
     if (offsets_.size() % 4 == 0) {
       size_estimate_++;
@@ -110,10 +111,12 @@ size_t BinaryPlainBlockBuilder::Count() const {
   return offsets_.size();
 }
 
-Status BinaryPlainBlockBuilder::GetFirstKey(void *key_void) const {
-  CHECK(finished_);
-
+Status BinaryPlainBlockBuilder::GetKeyAtIdx(void *key_void, int idx) const {
   Slice *slice = reinterpret_cast<Slice *>(key_void);
+
+  if (idx >= offsets_.size()) {
+    return Status::InvalidArgument("index too large");
+  }
 
   if (offsets_.empty()) {
     return Status::NotFound("no keys in data block");
@@ -122,11 +125,24 @@ Status BinaryPlainBlockBuilder::GetFirstKey(void *key_void) const {
   if (PREDICT_FALSE(offsets_.size() == 1)) {
     *slice = Slice(&buffer_[kMaxHeaderSize],
                    end_of_data_offset_ - kMaxHeaderSize);
+  } else if (idx + 1 == offsets_.size()) {
+    *slice = Slice(&buffer_[offsets_[idx]],
+                   end_of_data_offset_ - offsets_[idx]);
   } else {
-    *slice = Slice(&buffer_[kMaxHeaderSize],
-                   offsets_[1] - offsets_[0]);
+    *slice = Slice(&buffer_[offsets_[idx]],
+                   offsets_[idx + 1] - offsets_[idx]);
   }
   return Status::OK();
+}
+
+Status BinaryPlainBlockBuilder::GetFirstKey(void *key_void) const {
+  CHECK(finished_);
+  return GetKeyAtIdx(key_void, 0);
+}
+
+Status BinaryPlainBlockBuilder::GetLastKey(void *key_void) const {
+  CHECK(finished_);
+  return GetKeyAtIdx(key_void, offsets_.size() - 1);
 }
 
 ////////////////////////////////////////////////////////////
@@ -167,46 +183,50 @@ Status BinaryPlainBlockDecoder::ParseHeader() {
   const uint8_t *p = data_.data() + offsets_pos;
   const uint8_t *limit = data_.data() + data_.size();
 
-  offsets_.clear();
-  offsets_.reserve(num_elems_);
-
+  // Reserve one extra element, which we'll fill in at the end
+  // with an offset past the last element.
+  offsets_buf_.resize(sizeof(uint32_t) * (num_elems_ + 1));
+  uint32_t* dst_ptr = reinterpret_cast<uint32_t*>(offsets_buf_.data());
   size_t rem = num_elems_;
   while (rem >= 4) {
-    uint32_t ints[4];
-    if (p + 16 < limit) {
-      p = coding::DecodeGroupVarInt32_SSE(p, &ints[0], &ints[1], &ints[2], &ints[3]);
-    } else {
-      p = coding::DecodeGroupVarInt32_SlowButSafe(p, &ints[0], &ints[1], &ints[2], &ints[3]);
-    }
-    if (p > limit) {
-      LOG(WARNING) << "bad block: " << HexDump(data_);
-      return Status::Corruption(
-        StringPrintf("unable to decode offsets in block"));
-    }
+    if (PREDICT_TRUE(p + 16 < limit)) {
+      p = coding::DecodeGroupVarInt32_SSE(
+          p, &dst_ptr[0], &dst_ptr[1], &dst_ptr[2], &dst_ptr[3]);
 
-    offsets_.push_back(ints[0]);
-    offsets_.push_back(ints[1]);
-    offsets_.push_back(ints[2]);
-    offsets_.push_back(ints[3]);
+      // The above function should add at most 17 (4 32-bit ints plus a selector byte) to
+      // 'p'. Thus, since we checked that (p + 16 < limit) above, we are guaranteed that
+      // (p <= limit) now.
+      DCHECK_LE(p, limit);
+    } else {
+      p = coding::DecodeGroupVarInt32_SlowButSafe(
+          p, &dst_ptr[0], &dst_ptr[1], &dst_ptr[2], &dst_ptr[3]);
+      if (PREDICT_FALSE(p > limit)) {
+        // Only need to check 'p' overrun in the slow path, because 'p' may have
+        // been within 16 bytes of 'limit'.
+        LOG(WARNING) << "bad block: " << HexDump(data_);
+        return Status::Corruption(StringPrintf("unable to decode offsets in block"));
+      }
+    }
+    dst_ptr += 4;
     rem -= 4;
   }
 
   if (rem > 0) {
     uint32_t ints[4];
     p = coding::DecodeGroupVarInt32_SlowButSafe(p, &ints[0], &ints[1], &ints[2], &ints[3]);
-    if (p > limit) {
+    if (PREDICT_FALSE(p > limit)) {
       LOG(WARNING) << "bad block: " << HexDump(data_);
       return Status::Corruption(
         StringPrintf("unable to decode offsets in block"));
     }
 
     for (int i = 0; i < rem; i++) {
-      offsets_.push_back(ints[i]);
+      *dst_ptr++ = ints[i];
     }
   }
 
   // Add one extra entry pointing after the last item to make the indexing easier.
-  offsets_.push_back(offsets_pos);
+  *dst_ptr++ = offsets_pos;
 
   parsed_ = true;
 
@@ -255,36 +275,50 @@ Status BinaryPlainBlockDecoder::SeekAtOrAfterValue(const void *value_void, bool 
   return Status::OK();
 }
 
-Status BinaryPlainBlockDecoder::CopyNextValues(size_t *n, ColumnDataView *dst) {
+template <typename CellHandler>
+Status BinaryPlainBlockDecoder::HandleBatch(size_t* n, ColumnDataView* dst, CellHandler c) {
   DCHECK(parsed_);
   CHECK_EQ(dst->type_info()->physical_type(), BINARY);
   DCHECK_LE(*n, dst->nrows());
   DCHECK_EQ(dst->stride(), sizeof(Slice));
-
   Arena *out_arena = dst->arena();
   if (PREDICT_FALSE(*n == 0 || cur_idx_ >= num_elems_)) {
     *n = 0;
     return Status::OK();
   }
-
   size_t max_fetch = std::min(*n, static_cast<size_t>(num_elems_ - cur_idx_));
 
-  Slice *out = reinterpret_cast<Slice *>(dst->data());
-  size_t i;
-  for (i = 0; i < max_fetch; i++) {
+  Slice *out = reinterpret_cast<Slice*>(dst->data());
+  for (size_t i = 0; i < max_fetch; i++, out++, cur_idx_++) {
     Slice elem(string_at_index(cur_idx_));
-
-    // TODO: in a lot of cases, we might be able to get away with the decoder
-    // owning it and not truly copying. But, we should extend the CopyNextValues
-    // API so that the caller can specify if they truly _need_ copies or not.
-    CHECK(out_arena->RelocateSlice(elem, out));
-    out++;
-    cur_idx_++;
+    c(i, elem, out, out_arena);
   }
-
-  *n = i;
+  *n = max_fetch;
   return Status::OK();
 }
+
+Status BinaryPlainBlockDecoder::CopyNextValues(size_t* n, ColumnDataView* dst) {
+  return HandleBatch(n, dst, [&](size_t i, Slice elem, Slice* out, Arena* out_arena) {
+    CHECK(out_arena->RelocateSlice(elem, out));
+  });
+}
+
+Status BinaryPlainBlockDecoder::CopyNextAndEval(size_t* n,
+                                                ColumnMaterializationContext* ctx,
+                                                SelectionVectorView* sel,
+                                                ColumnDataView* dst) {
+  ctx->SetDecoderEvalSupported();
+  return HandleBatch(n, dst, [&](size_t i, Slice elem, Slice* out, Arena* out_arena) {
+    if (!sel->TestBit(i)) {
+      return;
+    } else if (ctx->pred()->EvaluateCell<BINARY>(static_cast<const void*>(&elem))) {
+      CHECK(out_arena->RelocateSlice(elem, out));
+    } else {
+      sel->ClearBit(i);
+    }
+  });
+}
+
 
 } // namespace cfile
 } // namespace kudu

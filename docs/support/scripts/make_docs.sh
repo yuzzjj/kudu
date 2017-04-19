@@ -146,7 +146,7 @@ for binary in ${binaries[@]}; do
   # Create the supported config reference
   xsltproc \
     --stringparam binary $binary \
-    --stringparam support-level stable \
+    --stringparam support-level supported \
     -o $GEN_DOC_DIR/${binary}_configuration_reference.adoc \
       $SOURCE_ROOT/docs/support/xsl/gflags_to_asciidoc.xsl \
     ${GEN_DOC_DIR}/$binary.xml
@@ -167,6 +167,30 @@ cp $SOURCE_ROOT/docs/configuration_reference* $GEN_DOC_DIR/
 sed -i "s#@@CONFIGURATION_REFERENCE@@#${INCLUSIONS_SUPPORTED}#" ${GEN_DOC_DIR}/configuration_reference.adoc
 sed -i "s#@@CONFIGURATION_REFERENCE@@#${INCLUSIONS_UNSUPPORTED}#" ${GEN_DOC_DIR}/configuration_reference_unsupported.adoc
 
+# Create tool references
+echo "Running kudu --helpxml"
+(
+  # Reset environment to avoid affecting the default flag values.
+  for var in $(env | awk -F= '{print $1}' | egrep -i 'KUDU|GLOG'); do
+    echo "unset $var"
+    eval "unset $var"
+  done
+
+  # Create the XML file.
+  # This command exits with a nonzero value.
+  $BUILD_ROOT/bin/kudu --helpxml > ${GEN_DOC_DIR}/kudu.xml || true
+)
+
+# Create the supported config reference
+xsltproc \
+-o $GEN_DOC_DIR/command_line_tools.adoc \
+  $SOURCE_ROOT/docs/support/xsl/tool_to_asciidoc.xsl \
+${GEN_DOC_DIR}/kudu.xml
+
+# Add the includes to the cli tools reference files, replacing the template lines
+cp $SOURCE_ROOT/docs/command_line_tools_reference.adoc $GEN_DOC_DIR/
+sed -i "s#@@TOOLS_REFERENCE@@#include::command_line_tools.adoc[leveloffset=+1]\n#" ${GEN_DOC_DIR}/command_line_tools_reference.adoc
+
 # If we're generating the web site, pass the template which causes us
 # to generate Jekyll templates instead of full HTML.
 if [ -n "$SITE" ]; then
@@ -184,7 +208,7 @@ cp $SOURCE_ROOT/docs/images/* "$OUTPUT_DIR/images/"
 
 echo
 echo ----------------------------
-echo "Docs built in $OUTPUT_DIR."
+echo "Docs built in $OUTPUT_DIR"
 
 # If we're building the site, try to run Jekyll for them to make
 # it a bit easier to quickly preview the results.

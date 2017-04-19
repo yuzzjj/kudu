@@ -15,62 +15,83 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <stdlib.h>
+
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
-#include <signal.h>
-#include <sys/time.h>
+#include <thread>
 
 #include "kudu/util/pstack_watcher.h"
 #include "kudu/util/flags.h"
+#include "kudu/util/minidump.h"
+#include "kudu/util/signal.h"
 #include "kudu/util/status.h"
+#include "kudu/util/test_util.h"
 
 DEFINE_int32(test_timeout_after, 0,
              "Maximum total seconds allowed for all unit tests in the suite. Default: disabled");
 
-// Start timer that kills the process if --test_timeout_after is exceeded before
-// the tests complete.
-static void CreateAndStartTimer();
+DEFINE_int32(stress_cpu_threads, 0,
+             "Number of threads to start that burn CPU in an attempt to "
+             "stimulate race conditions");
 
-// Gracefully kill the process.
-static void KillTestOnTimeout(int signum);
+namespace kudu {
+
+// Start thread that kills the process if --test_timeout_after is exceeded before
+// the tests complete.
+static void CreateAndStartTimeoutThread() {
+  if (FLAGS_test_timeout_after == 0) return;
+  std::thread([=](){
+      SleepFor(MonoDelta::FromSeconds(FLAGS_test_timeout_after));
+      // Dump a pstack to stdout.
+      WARN_NOT_OK(PstackWatcher::DumpStacks(), "Unable to print pstack");
+
+      // ...and abort.
+      LOG(FATAL) << "Maximum unit test time exceeded (" << FLAGS_test_timeout_after << " sec)";
+    }).detach();
+}
+} // namespace kudu
+
+
+static void StartStressThreads() {
+  for (int i = 0; i < FLAGS_stress_cpu_threads; i++) {
+    std::thread([]{
+        while (true) {
+          // Do something which won't be optimized out.
+          base::subtle::MemoryBarrier();
+        }
+      }).detach();
+  }
+}
 
 int main(int argc, char **argv) {
   google::InstallFailureSignalHandler();
+
+  // We don't use InitGoogleLoggingSafe() because gtest initializes glog, so we
+  // need to block SIGUSR1 explicitly in order to test minidump generation.
+  CHECK_OK(kudu::BlockSigUSR1());
+
+  // Ignore SIGPIPE for all tests so that threads writing to TLS
+  // sockets do not crash when writing to a closed socket. See KUDU-1910.
+  kudu::IgnoreSigPipe();
+
   // InitGoogleTest() must precede ParseCommandLineFlags(), as the former
   // removes gtest-related flags from argv that would trip up the latter.
   ::testing::InitGoogleTest(&argc, argv);
   kudu::ParseCommandLineFlags(&argc, &argv, true);
 
   // Create the test-timeout timer.
-  CreateAndStartTimer();
+  kudu::CreateAndStartTimeoutThread();
+
+  StartStressThreads();
+
+  // This is called by the KuduTest setup method, but in case we have
+  // any tests that don't inherit from KuduTest, it's helpful to
+  // cover our bases and call it here too.
+  kudu::KuduTest::OverrideKrb5Environment();
 
   int ret = RUN_ALL_TESTS();
 
   return ret;
-}
-
-static void CreateAndStartTimer() {
-  struct sigaction action;
-  struct itimerval timer;
-
-  // Create the test-timeout timer.
-  memset(&action, 0, sizeof(action));
-  action.sa_handler = &KillTestOnTimeout;
-  CHECK_ERR(sigaction(SIGALRM, &action, nullptr)) << "Unable to set timeout action";
-
-  timer.it_interval.tv_sec = 0;                      // No repeat.
-  timer.it_interval.tv_usec = 0;
-  timer.it_value.tv_sec = FLAGS_test_timeout_after;  // Fire in timeout seconds.
-  timer.it_value.tv_usec = 0;
-
-  CHECK_ERR(setitimer(ITIMER_REAL, &timer, nullptr)) << "Unable to set timeout timer";
-}
-
-static void KillTestOnTimeout(int signum) {
-  // Dump a pstack to stdout.
-  WARN_NOT_OK(kudu::PstackWatcher::DumpStacks(), "Unable to print pstack");
-
-  // ...and abort.
-  LOG(FATAL) << "Maximum unit test time exceeded (" << FLAGS_test_timeout_after << " sec)";
 }

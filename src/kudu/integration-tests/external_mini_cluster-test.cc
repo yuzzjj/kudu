@@ -15,15 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <glog/logging.h>
-#include <gtest/gtest.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <vector>
+
+#include <string>
+
+#include <glog/logging.h>
+#include <gtest/gtest.h>
 
 #include "kudu/integration-tests/external_mini_cluster.h"
+#include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/strings/util.h"
+#include "kudu/security/test/mini_kdc.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/test_util.h"
@@ -33,24 +37,79 @@ METRIC_DECLARE_gauge_uint64(threads_running);
 
 namespace kudu {
 
-class EMCTest : public KuduTest {
- public:
-  EMCTest() {
-    // Hard-coded RPC ports for the masters. This is safe, as this unit test
-    // runs under a resource lock (see CMakeLists.txt in this directory).
-    // TODO we should have a generic method to obtain n free ports.
-    master_peer_ports_ = { 11010, 11011, 11012 };
-  }
+using std::string;
+using strings::Substitute;
 
- protected:
-  std::vector<uint16_t> master_peer_ports_;
+enum KerberosMode {
+  WITHOUT_KERBEROS, WITH_KERBEROS
 };
 
-TEST_F(EMCTest, TestBasicOperation) {
+class ExternalMiniClusterTest : public KuduTest,
+                                public testing::WithParamInterface<KerberosMode> {};
+
+INSTANTIATE_TEST_CASE_P(KerberosOnAndOff,
+                        ExternalMiniClusterTest,
+                        ::testing::Values(WITHOUT_KERBEROS, WITH_KERBEROS));
+
+void SmokeTestKerberizedCluster(const ExternalMiniClusterOptions& opts) {
+  ASSERT_TRUE(opts.enable_kerberos);
+
+  ExternalMiniCluster cluster(opts);
+  ASSERT_OK(cluster.Start());
+
+  // Sleep long enough to ensure that the tserver's ticket would have expired
+  // if not for the renewal thread doing its thing.
+  SleepFor(MonoDelta::FromSeconds(16));
+
+  // Re-kinit for the client, since the client's ticket would have expired as well
+  // since the renewal thread doesn't run for the test client.
+  ASSERT_OK(cluster.kdc()->Kinit("test-admin"));
+
+  // Restart the master, and make sure the tserver is still able to reconnect and
+  // authenticate.
+  cluster.master(0)->Shutdown();
+  ASSERT_OK(cluster.master(0)->Restart());
+  // Ensure that all of the tablet servers can register with the masters.
+  ASSERT_OK(cluster.WaitForTabletServerCount(opts.num_tablet_servers, MonoDelta::FromSeconds(30)));
+  cluster.Shutdown();
+}
+
+TEST_F(ExternalMiniClusterTest, TestKerberosRenewal) {
+  if (!AllowSlowTests()) return;
+
   ExternalMiniClusterOptions opts;
-  opts.num_masters = master_peer_ports_.size();
+  opts.enable_kerberos = true;
+  // Set the kerberos ticket lifetime as 5 seconds to force ticket renewal every 5 seconds.
+  opts.mini_kdc_options.ticket_lifetime = "15s";
+  opts.num_tablet_servers = 1;
+
+  SmokeTestKerberizedCluster(opts);
+}
+
+TEST_F(ExternalMiniClusterTest, TestKerberosReacquire) {
+  if (!AllowSlowTests()) return;
+
+  ExternalMiniClusterOptions opts;
+  opts.enable_kerberos = true;
+  // Set the kerberos ticket lifetime and the renew lifetime as 5 seconds each, to force the
+  // processes to acquire a new ticket instead of being able to renew the existing one.
+  opts.mini_kdc_options.ticket_lifetime = "15s";
+  opts.mini_kdc_options.renew_lifetime = "15s";
+  opts.num_tablet_servers = 1;
+
+  SmokeTestKerberizedCluster(opts);
+}
+
+TEST_P(ExternalMiniClusterTest, TestBasicOperation) {
+  ExternalMiniClusterOptions opts;
+  opts.enable_kerberos = GetParam() == WITH_KERBEROS;
+
+  // Hard-coded RPC ports for the masters. This is safe, as this unit test
+  // runs under a resource lock (see CMakeLists.txt in this directory).
+  // TODO we should have a generic method to obtain n free ports.
+  opts.master_rpc_ports = { 11010, 11011, 11012 };
+  opts.num_masters = opts.master_rpc_ports.size();
   opts.num_tablet_servers = 3;
-  opts.master_rpc_ports = master_peer_ports_;
 
   ExternalMiniCluster cluster(opts);
   ASSERT_OK(cluster.Start());
@@ -80,7 +139,7 @@ TEST_F(EMCTest, TestBasicOperation) {
     SCOPED_TRACE(i);
     ExternalTabletServer* ts = CHECK_NOTNULL(cluster.tablet_server(i));
     HostPort ts_rpc = ts->bound_rpc_hostport();
-    string expected_prefix = strings::Substitute("$0:", cluster.GetBindIpForTabletServer(i));
+    string expected_prefix = Substitute("$0:", cluster.GetBindIpForTabletServer(i));
     EXPECT_NE(expected_prefix, "127.0.0.1") << "Should bind to unique per-server hosts";
     EXPECT_TRUE(HasPrefixString(ts_rpc.ToString(), expected_prefix)) << ts_rpc.ToString();
 
@@ -96,6 +155,9 @@ TEST_F(EMCTest, TestBasicOperation) {
                                  &value));
     EXPECT_GT(value, 0);
   }
+
+  // Ensure that all of the tablet servers can register with the masters.
+  ASSERT_OK(cluster.WaitForTabletServerCount(opts.num_tablet_servers, MonoDelta::FromSeconds(30)));
 
   // Restart a master and a tablet server. Make sure they come back up with the same ports.
   ExternalMaster* master = cluster.master(0);
@@ -118,6 +180,33 @@ TEST_F(EMCTest, TestBasicOperation) {
 
   ASSERT_EQ(ts_rpc.ToString(), ts->bound_rpc_hostport().ToString());
   ASSERT_EQ(ts_http.ToString(), ts->bound_http_hostport().ToString());
+
+  // Verify that, in a Kerberized cluster, if we drop our Kerberos environment,
+  // we can't make RPCs to a server.
+  if (opts.enable_kerberos) {
+    ASSERT_OK(cluster.kdc()->Kdestroy());
+    Status s = cluster.SetFlag(ts, "foo", "bar");
+    // The error differs depending on the version of Kerberos, so we match
+    // either message.
+    ASSERT_STR_MATCHES(s.ToString(), "Not authorized.*"
+                       "(Credentials cache file.*not found|"
+                        "No Kerberos credentials|"
+                        ".*No such file or directory)");
+  }
+
+  // Test that if we inject a fault into a tablet server's boot process
+  // ExternalTabletServer::Restart() still returns OK, even if the tablet server crashed.
+  ts->Shutdown();
+  ts->mutable_flags()->push_back("--fault_before_start=1.0");
+  ASSERT_OK(ts->Restart());
+  ASSERT_FALSE(ts->IsProcessAlive());
+  // Since the process should have already crashed, waiting for an injected crash with no
+  // timeout should still return OK.
+  ASSERT_OK(ts->WaitForInjectedCrash(MonoDelta::FromSeconds(0)));
+  ts->mutable_flags()->pop_back();
+  ts->Shutdown();
+  ASSERT_OK(ts->Restart());
+  ASSERT_TRUE(ts->IsProcessAlive());
 
   cluster.Shutdown();
 }

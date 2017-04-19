@@ -15,17 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <gflags/gflags.h>
-#include <glog/stl_logging.h>
-#include <gtest/gtest.h>
 #include <map>
 #include <memory>
 #include <set>
 #include <string>
 
+#include <gflags/gflags.h>
+#include <glog/stl_logging.h>
+#include <gtest/gtest.h>
+
 #include "kudu/client/client-test-util.h"
 #include "kudu/common/wire_protocol-test-util.h"
 #include "kudu/integration-tests/external_mini_cluster-itest-base.h"
+#include "kudu/master/master.pb.h"
+#include "kudu/master/master.proxy.h"
+#include "kudu/rpc/rpc_controller.h"
 #include "kudu/util/metrics.h"
 
 using std::multimap;
@@ -35,7 +39,6 @@ using std::vector;
 
 METRIC_DECLARE_entity(server);
 METRIC_DECLARE_histogram(handler_latency_kudu_tserver_TabletServerAdminService_CreateTablet);
-METRIC_DECLARE_histogram(handler_latency_kudu_tserver_TabletServerAdminService_DeleteTablet);
 
 namespace kudu {
 
@@ -66,6 +69,7 @@ TEST_F(CreateTableITest, TestCreateWhenMajorityOfReplicasFailCreation) {
   client::KuduSchema client_schema(client::KuduSchemaFromSchema(GetSimpleTestSchema()));
   ASSERT_OK(table_creator->table_name(kTableName)
             .schema(&client_schema)
+            .set_range_partition_columns({ "key" })
             .num_replicas(3)
             .wait(false)
             .Create());
@@ -123,15 +127,13 @@ TEST_F(CreateTableITest, TestCreateWhenMajorityOfReplicasFailCreation) {
 TEST_F(CreateTableITest, TestSpreadReplicasEvenly) {
   const int kNumServers = 10;
   const int kNumTablets = 20;
-  vector<string> ts_flags;
-  vector<string> master_flags;
-  ts_flags.push_back("--never_fsync"); // run faster on slow disks
-  NO_FATALS(StartCluster(ts_flags, master_flags, kNumServers));
+  NO_FATALS(StartCluster({}, {}, kNumServers));
 
   gscoped_ptr<client::KuduTableCreator> table_creator(client_->NewTableCreator());
   client::KuduSchema client_schema(client::KuduSchemaFromSchema(GetSimpleTestSchema()));
   ASSERT_OK(table_creator->table_name(kTableName)
             .schema(&client_schema)
+            .set_range_partition_columns({ "key" })
             .num_replicas(3)
             .add_hash_partitions({ "key" }, kNumTablets)
             .Create());
@@ -256,13 +258,18 @@ TEST_F(CreateTableITest, TestCreateTableWithDeadTServers) {
           // master considers the tservers unresponsive (and recreates the
           // outstanding table's tablets) during the test.
           "--tserver_unresponsive_timeout_ms=5000" }));
-  cluster_->Shutdown(ExternalMiniCluster::TS_ONLY);
+  cluster_->ShutdownNodes(ClusterNodes::TS_ONLY);
 
   Schema schema(GetSimpleTestSchema());
   client::KuduSchema client_schema(client::KuduSchemaFromSchema(schema));
   gscoped_ptr<client::KuduTableCreator> table_creator(client_->NewTableCreator());
+
+  // Don't bother waiting for table creation to finish; it'll never happen
+  // because all of the tservers are dead.
   CHECK_OK(table_creator->table_name(kTableName)
            .schema(&client_schema)
+           .set_range_partition_columns({ "key" })
+           .wait(false)
            .Create());
 
   // Spin off a bunch of threads that repeatedly look up random key ranges in the table.
@@ -277,9 +284,8 @@ TEST_F(CreateTableITest, TestCreateTableWithDeadTServers) {
   }
 
   // Give the lookup threads some time to crash the master.
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(MonoDelta::FromSeconds(15));
-  while (MonoTime::Now(MonoTime::FINE).ComesBefore(deadline)) {
+  MonoTime deadline = MonoTime::Now() + MonoDelta::FromSeconds(15);
+  while (MonoTime::Now() < deadline) {
     ASSERT_TRUE(cluster_->master()->IsProcessAlive()) << "Master crashed!";
     SleepFor(MonoDelta::FromMilliseconds(100));
   }

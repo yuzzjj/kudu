@@ -15,11 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <gtest/gtest.h>
 
 #include <algorithm>
 #include <memory>
+#include <string>
 #include <vector>
+
+#include <gtest/gtest.h>
 
 #include "kudu/common/wire_protocol.h"
 #include "kudu/gutil/stl_util.h"
@@ -28,17 +30,23 @@
 #include "kudu/master/master.proxy.h"
 #include "kudu/master/mini_master.h"
 #include "kudu/master/sys_catalog.h"
+#include "kudu/rpc/messenger.h"
+#include "kudu/security/cert.h"
+#include "kudu/security/crypto.h"
+#include "kudu/security/openssl_util.h"
 #include "kudu/server/rpc_server.h"
 #include "kudu/util/net/sockaddr.h"
+#include "kudu/util/pb_util.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_util.h"
-#include "kudu/rpc/messenger.h"
 
 using std::string;
 using std::shared_ptr;
 using kudu::rpc::Messenger;
 using kudu::rpc::MessengerBuilder;
-using kudu::rpc::RpcController;
+using kudu::security::Cert;
+using kudu::security::DataFormat;
+using kudu::security::PrivateKey;
 
 namespace kudu {
 namespace master {
@@ -99,7 +107,7 @@ class TableLoader : public TableVisitor {
 };
 
 static bool PbEquals(const google::protobuf::Message& a, const google::protobuf::Message& b) {
-  return a.DebugString() == b.DebugString();
+  return SecureDebugString(a) == SecureDebugString(b);
 }
 
 template<class C>
@@ -126,7 +134,9 @@ TEST_F(SysCatalogTest, TestSysCatalogTablesOperations) {
     l.mutable_data()->pb.set_state(SysTablesEntryPB::PREPARING);
     ASSERT_OK(SchemaToPB(Schema(), l.mutable_data()->pb.mutable_schema()));
     // Add the table
-    ASSERT_OK(master_->catalog_manager()->sys_catalog()->AddTable(table.get()));
+    SysCatalogTable::Actions actions;
+    actions.table_to_add = table.get();
+    ASSERT_OK(master_->catalog_manager()->sys_catalog()->Write(actions));
     l.Commit();
   }
 
@@ -141,7 +151,9 @@ TEST_F(SysCatalogTest, TestSysCatalogTablesOperations) {
     TableMetadataLock l(table.get(), TableMetadataLock::WRITE);
     l.mutable_data()->pb.set_version(1);
     l.mutable_data()->pb.set_state(SysTablesEntryPB::REMOVED);
-    ASSERT_OK(master_->catalog_manager()->sys_catalog()->UpdateTable(table.get()));
+    SysCatalogTable::Actions actions;
+    actions.table_to_update = table.get();
+    ASSERT_OK(master_->catalog_manager()->sys_catalog()->Write(actions));
     l.Commit();
   }
 
@@ -152,7 +164,9 @@ TEST_F(SysCatalogTest, TestSysCatalogTablesOperations) {
 
   // Delete the table
   loader.Reset();
-  ASSERT_OK(master_->catalog_manager()->sys_catalog()->DeleteTable(table.get()));
+  SysCatalogTable::Actions actions;
+  actions.table_to_delete = table.get();
+  ASSERT_OK(master_->catalog_manager()->sys_catalog()->Write(actions));
   ASSERT_OK(master_->catalog_manager()->sys_catalog()->VisitTables(&loader));
   ASSERT_EQ(0, loader.tables.size());
 }
@@ -261,7 +275,9 @@ TEST_F(SysCatalogTest, TestSysCatalogTabletsOperations) {
     loader.Reset();
     TabletMetadataLock l1(tablet1.get(), TabletMetadataLock::WRITE);
     TabletMetadataLock l2(tablet2.get(), TabletMetadataLock::WRITE);
-    ASSERT_OK(sys_catalog->AddTablets(tablets));
+    SysCatalogTable::Actions actions;
+    actions.tablets_to_add = tablets;
+    ASSERT_OK(sys_catalog->Write(actions));
     l1.Commit();
     l2.Commit();
 
@@ -278,7 +294,9 @@ TEST_F(SysCatalogTest, TestSysCatalogTabletsOperations) {
 
     TabletMetadataLock l1(tablet1.get(), TabletMetadataLock::WRITE);
     l1.mutable_data()->pb.set_state(SysTabletsEntryPB::RUNNING);
-    ASSERT_OK(sys_catalog->UpdateTablets(tablets));
+    SysCatalogTable::Actions actions;
+    actions.tablets_to_update = tablets;
+    ASSERT_OK(sys_catalog->Write(actions));
     l1.Commit();
 
     loader.Reset();
@@ -304,7 +322,10 @@ TEST_F(SysCatalogTest, TestSysCatalogTabletsOperations) {
     l2.mutable_data()->pb.set_state(SysTabletsEntryPB::RUNNING);
 
     loader.Reset();
-    ASSERT_OK(sys_catalog->AddAndUpdateTablets(to_add, to_update));
+    SysCatalogTable::Actions actions;
+    actions.tablets_to_add = to_add;
+    actions.tablets_to_update = to_update;
+    ASSERT_OK(sys_catalog->Write(actions));
 
     l1.Commit();
     l2.Commit();
@@ -324,7 +345,9 @@ TEST_F(SysCatalogTest, TestSysCatalogTabletsOperations) {
     tablets.push_back(tablet3.get());
 
     loader.Reset();
-    ASSERT_OK(master_->catalog_manager()->sys_catalog()->DeleteTablets(tablets));
+    SysCatalogTable::Actions actions;
+    actions.tablets_to_delete = tablets;
+    ASSERT_OK(master_->catalog_manager()->sys_catalog()->Write(actions));
     ASSERT_OK(master_->catalog_manager()->sys_catalog()->VisitTablets(&loader));
     ASSERT_EQ(1, loader.tablets.size());
     ASSERT_TRUE(MetadatasEqual(tablet2.get(), loader.tablets[0]));
@@ -364,6 +387,44 @@ TEST_F(SysCatalogTest, TestTabletInfoCommit) {
     ASSERT_EQ(SysTabletsEntryPB::RUNNING,
               read_lock.data().pb.state());
   }
+}
+
+// Check loading the auto-generated certificate authority information
+// upon startup.
+TEST_F(SysCatalogTest, LoadCertAuthorityInfo) {
+  // The system catalog should already contain newly generated CA private key
+  // and certificate: the SetUp() method awaits for the catalog manager
+  // becoming leader master, and by that time the certificate authority
+  // information should be loaded.
+  SysCertAuthorityEntryPB ca_entry;
+  ASSERT_OK(master_->catalog_manager()->sys_catalog()->
+            GetCertAuthorityEntry(&ca_entry));
+
+  // The CA private key data should be valid (DER format).
+  PrivateKey pkey;
+  EXPECT_OK(pkey.FromString(ca_entry.private_key(), DataFormat::DER));
+
+  // The data should be valid CA certificate in (DER format).
+  Cert cert;
+  EXPECT_OK(cert.FromString(ca_entry.certificate(), DataFormat::DER));
+}
+
+// Check that if the certificate authority information is already present,
+// it cannot be overwritten using SysCatalogTable::AddCertAuthorityInfo().
+// Basically, this is to verify that SysCatalogTable::AddCertAuthorityInfo()
+// can be called just once to store CA information on first cluster startup.
+TEST_F(SysCatalogTest, AttemptOverwriteCertAuthorityInfo) {
+  // The system catalog should already contain newly generated CA private key
+  // and certificate: the SetUp() method awaits for the catalog manager
+  // becoming leader master, and by that time the certificate authority
+  // information should be loaded.
+  SysCertAuthorityEntryPB ca_entry;
+  ASSERT_OK(master_->catalog_manager()->sys_catalog()->
+            GetCertAuthorityEntry(&ca_entry));
+  const Status s = master_->catalog_manager()->sys_catalog()->
+            AddCertAuthorityEntry(ca_entry);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  ASSERT_EQ("Corruption: One or more rows failed to write", s.ToString());
 }
 
 } // namespace master

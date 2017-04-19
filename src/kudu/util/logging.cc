@@ -14,38 +14,56 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 #include "kudu/util/logging.h"
 
-#include <boost/uuid/uuid.hpp>
-#include <boost/uuid/uuid_io.hpp>
-#include <boost/uuid/uuid_generators.hpp>
-#include <sstream>
 #include <stdio.h>
-#include <iostream>
+
+#include <algorithm>
 #include <fstream>
+#include <iostream>
+#include <mutex>
+#include <sstream>
+#include <utility>
+#include <vector>
+
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/uuid_generators.hpp>
+#include <boost/uuid/uuid_io.hpp>
 #include <glog/logging.h>
 
 #include "kudu/gutil/callback.h"
 #include "kudu/gutil/spinlock.h"
+#include "kudu/gutil/strings/substitute.h"
+#include "kudu/util/async_logger.h"
+#include "kudu/util/debug-util.h"
+#include "kudu/util/debug/leakcheck_disabler.h"
+#include "kudu/util/env.h"
+#include "kudu/util/env_util.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/minidump.h"
+#include "kudu/util/signal.h"
+#include "kudu/util/status.h"
 
 DEFINE_string(log_filename, "",
     "Prefix of log filename - "
     "full path is <log_dir>/<log_filename>.[INFO|WARN|ERROR|FATAL]");
 TAG_FLAG(log_filename, stable);
+
+DEFINE_bool(log_async, true,
+            "Enable asynchronous writing to log files. This improves "
+            "latency and stability.");
+TAG_FLAG(log_async, hidden);
+
+DEFINE_int32(log_async_buffer_bytes_per_level, 2 * 1024 * 1024,
+             "The number of bytes of buffer space used by each log "
+             "level. Only relevant when --log_async is enabled.");
+TAG_FLAG(log_async_buffer_bytes_per_level, hidden);
+
+DEFINE_int32(max_log_files, 10,
+    "Maximum number of log files to retain per severity level. The most recent "
+    "log files are retained. If set to 0, all log files are retained.");
+TAG_FLAG(max_log_files, runtime);
+TAG_FLAG(max_log_files, experimental);
 
 #define PROJ_NAME "kudu"
 
@@ -58,6 +76,11 @@ using base::SpinLock;
 using base::SpinLockHolder;
 
 namespace kudu {
+
+__thread bool tls_redact_user_data = true;
+bool g_should_redact_log;
+bool g_should_redact_flag;
+const char* const kRedactionMessage = "<redacted>";
 
 namespace {
 
@@ -111,6 +134,19 @@ SimpleSink* registered_sink = nullptr;
 // Protected by 'logging_mutex'.
 int initial_stderr_severity;
 
+void EnableAsyncLogging() {
+  debug::ScopedLeakCheckDisabler leaky;
+
+  // Enable Async for every level except for FATAL. Fatal should be synchronous
+  // to ensure that we get the fatal log message written before exiting.
+  for (auto level : { google::INFO, google::WARNING, google::ERROR }) {
+    auto* orig = google::base::GetLogger(level);
+    auto* async = new AsyncLogger(orig, FLAGS_log_async_buffer_bytes_per_level);
+    async->Start();
+    google::base::SetLogger(level, async);
+  }
+}
+
 void UnregisterLoggingCallbackUnlocked() {
   CHECK(logging_mutex.IsHeld());
   CHECK(registered_sink);
@@ -123,6 +159,48 @@ void UnregisterLoggingCallbackUnlocked() {
   registered_sink = nullptr;
 }
 
+void FlushCoverageOnExit() {
+  // Coverage flushing is not re-entrant, but this might be called from a
+  // crash signal context, so avoid re-entrancy.
+  static __thread bool in_call = false;
+  if (in_call) return;
+  in_call = true;
+
+  // The failure writer will be called multiple times per exit.
+  // We only need to flush coverage once. We use a 'once' here so that,
+  // if another thread is already flushing, we'll block and wait for them
+  // to finish before allowing this thread to call abort().
+  static std::once_flag once;
+  std::call_once(once, [] {
+      static const char msg[] = "Flushing coverage data before crash...\n";
+      write(STDERR_FILENO, msg, arraysize(msg));
+      TryFlushCoverage();
+    });
+  in_call = false;
+}
+
+// On SEGVs, etc, glog will call this function to write the error to stderr. This
+// implementation is copied from glog with the exception that we also flush coverage
+// the first time it's called.
+//
+// NOTE: this is only used in coverage builds!
+void FailureWriterWithCoverage(const char* data, int size) {
+  FlushCoverageOnExit();
+
+  // Original implementation from glog:
+  if (write(STDERR_FILENO, data, size) < 0) {
+    // Ignore errors.
+  }
+}
+
+// GLog "failure function". This is called in the case of LOG(FATAL) to
+// ensure that we flush coverage even on crashes.
+//
+// NOTE: this is only used in coverage builds!
+void FlushCoverageAndAbort() {
+  FlushCoverageOnExit();
+  abort();
+}
 } // anonymous namespace
 
 void InitGoogleLoggingSafe(const char* arg) {
@@ -147,13 +225,13 @@ void InitGoogleLoggingSafe(const char* arg) {
 
   if (!FLAGS_logtostderr) {
     // Verify that a log file can be created in log_dir by creating a tmp file.
-    stringstream ss;
+    ostringstream ss;
     random_generator uuid_generator;
     ss << FLAGS_log_dir << "/" << PROJ_NAME "_test_log." << uuid_generator();
     const string file_name = ss.str();
     ofstream test_file(file_name.c_str());
     if (!test_file.is_open()) {
-      stringstream error_msg;
+      ostringstream error_msg;
       error_msg << "Could not open file in log_dir " << FLAGS_log_dir;
       perror(error_msg.str().c_str());
       // Unlock the mutex before exiting the program to avoid mutex d'tor assert.
@@ -164,6 +242,17 @@ void InitGoogleLoggingSafe(const char* arg) {
   }
 
   google::InitGoogleLogging(arg);
+
+  // In coverage builds, we should flush coverage before exiting on crash.
+  // This way, fault injection tests still capture coverage of the daemon
+  // that "crashed".
+  if (IsCoverageBuild()) {
+    // We have to use both the "failure writer" and the "FailureFunction".
+    // This allows us to handle both LOG(FATAL) and unintended crashes like
+    // SEGVs.
+    google::InstallFailureWriter(FailureWriterWithCoverage);
+    google::InstallFailureFunction(FlushCoverageAndAbort);
+  }
 
   // Needs to be done after InitGoogleLogging
   if (FLAGS_log_filename.empty()) {
@@ -176,6 +265,18 @@ void InitGoogleLoggingSafe(const char* arg) {
   // Stderr logging threshold: FLAGS_stderrthreshold.
   // Sink logging: off.
   initial_stderr_severity = FLAGS_stderrthreshold;
+
+  // Ignore SIGPIPE early in the startup process so that threads writing to TLS
+  // sockets do not crash when writing to a closed socket. See KUDU-1910.
+  IgnoreSigPipe();
+
+  // For minidump support. Must be called before logging threads started.
+  CHECK_OK(BlockSigUSR1());
+
+  if (FLAGS_log_async) {
+    EnableAsyncLogging();
+  }
+
   logging_initialized = true;
 }
 
@@ -235,7 +336,7 @@ void UnregisterLoggingCallback() {
 }
 
 void GetFullLogFilename(google::LogSeverity severity, string* filename) {
-  stringstream ss;
+  ostringstream ss;
   ss << FLAGS_log_dir << "/" << FLAGS_log_filename << "."
      << google::GetLogSeverityName(severity);
   *filename = ss.str();
@@ -254,13 +355,30 @@ void ShutdownLoggingSafe() {
   logging_initialized = false;
 }
 
-void LogCommandLineFlags() {
-  LOG(INFO) << "Flags (see also /varz are on debug webserver):" << endl
-            << google::CommandlineFlagsIntoString();
+Status DeleteExcessLogFiles(Env* env) {
+  int32_t max_log_files = FLAGS_max_log_files;
+  // Ignore bad input or disable log rotation.
+  if (max_log_files <= 0) return Status::OK();
+
+  for (int severity = 0; severity < google::NUM_SEVERITIES; ++severity) {
+    // Build glob pattern for input
+    // e.g. /var/log/kudu/kudu-master.*.INFO.*
+    string pattern = strings::Substitute("$0/$1.*.$2.*", FLAGS_log_dir, FLAGS_log_filename,
+                                         google::GetLogSeverityName(severity));
+
+    // Keep the 'max_log_files' most recent log files, as compared by
+    // modification time. Glog files contain a second-granularity timestamp in
+    // the name, so this could potentially use the filename sort order as
+    // guaranteed by glob, however this code has been adapted from Impala which
+    // uses mtime to determine which files to delete, and there haven't been any
+    // issues in production settings.
+    RETURN_NOT_OK(env_util::DeleteExcessFilesByPattern(env, pattern, max_log_files));
+  }
+  return Status::OK();
 }
 
 // Support for the special THROTTLE_MSG token in a log message stream.
-ostream& operator<<(ostream &os, const PRIVATE_ThrottleMsg&) {
+ostream& operator<<(ostream &os, const PRIVATE_ThrottleMsg& /*unused*/) {
   using google::LogMessage;
 #ifdef DISABLE_RTTI
   LogMessage::LogStream *log = static_cast<LogMessage::LogStream*>(&os);

@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <boost/thread/locks.hpp>
 #include <glog/logging.h>
+#include <mutex>
+#include <string>
 #include <unordered_set>
 
 #include "kudu/gutil/macros.h"
@@ -30,7 +31,9 @@
 #include "kudu/util/test_util.h"
 #include "kudu/util/thread.h"
 #include "kudu/util/threadlocal.h"
+#include "kudu/util/threadlocal_cache.h"
 
+using std::string;
 using std::unordered_set;
 using std::vector;
 using strings::Substitute;
@@ -86,14 +89,14 @@ class Counter {
       registry_(CHECK_NOTNULL(registry)),
       val_(val) {
     LOG(INFO) << "Counter::~Counter(): tid = " << tid_ << ", addr = " << this << ", val = " << val_;
-    boost::lock_guard<RegistryLockType> reg_lock(*registry_->get_lock());
+    std::lock_guard<RegistryLockType> reg_lock(*registry_->get_lock());
     CHECK(registry_->RegisterUnlocked(this));
   }
 
   ~Counter() {
     LOG(INFO) << "Counter::~Counter(): tid = " << tid_ << ", addr = " << this << ", val = " << val_;
-    boost::lock_guard<RegistryLockType> reg_lock(*registry_->get_lock());
-    boost::lock_guard<CounterLockType> self_lock(lock_);
+    std::lock_guard<RegistryLockType> reg_lock(*registry_->get_lock());
+    std::lock_guard<CounterLockType> self_lock(lock_);
     LOG(INFO) << tid_ << ": deleting self from registry...";
     CHECK(registry_->UnregisterUnlocked(this));
   }
@@ -143,7 +146,7 @@ static void RegisterCounterAndLoopIncr(CounterRegistry* registry,
   reader_ready->Wait();
   // Now rock & roll on the counting loop.
   for (int i = 0; i < kTargetCounterVal; i++) {
-    boost::lock_guard<CounterLockType> l(*counter->get_lock());
+    std::lock_guard<CounterLockType> l(*counter->get_lock());
     counter->IncrementUnlocked();
   }
   // Let the reader know we're ready for him to verify our counts.
@@ -157,11 +160,11 @@ static void RegisterCounterAndLoopIncr(CounterRegistry* registry,
 static uint64_t Iterate(CounterRegistry* registry, int expected_counters) {
   uint64_t sum = 0;
   int seen_counters = 0;
-  boost::lock_guard<RegistryLockType> l(*registry->get_lock());
+  std::lock_guard<RegistryLockType> l(*registry->get_lock());
   for (Counter* counter : *registry->GetCountersUnlocked()) {
     uint64_t value;
     {
-      boost::lock_guard<CounterLockType> l(*counter->get_lock());
+      std::lock_guard<CounterLockType> l(*counter->get_lock());
       value = counter->GetValueUnlocked();
     }
     LOG(INFO) << "tid " << counter->tid() << " (counter " << counter << "): " << value;
@@ -316,6 +319,30 @@ TEST_F(ThreadLocalTest, TestTLSMember) {
   for (scoped_refptr<kudu::Thread> thread : threads) {
     CHECK_OK(ThreadJoiner(thread.get()).Join());
   }
+}
+
+TEST_F(ThreadLocalTest, TestThreadLocalCache) {
+  using TLC = ThreadLocalCache<int, string>;
+  TLC* tlc = TLC::GetInstance();
+
+  // Lookup in an empty cache should return nullptr.
+  ASSERT_EQ(nullptr, tlc->Lookup(0));
+
+  // Insert more items than the cache capacity.
+  const int kLastItem = TLC::kItemCapacity * 2;
+  for (int i = 1; i <= kLastItem ; i++) {
+    auto* item = tlc->EmplaceNew(i);
+    ASSERT_NE(nullptr, item);
+    *item = Substitute("item $0", i);
+  }
+
+  // Looking up the most recent items should return them.
+  string* item = tlc->Lookup(kLastItem);
+  ASSERT_NE(nullptr, item);
+  EXPECT_EQ(*item, Substitute("item $0", kLastItem));
+
+  // Looking up evicted items should return nullptr.
+  ASSERT_EQ(nullptr, tlc->Lookup(1));
 }
 
 } // namespace threadlocal

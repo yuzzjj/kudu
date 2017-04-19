@@ -23,6 +23,7 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/catalog_manager.h"
 #include "kudu/master/master.h"
+#include "kudu/master/master.proxy.h"
 #include "kudu/master/mini_master.h"
 #include "kudu/master/ts_descriptor.h"
 #include "kudu/master/ts_manager.h"
@@ -40,8 +41,9 @@ namespace kudu {
 
 using client::KuduClient;
 using client::KuduClientBuilder;
+using master::CatalogManager;
+using master::MasterServiceProxy;
 using master::MiniMaster;
-using master::TabletLocationsPB;
 using master::TSDescriptor;
 using std::shared_ptr;
 using tserver::MiniTabletServer;
@@ -61,11 +63,10 @@ MiniCluster::MiniCluster(Env* env, const MiniClusterOptions& options)
     num_ts_initial_(options.num_tablet_servers),
     master_rpc_ports_(options.master_rpc_ports),
     tserver_rpc_ports_(options.tserver_rpc_ports) {
-  mini_masters_.resize(num_masters_initial_);
 }
 
 MiniCluster::~MiniCluster() {
-  CHECK(!running_);
+  Shutdown();
 }
 
 Status MiniCluster::Start() {
@@ -96,6 +97,12 @@ Status MiniCluster::Start() {
   RETURN_NOT_OK_PREPEND(WaitForTabletServerCount(num_ts_initial_),
                         "Waiting for tablet servers to start");
 
+  RETURN_NOT_OK_PREPEND(rpc::MessengerBuilder("minicluster-messenger")
+                        .set_num_reactors(1)
+                        .set_max_negotiation_threads(1)
+                        .Build(&messenger_),
+                        "Failed to start Messenger for minicluster");
+
   running_ = true;
   return Status::OK();
 }
@@ -114,7 +121,7 @@ Status MiniCluster::StartDistributedMasters() {
                           Substitute("Couldn't start follower $0", i));
     VLOG(1) << "Started MiniMaster with UUID " << mini_master->permanent_uuid()
             << " at index " << i;
-    mini_masters_[i] = shared_ptr<MiniMaster>(mini_master.release());
+    mini_masters_.push_back(shared_ptr<MiniMaster>(mini_master.release()));
   }
   int i = 0;
   for (const shared_ptr<MiniMaster>& master : mini_masters_) {
@@ -137,8 +144,7 @@ Status MiniCluster::StartSync() {
 }
 
 Status MiniCluster::StartSingleMaster() {
-  // If there's a single master, 'mini_masters_' must be size 1.
-  CHECK_EQ(mini_masters_.size(), 1);
+  CHECK_EQ(1, num_masters_initial_);
   CHECK_LE(master_rpc_ports_.size(), 1);
   uint16_t master_rpc_port = 0;
   if (master_rpc_ports_.size() == 1) {
@@ -151,7 +157,7 @@ Status MiniCluster::StartSingleMaster() {
   RETURN_NOT_OK_PREPEND(mini_master->Start(), "Couldn't start master");
   RETURN_NOT_OK(mini_master->master()->
       WaitUntilCatalogManagerIsLeaderAndReadyForTests(MonoDelta::FromSeconds(5)));
-  mini_masters_[0] = shared_ptr<MiniMaster>(mini_master.release());
+  mini_masters_.push_back(shared_ptr<MiniMaster>(mini_master.release()));
   return Status::OK();
 }
 
@@ -178,141 +184,165 @@ Status MiniCluster::AddTabletServer() {
   return Status::OK();
 }
 
-MiniMaster* MiniCluster::leader_mini_master() {
-  Stopwatch sw;
-  sw.start();
-  while (sw.elapsed().wall_seconds() < kMasterLeaderElectionWaitTimeSeconds) {
-    for (int i = 0; i < mini_masters_.size(); i++) {
-      MiniMaster* master = mini_master(i);
-      if (master->master()->IsShutdown()) {
-        continue;
-      }
-      if (master->master()->catalog_manager()->IsInitialized() &&
-          master->master()->catalog_manager()->CheckIsLeaderAndReady().ok()) {
-        return master;
-      }
+void MiniCluster::ShutdownNodes(ClusterNodes nodes) {
+  if (nodes == ClusterNodes::ALL || nodes == ClusterNodes::TS_ONLY) {
+    for (const shared_ptr<MiniTabletServer>& tablet_server : mini_tablet_servers_) {
+      tablet_server->Shutdown();
     }
-    SleepFor(MonoDelta::FromMilliseconds(1));
+    mini_tablet_servers_.clear();
   }
-  LOG(ERROR) << "No leader master elected after " << kMasterLeaderElectionWaitTimeSeconds
-             << " seconds.";
-  return nullptr;
-}
-
-void MiniCluster::Shutdown() {
-  for (const shared_ptr<MiniTabletServer>& tablet_server : mini_tablet_servers_) {
-    tablet_server->Shutdown();
-  }
-  mini_tablet_servers_.clear();
-  for (shared_ptr<MiniMaster>& master_server : mini_masters_) {
-    master_server->Shutdown();
-    master_server.reset();
+  if (nodes == ClusterNodes::ALL || nodes == ClusterNodes::MASTERS_ONLY) {
+    for (const shared_ptr<MiniMaster>& master_server : mini_masters_) {
+      master_server->Shutdown();
+    }
+    mini_masters_.clear();
   }
   running_ = false;
 }
 
-void MiniCluster::ShutdownMasters() {
-  for (shared_ptr<MiniMaster>& master_server : mini_masters_) {
-    master_server->Shutdown();
-    master_server.reset();
-  }
-}
-
-MiniMaster* MiniCluster::mini_master(int idx) {
+MiniMaster* MiniCluster::mini_master(int idx) const {
   CHECK_GE(idx, 0) << "Master idx must be >= 0";
   CHECK_LT(idx, mini_masters_.size()) << "Master idx must be < num masters started";
   return mini_masters_[idx].get();
 }
 
-MiniTabletServer* MiniCluster::mini_tablet_server(int idx) {
+MiniTabletServer* MiniCluster::mini_tablet_server(int idx) const {
   CHECK_GE(idx, 0) << "TabletServer idx must be >= 0";
   CHECK_LT(idx, mini_tablet_servers_.size()) << "TabletServer idx must be < 'num_ts_started_'";
   return mini_tablet_servers_[idx].get();
 }
 
-string MiniCluster::GetMasterFsRoot(int idx) {
+string MiniCluster::GetMasterFsRoot(int idx) const {
   return JoinPathSegments(fs_root_, Substitute("master-$0-root", idx));
 }
 
-string MiniCluster::GetTabletServerFsRoot(int idx) {
+string MiniCluster::GetTabletServerFsRoot(int idx) const {
   return JoinPathSegments(fs_root_, Substitute("ts-$0-root", idx));
 }
 
-Status MiniCluster::WaitForReplicaCount(const string& tablet_id,
-                                        int expected_count) {
-  TabletLocationsPB locations;
-  return WaitForReplicaCount(tablet_id, expected_count, &locations);
-}
-
-Status MiniCluster::WaitForReplicaCount(const string& tablet_id,
-                                        int expected_count,
-                                        TabletLocationsPB* locations) {
-  Stopwatch sw;
-  sw.start();
-  while (sw.elapsed().wall_seconds() < kTabletReportWaitTimeSeconds) {
-    Status s =
-        leader_mini_master()->master()->catalog_manager()->GetTabletLocations(tablet_id, locations);
-    if (s.ok() && ((locations->stale() && expected_count == 0) ||
-        (!locations->stale() && locations->replicas_size() == expected_count))) {
-      return Status::OK();
-    }
-
-    SleepFor(MonoDelta::FromMilliseconds(1));
-  }
-  return Status::TimedOut(Substitute("Tablet $0 never reached expected replica count $1",
-                                     tablet_id, expected_count));
-}
-
-Status MiniCluster::WaitForTabletServerCount(int count) {
-  vector<shared_ptr<master::TSDescriptor> > descs;
-  return WaitForTabletServerCount(count, &descs);
+Status MiniCluster::WaitForTabletServerCount(int count) const {
+  vector<shared_ptr<master::TSDescriptor>> descs;
+  return WaitForTabletServerCount(count, MatchMode::MATCH_TSERVERS, &descs);
 }
 
 Status MiniCluster::WaitForTabletServerCount(int count,
-                                             vector<shared_ptr<TSDescriptor> >* descs) {
+                                             MatchMode mode,
+                                             vector<shared_ptr<TSDescriptor>>* descs) const {
+  unordered_set<int> masters_to_search;
+  for (int i = 0; i < num_masters(); i++) {
+    if (!mini_master(i)->master()->IsShutdown()) {
+      masters_to_search.insert(i);
+    }
+  }
+
   Stopwatch sw;
   sw.start();
   while (sw.elapsed().wall_seconds() < kRegistrationWaitTimeSeconds) {
-    leader_mini_master()->master()->ts_manager()->GetAllDescriptors(descs);
-    if (descs->size() == count) {
-      // GetAllDescriptors() may return servers that are no longer online.
-      // Do a second step of verification to verify that the descs that we got
-      // are aligned (same uuid/seqno) with the TSs that we have in the cluster.
+    for (auto iter = masters_to_search.begin(); iter != masters_to_search.end();) {
+      mini_master(*iter)->master()->ts_manager()->GetAllDescriptors(descs);
       int match_count = 0;
-      for (const shared_ptr<TSDescriptor>& desc : *descs) {
-        for (auto mini_tablet_server : mini_tablet_servers_) {
-          auto ts = mini_tablet_server->server();
-          if (ts->instance_pb().permanent_uuid() == desc->permanent_uuid() &&
-              ts->instance_pb().instance_seqno() == desc->latest_seqno()) {
-            match_count++;
-            break;
+      switch (mode) {
+        case MatchMode::MATCH_TSERVERS:
+          // GetAllDescriptors() may return servers that are no longer online.
+          // Do a second step of verification to verify that the descs that we got
+          // are aligned (same uuid/seqno) with the TSs that we have in the cluster.
+          for (const shared_ptr<TSDescriptor>& desc : *descs) {
+            for (auto mini_tablet_server : mini_tablet_servers_) {
+              auto ts = mini_tablet_server->server();
+              if (ts->instance_pb().permanent_uuid() == desc->permanent_uuid() &&
+                  ts->instance_pb().instance_seqno() == desc->latest_seqno()) {
+                match_count++;
+                break;
+              }
+            }
           }
-        }
+          break;
+        case MatchMode::DO_NOT_MATCH_TSERVERS:
+          match_count = descs->size();
+          break;
+        default:
+          LOG(FATAL) << "Invalid match mode";
       }
 
       if (match_count == count) {
-        LOG(INFO) << count << " TS(s) registered with Master after "
-                  << sw.elapsed().wall_seconds() << "s";
-        return Status::OK();
+        // This master has returned the correct set of tservers.
+        iter = masters_to_search.erase(iter);
+      } else {
+        iter++;
       }
+    }
+    if (masters_to_search.empty()) {
+      // All masters have returned the correct set of tservers.
+      LOG(INFO) << Substitute("$0 TS(s) registered with all masters after $1s",
+                              count, sw.elapsed().wall_seconds());
+      return Status::OK();
     }
     SleepFor(MonoDelta::FromMilliseconds(1));
   }
-  return Status::TimedOut(Substitute("$0 TS(s) never registered with master", count));
+  return Status::TimedOut(Substitute(
+      "Timed out waiting for $0 TS(s) to register with all masters", count));
 }
 
 Status MiniCluster::CreateClient(KuduClientBuilder* builder,
-                                 client::sp::shared_ptr<KuduClient>* client) {
-  KuduClientBuilder default_builder;
+                                 client::sp::shared_ptr<KuduClient>* client) const {
+  client::KuduClientBuilder defaults;
   if (builder == nullptr) {
-    builder = &default_builder;
+    builder = &defaults;
   }
+
   builder->clear_master_server_addrs();
   for (const shared_ptr<MiniMaster>& master : mini_masters_) {
     CHECK(master);
     builder->add_master_server_addr(master->bound_rpc_addr_str());
   }
   return builder->Build(client);
+}
+
+Status MiniCluster::GetLeaderMasterIndex(int* idx) const {
+  const MonoTime deadline = MonoTime::Now() +
+      MonoDelta::FromSeconds(kMasterStartupWaitTimeSeconds);
+
+  int leader_idx = -1;
+  while (MonoTime::Now() < deadline) {
+    for (int i = 0; i < num_masters(); i++) {
+      master::MiniMaster* mm = mini_master(i);
+      if (!mm->is_running() || mm->master()->IsShutdown()) {
+        continue;
+      }
+      master::CatalogManager* catalog = mm->master()->catalog_manager();
+      master::CatalogManager::ScopedLeaderSharedLock l(catalog);
+      if (l.first_failed_status().ok()) {
+        leader_idx = i;
+        break;
+      }
+    }
+    if (leader_idx != -1) {
+      break;
+    }
+    SleepFor(MonoDelta::FromMilliseconds(100));
+  }
+  if (leader_idx == -1) {
+    return Status::NotFound("Leader master was not found within deadline");
+  }
+
+  if (idx) {
+    *idx = leader_idx;
+  }
+  return Status::OK();
+}
+
+std::shared_ptr<rpc::Messenger> MiniCluster::messenger() const {
+  return messenger_;
+}
+
+std::shared_ptr<MasterServiceProxy> MiniCluster::master_proxy() const {
+  CHECK_EQ(1, mini_masters_.size());
+  return master_proxy(0);
+}
+
+std::shared_ptr<MasterServiceProxy> MiniCluster::master_proxy(int idx) const {
+  return std::shared_ptr<MasterServiceProxy>(
+      new MasterServiceProxy(messenger_, CHECK_NOTNULL(mini_master(idx))->bound_rpc_addr()));
 }
 
 } // namespace kudu

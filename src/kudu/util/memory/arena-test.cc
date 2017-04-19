@@ -15,12 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <boost/ptr_container/ptr_vector.hpp>
-#include <boost/thread/thread.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #include "kudu/gutil/stringprintf.h"
@@ -35,6 +34,8 @@ DEFINE_int32(alloc_size, 4, "number of bytes in each allocation");
 namespace kudu {
 
 using std::shared_ptr;
+using std::thread;
+using std::vector;
 
 template<class ArenaType>
 static void AllocateThread(ArenaType *arena, uint8_t thread_index) {
@@ -58,8 +59,7 @@ static void AllocateThread(ArenaType *arena, uint8_t thread_index) {
   }
 }
 
-// Non-templated function to forward to above -- simplifies
-// boost::thread creation
+// Non-templated function to forward to above -- simplifies thread creation
 static void AllocateThreadTSArena(ThreadSafeArena *arena, uint8_t thread_index) {
   AllocateThread(arena, thread_index);
 }
@@ -78,12 +78,12 @@ TEST(TestArena, TestMultiThreaded) {
 
   ThreadSafeArena arena(1024, 1024);
 
-  boost::ptr_vector<boost::thread> threads;
+  vector<thread> threads;
   for (uint8_t i = 0; i < FLAGS_num_threads; i++) {
-    threads.push_back(new boost::thread(AllocateThreadTSArena, &arena, (uint8_t)i));
+    threads.emplace_back(AllocateThreadTSArena, &arena, (uint8_t)i);
   }
 
-  for (boost::thread &thr : threads) {
+  for (thread& thr : threads) {
     thr.join();
   }
 }
@@ -100,6 +100,18 @@ TEST(TestArena, TestAlignment) {
       ret;
   }
 }
+
+TEST(TestArena, TestObjectAlignment) {
+  struct MyStruct {
+    int64_t v;
+  };
+  Arena a(256, 256 * 1024);
+  // Allocate a junk byte to ensure that the next allocation isn't "accidentally" aligned.
+  a.AllocateBytes(1);
+  void* v = a.NewObject<MyStruct>();
+  ASSERT_EQ(reinterpret_cast<uintptr_t>(v) % alignof(MyStruct), 0);
+}
+
 
 // MemTrackers update their ancestors when consuming and releasing memory to compute
 // usage totals. However, the lifetimes of parent and child trackers can be different.

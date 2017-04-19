@@ -14,30 +14,20 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
 
 #include "kudu/server/default-path-handlers.h"
 
-#include <boost/algorithm/string.hpp>
-#include <boost/bind.hpp>
+#include <sys/stat.h>
+
 #include <fstream>
-#include <gperftools/malloc_extension.h>
 #include <memory>
 #include <sstream>
 #include <string>
-#include <sys/stat.h>
 #include <vector>
+
+#include <boost/algorithm/string.hpp>
+#include <boost/bind.hpp>
+#include <gperftools/malloc_extension.h>
 
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/human_readable.h"
@@ -46,6 +36,7 @@
 #include "kudu/server/pprof-path-handlers.h"
 #include "kudu/server/webserver.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/flags.h"
 #include "kudu/util/histogram.pb.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/mem_tracker.h"
@@ -53,7 +44,6 @@
 #include "kudu/util/jsonwriter.h"
 
 using boost::replace_all;
-using google::CommandlineFlagsIntoString;
 using std::ifstream;
 using std::string;
 using std::endl;
@@ -94,7 +84,7 @@ struct Tags {
 
 // Writes the last FLAGS_web_log_bytes of the INFO logfile to a webpage
 // Note to get best performance, set GLOG_logbuflevel=-1 to prevent log buffering
-static void LogsHandler(const Webserver::WebRequest& req, std::stringstream* output) {
+static void LogsHandler(const Webserver::WebRequest& req, std::ostringstream* output) {
   bool as_text = (req.parsed_args.find("raw") != req.parsed_args.end());
   Tags tags(as_text);
   string logfile;
@@ -121,16 +111,22 @@ static void LogsHandler(const Webserver::WebRequest& req, std::stringstream* out
   }
 }
 
-// Registered to handle "/flags", and prints out all command-line flags and their values
-static void FlagsHandler(const Webserver::WebRequest& req, std::stringstream* output) {
+// Registered to handle "/flags", and prints out all command-line flags and their HTML
+// escaped values. If --redact is set with 'flag', the values of flags tagged as
+// sensitive will be redacted. The values would not be HTML escaped if in the raw text
+// mode, e.g. "/varz?raw".
+static void FlagsHandler(const Webserver::WebRequest& req, std::ostringstream* output) {
   bool as_text = (req.parsed_args.find("raw") != req.parsed_args.end());
   Tags tags(as_text);
+
   (*output) << tags.header << "Command-line Flags" << tags.end_header;
-  (*output) << tags.pre_tag << CommandlineFlagsIntoString() << tags.end_pre_tag;
+  (*output) << tags.pre_tag
+            << CommandlineFlagsIntoString(as_text ? EscapeMode::NONE : EscapeMode::HTML)
+            << tags.end_pre_tag;
 }
 
 // Registered to handle "/memz", and prints out memory allocation statistics.
-static void MemUsageHandler(const Webserver::WebRequest& req, std::stringstream* output) {
+static void MemUsageHandler(const Webserver::WebRequest& req, std::ostringstream* output) {
   bool as_text = (req.parsed_args.find("raw") != req.parsed_args.end());
   Tags tags(as_text);
 
@@ -148,7 +144,7 @@ static void MemUsageHandler(const Webserver::WebRequest& req, std::stringstream*
 }
 
 // Registered to handle "/mem-trackers", and prints out to handle memory tracker information.
-static void MemTrackersHandler(const Webserver::WebRequest& req, std::stringstream* output) {
+static void MemTrackersHandler(const Webserver::WebRequest& req, std::ostringstream* output) {
   *output << "<h1>Memory usage by subsystem</h1>\n";
   *output << "<table class='table table-striped'>\n";
   *output << "  <tr><th>Id</th><th>Parent</th><th>Limit</th><th>Current Consumption</th>"
@@ -181,7 +177,7 @@ void AddDefaultPathHandlers(Webserver* webserver) {
 
 
 static void WriteMetricsAsJson(const MetricRegistry* const metrics,
-                               const Webserver::WebRequest& req, std::stringstream* output) {
+                               const Webserver::WebRequest& req, std::ostringstream* output) {
   const string* requested_metrics_param = FindOrNull(req.parsed_args, "metrics");
   vector<string> requested_metrics;
   MetricJsonOptions opts;

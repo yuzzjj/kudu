@@ -61,7 +61,7 @@ class DeltaApplier : public ColumnwiseIterator {
   // All other rows are set to 1.
   virtual Status InitializeSelectionVector(SelectionVector *sel_vec) OVERRIDE;
 
-  Status MaterializeColumn(size_t col_idx, ColumnBlock *dst) OVERRIDE;
+  Status MaterializeColumn(ColumnMaterializationContext *ctx) override;
  private:
   friend class DeltaTracker;
 
@@ -71,11 +71,11 @@ class DeltaApplier : public ColumnwiseIterator {
 
   // Construct. The base_iter and delta_iter should not be Initted.
   DeltaApplier(std::shared_ptr<CFileSet::Iterator> base_iter,
-               std::shared_ptr<DeltaIterator> delta_iter);
+               std::unique_ptr<DeltaIterator> delta_iter);
   virtual ~DeltaApplier();
 
   std::shared_ptr<CFileSet::Iterator> base_iter_;
-  std::shared_ptr<DeltaIterator> delta_iter_;
+  std::unique_ptr<DeltaIterator> delta_iter_;
 
   bool first_prepare_;
 };

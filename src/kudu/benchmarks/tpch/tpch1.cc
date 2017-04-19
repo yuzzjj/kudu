@@ -81,6 +81,7 @@ DEFINE_string(tpch_path_to_data, "/tmp/lineitem.tbl",
               "The full path to the '|' separated file containing the lineitem table.");
 DEFINE_int32(tpch_num_query_iterations, 1, "Number of times the query will be run.");
 DEFINE_int32(tpch_expected_matching_rows, 5916591, "Number of rows that should match the query.");
+DEFINE_bool(tpch_check_matching_rows, true, "Whether to check the number of matching rows.");
 DEFINE_bool(use_mini_cluster, true,
             "Create a mini cluster for the work to be performed against.");
 DEFINE_string(mini_cluster_base_dir, "/tmp/tpch",
@@ -88,7 +89,9 @@ DEFINE_string(mini_cluster_base_dir, "/tmp/tpch",
 DEFINE_string(master_address, "localhost",
               "Address of master for the cluster to operate on");
 DEFINE_int32(tpch_max_batch_size, 1000,
-             "Maximum number of inserts/updates to batch at once");
+             "Maximum number of inserts/updates to batch at once.  Set to 0 "
+             "to delegate the batching control to the logic of the "
+             "KuduSession running in AUTO_BACKGROUND_MODE flush mode.");
 DEFINE_string(table_name, "lineitem",
               "The table name to write/read");
 
@@ -231,7 +234,9 @@ void Tpch1(RpcLineItemDAO *dao) {
     delete maps;
     delete returnflag.slice.data();
   }
-  CHECK_EQ(matching_rows, FLAGS_tpch_expected_matching_rows) << "Wrong number of rows returned";
+  if (FLAGS_tpch_check_matching_rows) {
+    CHECK_EQ(matching_rows, FLAGS_tpch_expected_matching_rows) << "Wrong number of rows returned";
+  }
 }
 
 } // namespace kudu
@@ -240,16 +245,16 @@ int main(int argc, char **argv) {
   kudu::ParseCommandLineFlags(&argc, &argv, true);
   kudu::InitGoogleLoggingSafe(argv[0]);
 
-  gscoped_ptr<kudu::Env> env;
+  kudu::Env* env;
   gscoped_ptr<kudu::MiniCluster> cluster;
   string master_address;
   if (FLAGS_use_mini_cluster) {
-    env.reset(new kudu::EnvWrapper(kudu::Env::Default()));
+    env = kudu::Env::Default();
     kudu::Status s = env->CreateDir(FLAGS_mini_cluster_base_dir);
-    CHECK(s.IsAlreadyPresent() || s.ok());
+    CHECK(s.IsAlreadyPresent() || s.ok()) << s.ToString();
     kudu::MiniClusterOptions options;
     options.data_root = FLAGS_mini_cluster_base_dir;
-    cluster.reset(new kudu::MiniCluster(env.get(), options));
+    cluster.reset(new kudu::MiniCluster(env, options));
     CHECK_OK(cluster->StartSync());
     master_address = cluster->mini_master()->bound_rpc_addr_str();
   } else {

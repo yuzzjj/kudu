@@ -21,41 +21,66 @@
 ////////////////////////////////////////////////////////////////////////////////
 
 #include <ctype.h>
-#include <glog/logging.h>
-#include <google/protobuf/compiler/code_generator.h>
-#include <google/protobuf/compiler/plugin.h>
-#include <google/protobuf/descriptor.h>
-#include <google/protobuf/io/printer.h>
-#include <google/protobuf/io/zero_copy_stream.h>
-#include <google/protobuf/stubs/common.h>
+
 #include <iostream>
 #include <map>
 #include <memory>
 #include <sstream>
 #include <string>
 
+#include <boost/optional.hpp>
+#include <glog/logging.h>
+#include <google/protobuf/compiler/code_generator.h>
+#include <google/protobuf/compiler/plugin.h>
+#include <google/protobuf/descriptor.h>
+#include <google/protobuf/descriptor.pb.h>
+#include <google/protobuf/io/printer.h>
+#include <google/protobuf/io/zero_copy_stream.h>
+#include <google/protobuf/stubs/common.h>
+
 #include "kudu/gutil/gscoped_ptr.h"
-#include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/numbers.h"
-#include "kudu/gutil/strings/strip.h"
+#include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/stringpiece.h"
+#include "kudu/gutil/strings/strip.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/strings/util.h"
+#include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/util/status.h"
 #include "kudu/util/string_case.h"
 
+using boost::optional;
 using google::protobuf::FileDescriptor;
 using google::protobuf::io::Printer;
 using google::protobuf::MethodDescriptor;
 using google::protobuf::ServiceDescriptor;
 using std::map;
 using std::shared_ptr;
+using std::set;
 using std::string;
 using std::vector;
 
 namespace kudu {
 namespace rpc {
+
+namespace {
+
+// Return the name of the authorization method specified for this
+// RPC method, or boost::none if none is specified.
+//
+// This handles fallback to the service-wide default.
+optional<string> GetAuthzMethod(const MethodDescriptor& method) {
+  if (method.options().HasExtension(authz_method)) {
+    return method.options().GetExtension(authz_method);
+  }
+  if (method.service()->options().HasExtension(default_authz_method)) {
+    return method.service()->options().GetExtension(default_authz_method);
+  }
+  return boost::none;
+}
+
+} // anonymous namespace
 
 class Substituter {
  public:
@@ -167,6 +192,7 @@ class MethodSubstitutions : public Substituter {
   }
 
   virtual void InitSubstitutionMap(map<string, string> *map) const OVERRIDE {
+
     (*map)["rpc_name"] = method_->name();
     (*map)["rpc_full_name"] = method_->full_name();
     (*map)["rpc_full_name_plainchars"] =
@@ -180,6 +206,9 @@ class MethodSubstitutions : public Substituter {
             StripNamespaceIfPossible(method_->service()->full_name(),
                                      method_->output_type()->full_name()));
     (*map)["metric_enum_key"] = strings::Substitute("kMetricIndex$0", method_->name());
+    bool track_result = static_cast<bool>(method_->options().GetExtension(track_rpc_result));
+    (*map)["track_result"] = track_result ? " true" : "false";
+    (*map)["authz_method"] = GetAuthzMethod(*method_).get_value_or("AuthorizeAllowAll");
   }
 
   // Strips the package from method arguments if they are in the same package as
@@ -326,6 +355,8 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
       "\n"
       "#include \"$path_no_extension$.pb.h\"\n"
       "\n"
+      "#include <functional>\n"
+      "#include <memory>\n"
       "#include <string>\n"
       "\n"
       "#include \"kudu/rpc/rpc_header.pb.h\"\n"
@@ -335,6 +366,7 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
       "class MetricEntity;\n"
       "namespace rpc {\n"
       "class Messenger;\n"
+      "class ResultTracker;\n"
       "class RpcContext;\n"
       "} // namespace rpc\n"
       "} // namespace kudu\n"
@@ -349,17 +381,17 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
       subs->PushService(service);
 
       Print(printer, *subs,
-        "\n"
-        "class $service_name$If : public ::kudu::rpc::ServiceIf {\n"
+        "class $service_name$If : public ::kudu::rpc::GeneratedServiceIf {\n"
         " public:\n"
-        "  explicit $service_name$If(const scoped_refptr<MetricEntity>& entity);\n"
+        "  explicit $service_name$If(const scoped_refptr<::kudu::MetricEntity>& entity,"
+            " const scoped_refptr<::kudu::rpc::ResultTracker>& result_tracker);\n"
         "  virtual ~$service_name$If();\n"
-        "  virtual void Handle(::kudu::rpc::InboundCall *call);\n"
-        "  virtual std::string service_name() const;\n"
+        "  std::string service_name() const override;\n"
         "  static std::string static_service_name();\n"
         "\n"
         );
 
+      set<string> authz_methods;
       for (int method_idx = 0; method_idx < service->method_count();
            ++method_idx) {
         const MethodDescriptor *method = service->method(method_idx);
@@ -369,41 +401,25 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
         "  virtual void $rpc_name$(const $request$ *req,\n"
         "     $response$ *resp, ::kudu::rpc::RpcContext *context) = 0;\n"
         );
-
         subs->Pop();
+        if (auto m = GetAuthzMethod(*method)) {
+          authz_methods.insert(m.get());
+        }
+      }
+
+      if (!authz_methods.empty()) {
+        printer->Print(
+        "\n\n"
+        "  // Authorization methods\n"
+        "  // ---------------------\n\n");
+      }
+      for (const string& m : authz_methods) {
+        printer->Print({ {"m", m} },
+        "  virtual bool $m$(const google::protobuf::Message* req,\n"
+        "     google::protobuf::Message* resp, ::kudu::rpc::RpcContext *context) = 0;\n");
       }
 
       Print(printer, *subs,
-        "\n"
-        " private:\n"
-      );
-
-
-      Print(printer, *subs,
-        "  enum RpcMetricIndexes {\n"
-      );
-      for (int method_idx = 0; method_idx < service->method_count();
-           ++method_idx) {
-        const MethodDescriptor *method = service->method(method_idx);
-        subs->PushMethod(method);
-
-        Print(printer, *subs,
-          "    $metric_enum_key$,\n"
-        );
-
-        subs->Pop();
-      }
-      Print(printer, *subs,
-        "  };\n" // enum
-      );
-
-      Print(printer, *subs,
-        "  static const int kMethodCount = $service_method_count$;\n"
-        "\n"
-        "  // Pre-initialize metrics because calling METRIC_foo.Instantiate() is expensive.\n"
-        "  void InitMetrics(const scoped_refptr<MetricEntity>& ent);\n"
-        "\n"
-        "  ::kudu::rpc::RpcMethodMetrics metrics_[kMethodCount];\n"
         "\n"
         "};\n"
       );
@@ -459,6 +475,13 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
     }
 
     Print(printer, *subs,
+      "using google::protobuf::Message;\n"
+      "using kudu::MetricEntity;\n"
+      "using kudu::rpc::ResultTracker;\n"
+      "using kudu::rpc::RpcContext;\n"
+      "using kudu::rpc::RpcMethodInfo;\n"
+      "using std::unique_ptr;\n"
+      "\n"
       "$open_namespace$"
       "\n");
 
@@ -468,40 +491,43 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
       subs->PushService(service);
 
       Print(printer, *subs,
-        "$service_name$If::$service_name$If(const scoped_refptr<MetricEntity>& entity) {\n"
-        "  InitMetrics(entity);\n"
-        "}\n"
-        "\n"
-        "$service_name$If::~$service_name$If() {\n"
-        "}\n"
-        "\n"
-        "void $service_name$If::Handle(::kudu::rpc::InboundCall *call) {\n"
-        "  {\n");
-
+        "$service_name$If::$service_name$If(const scoped_refptr<MetricEntity>& entity,"
+            " const scoped_refptr<ResultTracker>& result_tracker) {\n"
+            "result_tracker_ = result_tracker;\n"
+      );
       for (int method_idx = 0; method_idx < service->method_count();
            ++method_idx) {
         const MethodDescriptor *method = service->method(method_idx);
         subs->PushMethod(method);
 
         Print(printer, *subs,
-        "    if (call->remote_method().method_name() == \"$rpc_name$\") {\n"
-        "      $request$ *req = new $request$;\n"
-        "      if (PREDICT_FALSE(!ParseParam(call, req))) {\n"
-        "        delete req;\n"
-        "        return;\n"
-        "      }\n"
-        "      $response$ *resp = new $response$;\n"
-        "      $rpc_name$(req, resp,\n"
-        "          new ::kudu::rpc::RpcContext(call, req, resp,\n"
-        "                                      metrics_[$metric_enum_key$]));\n"
-        "      return;\n"
-        "    }\n"
-        "\n");
+              "  {\n"
+              "    scoped_refptr<RpcMethodInfo> mi(new RpcMethodInfo());\n"
+              "    mi->req_prototype.reset(new $request$());\n"
+              "    mi->resp_prototype.reset(new $response$());\n"
+              "    mi->authz_method = [this](const Message* req, Message* resp,\n"
+              "                              RpcContext* ctx) {\n"
+              "      return this->$authz_method$(static_cast<const $request$*>(req),\n"
+              "                           static_cast<$response$*>(resp),\n"
+              "                           ctx);\n"
+              "    };\n"
+              "    mi->track_result = $track_result$;\n"
+              "    mi->handler_latency_histogram =\n"
+              "        METRIC_handler_latency_$rpc_full_name_plainchars$.Instantiate(entity);\n"
+              "    mi->func = [this](const Message* req, Message* resp, RpcContext* ctx) {\n"
+              "      this->$rpc_name$(static_cast<const $request$*>(req),\n"
+              "                       static_cast<$response$*>(resp),\n"
+              "                       ctx);\n"
+              "    };\n"
+              "    methods_by_name_[\"$rpc_name$\"] = std::move(mi);\n"
+              "  }\n");
         subs->Pop();
       }
+
       Print(printer, *subs,
-        "  }\n"
-        "  RespondBadMethod(call);\n"
+        "}\n"
+        "\n"
+        "$service_name$If::~$service_name$If() {\n"
         "}\n"
         "\n"
         "std::string $service_name$If::service_name() const {\n"
@@ -509,27 +535,6 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
         "}\n"
         "std::string $service_name$If::static_service_name() {\n"
         "  return \"$full_service_name$\";\n"
-        "}\n"
-        "\n"
-      );
-
-      Print(printer, *subs,
-        "void $service_name$If::InitMetrics(const scoped_refptr<MetricEntity>& entity) {\n"
-      );
-      // Expose per-RPC metrics.
-      for (int method_idx = 0; method_idx < service->method_count();
-           ++method_idx) {
-        const MethodDescriptor *method = service->method(method_idx);
-        subs->PushMethod(method);
-
-        Print(printer, *subs,
-          "  metrics_[$metric_enum_key$].handler_latency = \n"
-          "      METRIC_handler_latency_$rpc_full_name_plainchars$.Instantiate(entity);\n"
-        );
-
-        subs->Pop();
-      }
-      Print(printer, *subs,
         "}\n"
         "\n"
       );
@@ -569,17 +574,11 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
       subs->PushService(service);
 
       Print(printer, *subs,
-        "class $service_name$Proxy {\n"
+        "class $service_name$Proxy : public ::kudu::rpc::Proxy {\n"
         " public:\n"
         "  $service_name$Proxy(const std::shared_ptr< ::kudu::rpc::Messenger>\n"
         "                &messenger, const ::kudu::Sockaddr &sockaddr);\n"
         "  ~$service_name$Proxy();\n"
-        "\n"
-        "  // Set the user information for the connection.\n"
-        "  void set_user_credentials(const ::kudu::rpc::UserCredentials& user_credentials);\n"
-        "\n"
-        "  // Get the current user information for the connection.\n"
-        "  const ::kudu::rpc::UserCredentials& user_credentials() const;\n"
         "\n"
         );
 
@@ -600,8 +599,6 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
         subs->Pop();
       }
       Print(printer, *subs,
-      " private:\n"
-      "  ::kudu::rpc::Proxy proxy_;\n"
       "};\n");
       subs->Pop();
     }
@@ -636,20 +633,12 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
         "$service_name$Proxy::$service_name$Proxy(\n"
         "   const std::shared_ptr< ::kudu::rpc::Messenger> &messenger,\n"
         "   const ::kudu::Sockaddr &remote)\n"
-        "  : proxy_(messenger, remote, \"$full_service_name$\") {\n"
+        "  : Proxy(messenger, remote, \"$full_service_name$\") {\n"
         "}\n"
         "\n"
         "$service_name$Proxy::~$service_name$Proxy() {\n"
         "}\n"
         "\n"
-        "void $service_name$Proxy::set_user_credentials(\n"
-        "  const ::kudu::rpc::UserCredentials& user_credentials) {\n"
-        "  proxy_.set_user_credentials(user_credentials);\n"
-        "}\n"
-        "\n"
-        "const ::kudu::rpc::UserCredentials& $service_name$Proxy::user_credentials() const {\n"
-        "  return proxy_.user_credentials();\n"
-        "}\n"
         "\n");
       for (int method_idx = 0; method_idx < service->method_count();
            ++method_idx) {
@@ -658,13 +647,13 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
         Print(printer, *subs,
         "::kudu::Status $service_name$Proxy::$rpc_name$(const $request$ &req, $response$ *resp,\n"
         "                                     ::kudu::rpc::RpcController *controller) {\n"
-        "  return proxy_.SyncRequest(\"$rpc_name$\", req, resp, controller);\n"
+        "  return SyncRequest(\"$rpc_name$\", req, resp, controller);\n"
         "}\n"
         "\n"
         "void $service_name$Proxy::$rpc_name$Async(const $request$ &req,\n"
         "                     $response$ *resp, ::kudu::rpc::RpcController *controller,\n"
         "                     const ::kudu::rpc::ResponseCallback &callback) {\n"
-        "  proxy_.AsyncRequest(\"$rpc_name$\", req, resp, controller, callback);\n"
+        "  AsyncRequest(\"$rpc_name$\", req, resp, controller, callback);\n"
         "}\n"
         "\n");
         subs->Pop();

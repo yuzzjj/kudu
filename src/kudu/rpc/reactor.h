@@ -17,15 +17,17 @@
 #ifndef KUDU_RPC_REACTOR_H
 #define KUDU_RPC_REACTOR_H
 
-#include <boost/intrusive/list.hpp>
-#include <boost/utility.hpp>
-#include <ev++.h>
+#include <stdint.h>
+
 #include <list>
 #include <map>
 #include <memory>
 #include <set>
-#include <stdint.h>
 #include <string>
+
+#include <boost/function.hpp>
+#include <boost/intrusive/list.hpp>
+#include <ev++.h>
 
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/connection.h"
@@ -37,9 +39,12 @@
 #include "kudu/util/status.h"
 
 namespace kudu {
+
+class Socket;
+
 namespace rpc {
 
-typedef std::list<scoped_refptr<Connection> > conn_list_t;
+typedef std::list<scoped_refptr<Connection>> conn_list_t;
 
 class DumpRunningRpcsRequestPB;
 class DumpRunningRpcsResponsePB;
@@ -89,10 +94,10 @@ class DelayedTask : public ReactorTask {
   DelayedTask(boost::function<void(const Status &)> func, MonoDelta when);
 
   // Schedules the task for running later but doesn't actually run it yet.
-  virtual void Run(ReactorThread* reactor) OVERRIDE;
+  void Run(ReactorThread* thread) override;
 
   // Behaves like ReactorTask::Abort.
-  virtual void Abort(const Status& abort_status) OVERRIDE;
+  void Abort(const Status& abort_status) override;
 
  private:
   // libev callback for when the registered timer fires.
@@ -167,14 +172,12 @@ class ReactorThread {
 
   // Begin the process of connection negotiation.
   // Must be called from the reactor thread.
-  // Deadline specifies latest time negotiation may complete before timeout.
-  Status StartConnectionNegotiation(const scoped_refptr<Connection>& conn,
-                                    const MonoTime& deadline);
+  Status StartConnectionNegotiation(const scoped_refptr<Connection>& conn);
 
   // Transition back from negotiating to processing requests.
   // Must be called from the reactor thread.
   void CompleteConnectionNegotiation(const scoped_refptr<Connection>& conn,
-      const Status& status);
+                                     const Status& status);
 
   // Collect metrics.
   // Must be called from the reactor thread.
@@ -192,10 +195,8 @@ class ReactorThread {
   // If such a connection already exists, returns that, otherwise creates a new one.
   // May return a bad Status if the connect() call fails.
   // The resulting connection object is managed internally by the reactor thread.
-  // Deadline specifies latest time allowed for initializing the connection.
   Status FindOrStartConnection(const ConnectionId& conn_id,
-                               scoped_refptr<Connection>* conn,
-                               const MonoTime& deadline);
+                               scoped_refptr<Connection>* conn);
 
   // Shut down the given connection, removing it from the connection tracking
   // structures of this reactor.
@@ -221,7 +222,7 @@ class ReactorThread {
   void AssignOutboundCall(const std::shared_ptr<OutboundCall> &call);
 
   // Register a new connection.
-  void RegisterConnection(const scoped_refptr<Connection>& conn);
+  void RegisterConnection(scoped_refptr<Connection> conn);
 
   // Actually perform shutdown of the thread, tearing down any connections,
   // etc. This is called from within the thread.
@@ -268,7 +269,7 @@ class ReactorThread {
 // A Reactor manages a ReactorThread
 class Reactor {
  public:
-  Reactor(const std::shared_ptr<Messenger>& messenger,
+  Reactor(std::shared_ptr<Messenger> messenger,
           int index,
           const MessengerBuilder &bld);
   Status Init();

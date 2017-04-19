@@ -32,9 +32,11 @@
 #include "kudu/tablet/mutation.h"
 #include "kudu/tablet/mvcc.h"
 #include "kudu/util/coding-inl.h"
+#include "kudu/util/compression/compression_codec.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/hexdump.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/trace.h"
 
 DECLARE_bool(cfile_lazy_open);
 DEFINE_int32(deltafile_default_block_size, 32*1024,
@@ -42,15 +44,20 @@ DEFINE_int32(deltafile_default_block_size, 32*1024,
              "on a per-table basis.");
 TAG_FLAG(deltafile_default_block_size, experimental);
 
+DEFINE_string(deltafile_default_compression_codec, "lz4",
+              "The compression codec used when writing deltafiles.");
+TAG_FLAG(deltafile_default_compression_codec, experimental);
+
 using std::shared_ptr;
+using std::unique_ptr;
 
 namespace kudu {
 
-using cfile::BlockHandle;
-using cfile::BlockPointer;
-using cfile::IndexTreeIterator;
 using cfile::BinaryPlainBlockDecoder;
+using cfile::BlockPointer;
 using cfile::CFileReader;
+using cfile::IndexTreeIterator;
+using cfile::ReaderOptions;
 using fs::ReadableBlock;
 using fs::ScopedWritableBlockCloser;
 using fs::WritableBlock;
@@ -63,7 +70,7 @@ namespace {
 
 } // namespace
 
-DeltaFileWriter::DeltaFileWriter(gscoped_ptr<WritableBlock> block)
+DeltaFileWriter::DeltaFileWriter(unique_ptr<WritableBlock> block)
 #ifndef NDEBUG
  : has_appended_(false)
 #endif
@@ -72,7 +79,11 @@ DeltaFileWriter::DeltaFileWriter(gscoped_ptr<WritableBlock> block)
   opts.write_validx = true;
   opts.storage_attributes.cfile_block_size = FLAGS_deltafile_default_block_size;
   opts.storage_attributes.encoding = PLAIN_ENCODING;
-  writer_.reset(new cfile::CFileWriter(opts, GetTypeInfo(BINARY), false, block.Pass()));
+  opts.storage_attributes.compression = GetCompressionCodecType(
+      FLAGS_deltafile_default_compression_codec);
+  // No optimization for deltafiles because a deltafile index key must decode into a DeltaKey
+  opts.optimize_index_keys = false;
+  writer_.reset(new cfile::CFileWriter(opts, GetTypeInfo(BINARY), false, std::move(block)));
 }
 
 
@@ -87,18 +98,15 @@ Status DeltaFileWriter::Finish() {
 }
 
 Status DeltaFileWriter::FinishAndReleaseBlock(ScopedWritableBlockCloser* closer) {
+  if (writer_->written_value_count() == 0) {
+    return Status::Aborted("no deltas written");
+  }
   return writer_->FinishAndReleaseBlock(closer);
 }
 
 Status DeltaFileWriter::DoAppendDelta(const DeltaKey &key,
                                       const RowChangeList &delta) {
   Slice delta_slice(delta.slice());
-
-  // See TODO in RowChangeListEncoder::SetToReinsert
-  CHECK(!delta.is_reinsert())
-    << "TODO: REINSERT deltas cannot currently be written to disk "
-    << "since they don't have a standalone encoded form.";
-
   tmp_buf_.clear();
 
   // Write the encoded form of the key to the file.
@@ -148,17 +156,13 @@ Status DeltaFileWriter::AppendDelta<UNDO>(
   return DoAppendDelta(key, delta);
 }
 
-Status DeltaFileWriter::WriteDeltaStats(const DeltaStats& stats) {
+void DeltaFileWriter::WriteDeltaStats(const DeltaStats& stats) {
   DeltaStatsPB delta_stats_pb;
   stats.ToPB(&delta_stats_pb);
 
   faststring buf;
-  if (!pb_util::SerializeToString(delta_stats_pb, &buf)) {
-    return Status::IOError("Unable to serialize DeltaStatsPB", delta_stats_pb.DebugString());
-  }
-
+  pb_util::SerializeToString(delta_stats_pb, &buf);
   writer_->AddMetadataPair(DeltaFileReader::kDeltaStatsEntryName, buf.ToString());
-  return Status::OK();
 }
 
 
@@ -166,29 +170,31 @@ Status DeltaFileWriter::WriteDeltaStats(const DeltaStats& stats) {
 // Reader
 ////////////////////////////////////////////////////////////
 
-Status DeltaFileReader::Open(gscoped_ptr<ReadableBlock> block,
-                             const BlockId& block_id,
-                             shared_ptr<DeltaFileReader>* reader_out,
-                             DeltaType delta_type) {
+Status DeltaFileReader::Open(unique_ptr<ReadableBlock> block,
+                             DeltaType delta_type,
+                             ReaderOptions options,
+                             shared_ptr<DeltaFileReader>* reader_out) {
   shared_ptr<DeltaFileReader> df_reader;
-  RETURN_NOT_OK(DeltaFileReader::OpenNoInit(block.Pass(),
-                                            block_id, &df_reader, delta_type));
+  RETURN_NOT_OK(DeltaFileReader::OpenNoInit(std::move(block),
+                                            delta_type,
+                                            std::move(options),
+                                            &df_reader));
   RETURN_NOT_OK(df_reader->Init());
 
   *reader_out = df_reader;
   return Status::OK();
 }
 
-Status DeltaFileReader::OpenNoInit(gscoped_ptr<ReadableBlock> block,
-                                   const BlockId& block_id,
-                                   shared_ptr<DeltaFileReader>* reader_out,
-                                   DeltaType delta_type) {
-  gscoped_ptr<CFileReader> cf_reader;
-  RETURN_NOT_OK(CFileReader::OpenNoInit(block.Pass(),
-                                        cfile::ReaderOptions(), &cf_reader));
-  gscoped_ptr<DeltaFileReader> df_reader(new DeltaFileReader(block_id,
-                                                             cf_reader.release(),
-                                                             delta_type));
+Status DeltaFileReader::OpenNoInit(unique_ptr<ReadableBlock> block,
+                                   DeltaType delta_type,
+                                   ReaderOptions options,
+                                   shared_ptr<DeltaFileReader>* reader_out) {
+  unique_ptr<CFileReader> cf_reader;
+  RETURN_NOT_OK(CFileReader::OpenNoInit(std::move(block),
+                                        std::move(options),
+                                        &cf_reader));
+  gscoped_ptr<DeltaFileReader> df_reader(
+      new DeltaFileReader(std::move(cf_reader), delta_type));
   if (!FLAGS_cfile_lazy_open) {
     RETURN_NOT_OK(df_reader->Init());
   }
@@ -198,10 +204,9 @@ Status DeltaFileReader::OpenNoInit(gscoped_ptr<ReadableBlock> block,
   return Status::OK();
 }
 
-DeltaFileReader::DeltaFileReader(BlockId block_id, CFileReader *cf_reader,
+DeltaFileReader::DeltaFileReader(unique_ptr<CFileReader> cf_reader,
                                  DeltaType delta_type)
-    : reader_(cf_reader),
-      block_id_(std::move(block_id)),
+    : reader_(cf_reader.release()),
       delta_type_(delta_type) {}
 
 Status DeltaFileReader::Init() {
@@ -255,14 +260,26 @@ bool DeltaFileReader::IsRelevantForSnapshot(const MvccSnapshot& snap) const {
   return false;
 }
 
+Status DeltaFileReader::CloneForDebugging(FsManager* fs_manager,
+                                          const shared_ptr<MemTracker>& parent_mem_tracker,
+                                          shared_ptr<DeltaFileReader>* out) const {
+  unique_ptr<ReadableBlock> block;
+  RETURN_NOT_OK(fs_manager->OpenBlock(reader_->block_id(), &block));
+  ReaderOptions options;
+  options.parent_mem_tracker = parent_mem_tracker;
+  return DeltaFileReader::OpenNoInit(std::move(block), delta_type_, options, out);
+}
+
 Status DeltaFileReader::NewDeltaIterator(const Schema *projection,
                                          const MvccSnapshot &snap,
                                          DeltaIterator** iterator) const {
   if (IsRelevantForSnapshot(snap)) {
     if (VLOG_IS_ON(2)) {
       if (!init_once_.initted()) {
+        TRACE_COUNTER_INCREMENT("delta_iterators_lazy_initted", 1);
+
         VLOG(2) << (delta_type_ == REDO ? "REDO" : "UNDO") << " delta " << ToString()
-                << "has no delta stats"
+                << " has no delta stats"
                 << ": can't cull for " << snap.ToString();
       } else if (delta_type_ == REDO) {
         VLOG(2) << "REDO delta " << ToString()
@@ -275,6 +292,7 @@ Status DeltaFileReader::NewDeltaIterator(const Schema *projection,
       }
     }
 
+    TRACE_COUNTER_INCREMENT("delta_iterators_relevant", 1);
     // Ugly cast, but it lets the iterator fully initialize the reader
     // during its first seek.
     *iterator = new DeltaFileIterator(
@@ -289,6 +307,15 @@ Status DeltaFileReader::NewDeltaIterator(const Schema *projection,
 }
 
 Status DeltaFileReader::CheckRowDeleted(rowid_t row_idx, bool *deleted) const {
+  RETURN_NOT_OK(const_cast<DeltaFileReader*>(this)->Init());
+
+  // If there are no deletes in the delta file at all, we can short-circuit
+  // the seek.
+  if (delta_stats_->delete_count() == 0) {
+    *deleted = false;
+    return Status::OK();
+  }
+
   MvccSnapshot snap_all(MvccSnapshot::CreateSnapshotIncludingAllTransactions());
 
   // TODO: would be nice to avoid allocation here, but we don't want to
@@ -359,6 +386,17 @@ Status DeltaFileIterator::SeekToOrdinal(rowid_t idx) {
 
   // Finish the initialization of any lazily-initialized state.
   RETURN_NOT_OK(dfr_->Init());
+
+  // Check again whether this delta file is relevant given the snapshot
+  // that we are querying. We did this already before creating the
+  // DeltaFileIterator, but due to lazy initialization, it's possible
+  // that we weren't able to check at that time.
+  if (!dfr_->IsRelevantForSnapshot(mvcc_snap_)) {
+    exhausted_ = true;
+    delta_blocks_.clear();
+    return Status::OK();
+  }
+
   if (!index_iter_) {
     index_iter_.reset(IndexTreeIterator::Create(
         dfr_->cfile_reader().get(),
@@ -392,7 +430,7 @@ Status DeltaFileIterator::ReadCurrentBlockOntoQueue() {
   DCHECK(initted_) << "Must call Init()";
   DCHECK(index_iter_) << "Must call SeekToOrdinal()";
 
-  gscoped_ptr<PreparedDeltaBlock> pdb(new PreparedDeltaBlock());
+  unique_ptr<PreparedDeltaBlock> pdb(new PreparedDeltaBlock());
   BlockPointer dblk_ptr = index_iter_->GetCurrentBlockPointer();
   RETURN_NOT_OK(dfr_->cfile_reader()->ReadBlock(
       dblk_ptr, cache_blocks_, &pdb->block_));
@@ -414,7 +452,7 @@ Status DeltaFileIterator::ReadCurrentBlockOntoQueue() {
     pdb->last_updated_idx_;
   #endif
 
-  delta_blocks_.push_back(pdb.release());
+  delta_blocks_.emplace_back(std::move(pdb));
   return Status::OK();
 }
 
@@ -446,7 +484,7 @@ string DeltaFileIterator::PreparedDeltaBlock::ToString() const {
 
 Status DeltaFileIterator::PrepareBatch(size_t nrows, PrepareFlag flag) {
   DCHECK(initted_) << "Must call Init()";
-  DCHECK(index_iter_) << "Must call SeekToOrdinal()";
+  DCHECK(exhausted_ || index_iter_) << "Must call SeekToOrdinal()";
 
   CHECK_GT(nrows, 0);
 
@@ -456,7 +494,7 @@ Status DeltaFileIterator::PrepareBatch(size_t nrows, PrepareFlag flag) {
   // Remove blocks from our list which are no longer relevant to the range
   // being prepared.
   while (!delta_blocks_.empty() &&
-         delta_blocks_.front().last_updated_idx_ < start_row) {
+         delta_blocks_.front()->last_updated_idx_ < start_row) {
     delta_blocks_.pop_front();
   }
 
@@ -480,7 +518,7 @@ Status DeltaFileIterator::PrepareBatch(size_t nrows, PrepareFlag flag) {
   }
 
   if (!delta_blocks_.empty()) {
-    PreparedDeltaBlock &block = delta_blocks_.front();
+    PreparedDeltaBlock& block = *delta_blocks_.front();
     int i = 0;
     for (i = block.prepared_block_start_idx_;
          i < block.decoder_->Count();
@@ -509,12 +547,12 @@ Status DeltaFileIterator::VisitMutations(Visitor *visitor) {
 
   rowid_t start_row = prepared_idx_;
 
-  for (PreparedDeltaBlock &block : delta_blocks_) {
-    BinaryPlainBlockDecoder &bpd = *block.decoder_;
-    DVLOG(2) << "Visiting delta block " << block.first_updated_idx_ << "-"
-      << block.last_updated_idx_ << " for row block starting at " << start_row;
+  for (auto& block : delta_blocks_) {
+    BinaryPlainBlockDecoder& bpd = *block->decoder_;
+    DVLOG(2) << "Visiting delta block " << block->first_updated_idx_ << "-"
+             << block->last_updated_idx_ << " for row block starting at " << start_row;
 
-    if (PREDICT_FALSE(start_row > block.last_updated_idx_)) {
+    if (PREDICT_FALSE(start_row > block->last_updated_idx_)) {
       // The block to be updated completely falls after this delta block:
       //  <-- delta block -->      <-- delta block -->
       //                      <-- block to update     -->
@@ -526,7 +564,7 @@ Status DeltaFileIterator::VisitMutations(Visitor *visitor) {
 
     rowid_t previous_rowidx = MathLimits<rowid_t>::kMax;
     bool continue_visit = true;
-    for (int i = block.prepared_block_start_idx_; i < bpd.Count(); i++) {
+    for (int i = block->prepared_block_start_idx_; i < bpd.Count(); i++) {
       Slice slice = bpd.string_at_index(i);
 
       // Decode and check the ID of the row we're going to update.
@@ -554,9 +592,10 @@ Status DeltaFileIterator::VisitMutations(Visitor *visitor) {
       RETURN_NOT_OK(visitor->Visit(key, slice, &continue_visit));
       if (VLOG_IS_ON(3)) {
         RowChangeList rcl(slice);
-        DVLOG(3) << "Visited delta for key: " << key.ToString() << " Mut: "
-            << rcl.ToString(*projection_) << " Continue?: "
-            << (continue_visit ? "TRUE" : "FALSE");
+        DVLOG(3) << "Visited " << DeltaType_Name(delta_type_)
+                 << " delta for key: " << key.ToString() << " Mut: "
+                 << rcl.ToString(*projection_) << " Continue?: "
+                 << (continue_visit ? "TRUE" : "FALSE");
       }
     }
   }
@@ -611,14 +650,12 @@ struct ApplyingVisitor {
     const Schema* schema = dfi->projection_;
     RowChangeListDecoder decoder((RowChangeList(deltas)));
     RETURN_NOT_OK(decoder.Init());
-    if (decoder.is_update()) {
+    if (decoder.is_update() || decoder.is_reinsert()) {
       return decoder.ApplyToOneColumn(rel_idx, dst, *schema, col_to_apply, dst->arena());
-    } else if (decoder.is_delete()) {
-      // If it's a DELETE, then it will be processed by DeletingVisitor.
-      return Status::OK();
-    } else {
-      dfi->FatalUnexpectedDelta(key, deltas, "Expect only UPDATE or DELETE deltas on disk");
     }
+
+    DCHECK(decoder.is_delete());
+    // If it's a DELETE, then it will be processed by LivenessVisitor.
     return Status::OK();
   }
 
@@ -658,16 +695,15 @@ Status DeltaFileIterator::ApplyUpdates(size_t col_to_apply, ColumnBlock *dst) {
     DVLOG(3) << "Applying REDO mutations to " << col_to_apply;
     ApplyingVisitor<REDO> visitor = {this, col_to_apply, dst};
     return VisitMutations(&visitor);
-  } else {
-    DVLOG(3) << "Applying UNDO mutations to " << col_to_apply;
-    ApplyingVisitor<UNDO> visitor = {this, col_to_apply, dst};
-    return VisitMutations(&visitor);
   }
+  DVLOG(3) << "Applying UNDO mutations to " << col_to_apply;
+  ApplyingVisitor<UNDO> visitor = {this, col_to_apply, dst};
+  return VisitMutations(&visitor);
 }
 
-// Visitor which applies deletes to the selection vector.
+// Visitor which establishes the liveness of a row by applying deletes and reinserts.
 template<DeltaType Type>
-struct DeletingVisitor {
+struct LivenessVisitor {
 
   Status Visit(const DeltaKey &key, const Slice &deltas, bool* continue_visit);
 
@@ -682,12 +718,19 @@ struct DeletingVisitor {
       // If this is an update the row must be selected.
       DCHECK(sel_vec->IsRowSelected(rel_idx));
       return Status::OK();
-    } else if (decoder.is_delete()) {
+    }
+
+    if (decoder.is_delete()) {
       DVLOG(3) << "Row deleted";
       sel_vec->SetRowUnselected(rel_idx);
-    } else {
-      dfi->FatalUnexpectedDelta(key, deltas, "Expect only UPDATE or DELETE deltas on disk");
+      return Status::OK();
     }
+
+    DCHECK(decoder.is_reinsert());
+    DVLOG(3) << "Re-selected the row (reinsert)";
+    // If this is a reinsert the row must be unselected.
+    DCHECK(!sel_vec->IsRowSelected(rel_idx));
+    sel_vec->SetRowSelected(rel_idx);
     return Status::OK();
   }
 
@@ -696,7 +739,7 @@ struct DeletingVisitor {
 };
 
 template<>
-inline Status DeletingVisitor<REDO>::Visit(const DeltaKey& key,
+inline Status LivenessVisitor<REDO>::Visit(const DeltaKey& key,
                                            const Slice& deltas,
                                            bool* continue_visit) {
   if (IsRedoRelevant(dfi->mvcc_snap_, key.timestamp(), continue_visit)) {
@@ -706,7 +749,7 @@ inline Status DeletingVisitor<REDO>::Visit(const DeltaKey& key,
 }
 
 template<>
-inline Status DeletingVisitor<UNDO>::Visit(const DeltaKey& key,
+inline Status LivenessVisitor<UNDO>::Visit(const DeltaKey& key,
                                            const Slice& deltas, bool*
                                            continue_visit) {
   if (IsUndoRelevant(dfi->mvcc_snap_, key.timestamp(), continue_visit)) {
@@ -720,18 +763,16 @@ Status DeltaFileIterator::ApplyDeletes(SelectionVector *sel_vec) {
   DCHECK_LE(prepared_count_, sel_vec->nrows());
   if (delta_type_ == REDO) {
     DVLOG(3) << "Applying REDO deletes";
-    DeletingVisitor<REDO> visitor = { this, sel_vec};
-    return VisitMutations(&visitor);
-  } else {
-    DVLOG(3) << "Applying UNDO deletes";
-    DeletingVisitor<UNDO> visitor = { this, sel_vec};
+    LivenessVisitor<REDO> visitor = { this, sel_vec };
     return VisitMutations(&visitor);
   }
+  DVLOG(3) << "Applying UNDO deletes";
+  LivenessVisitor<UNDO> visitor = { this, sel_vec };
+  return VisitMutations(&visitor);
 }
 
-// Visitor which, for each mutation, appends it into a ColumnBlock of
-// Mutation *s. See CollectMutations()
-// Each mutation is projected into the iterator schema, if required.
+// Visitor which, for each mutation, adds it into a ColumnBlock of
+// Mutation *s, prepending to each linked list. See CollectMutations().
 template<DeltaType Type>
 struct CollectingVisitor {
 
@@ -743,7 +784,7 @@ struct CollectingVisitor {
 
     RowChangeList changelist(deltas);
     Mutation *mutation = Mutation::CreateInArena(dst_arena, key.timestamp(), changelist);
-    mutation->AppendToList(&dst->at(rel_idx));
+    mutation->PrependToList(&dst->at(rel_idx));
 
     return Status::OK();
   }
@@ -786,6 +827,22 @@ Status DeltaFileIterator::CollectMutations(vector<Mutation *> *dst, Arena *dst_a
 
 bool DeltaFileIterator::HasNext() {
   return !exhausted_ || !delta_blocks_.empty();
+}
+
+bool DeltaFileIterator::MayHaveDeltas() {
+  // TODO: change the API to take in the col_to_apply and check for deltas on
+  // that column only.
+  DCHECK(prepared_) << "must Prepare";
+  for (auto& block : delta_blocks_) {
+    BinaryPlainBlockDecoder& bpd = *block->decoder_;
+    if (PREDICT_FALSE(prepared_idx_ > block->last_updated_idx_)) {
+      continue;
+    }
+    if (block->prepared_block_start_idx_ < bpd.Count()) {
+      return true;
+    }
+  }
+  return false;
 }
 
 string DeltaFileIterator::ToString() const {

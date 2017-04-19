@@ -17,23 +17,22 @@
 #ifndef KUDU_MASTER_MASTER_PATH_HANDLERS_H
 #define KUDU_MASTER_MASTER_PATH_HANDLERS_H
 
+#include <iosfwd>
+#include <string>
+#include <vector>
+
 #include "kudu/gutil/macros.h"
 #include "kudu/server/webserver.h"
 
-#include <string>
-#include <sstream>
-#include <vector>
-
 namespace kudu {
-
 class Schema;
+class ServerRegistrationPB;
 
 namespace master {
 
 class Master;
 struct TabletReplica;
 class TSDescriptor;
-class TSRegistrationPB;
 
 // Web page support for the master.
 class MasterPathHandlers {
@@ -48,21 +47,15 @@ class MasterPathHandlers {
 
  private:
   void HandleTabletServers(const Webserver::WebRequest& req,
-                           std::stringstream* output);
+                           std::ostringstream* output);
   void HandleCatalogManager(const Webserver::WebRequest& req,
-                            std::stringstream* output);
+                            std::ostringstream* output);
   void HandleTablePage(const Webserver::WebRequest& req,
-                       std::stringstream *output);
+                       std::ostringstream *output);
   void HandleMasters(const Webserver::WebRequest& req,
-                     std::stringstream* output);
+                     std::ostringstream* output);
   void HandleDumpEntities(const Webserver::WebRequest& req,
-                          std::stringstream* output);
-
-  // Convert location of peers to HTML, indicating the roles
-  // of each tablet server in a consensus configuration.
-  // This method will display 'locations' in the order given.
-  std::string RaftConfigToHtml(const std::vector<TabletReplica>& locations,
-                               const std::string& tablet_id) const;
+                          std::ostringstream* output);
 
   // Convert the specified TSDescriptor to HTML, adding a link to the
   // tablet server's own webserver if specified in 'desc'.
@@ -71,17 +64,15 @@ class MasterPathHandlers {
 
   // Convert the specified server registration to HTML, adding a link
   // to the server's own web server (if specified in 'reg') with
-  // anchor text 'link_text'. 'RegistrationType' must be
-  // TSRegistrationPB or MasterRegistrationPB.
-  template<class RegistrationType>
-  std::string RegistrationToHtml(const RegistrationType& reg,
+  // anchor text 'link_text'.
+  std::string RegistrationToHtml(const ServerRegistrationPB& reg,
                                  const std::string& link_text) const;
 
   Master* master_;
   DISALLOW_COPY_AND_ASSIGN(MasterPathHandlers);
 };
 
-void HandleTabletServersPage(const Webserver::WebRequest& req, std::stringstream* output);
+void HandleTabletServersPage(const Webserver::WebRequest& req, std::ostringstream* output);
 
 } // namespace master
 } // namespace kudu

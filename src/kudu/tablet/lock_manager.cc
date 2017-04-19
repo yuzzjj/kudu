@@ -15,18 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <boost/thread/locks.hpp>
-#include <boost/thread/mutex.hpp>
+#include "kudu/tablet/lock_manager.h"
+
 #include <glog/logging.h>
-#include <string>
+#include <mutex>
 #include <semaphore.h>
+#include <string>
 
 #include "kudu/gutil/dynamic_annotations.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/hash/city.h"
-#include "kudu/tablet/lock_manager.h"
+#include "kudu/gutil/walltime.h"
 #include "kudu/util/locks.h"
+#include "kudu/util/logging.h"
 #include "kudu/util/semaphore.h"
+#include "kudu/util/trace.h"
 
 namespace kudu {
 namespace tablet {
@@ -54,7 +57,7 @@ class LockEntry {
   }
 
   std::string ToString() const {
-    return key_.ToDebugString();
+    return KUDU_REDACT(key_.ToDebugString());
   }
 
   // Mutex used by the LockManager
@@ -164,10 +167,10 @@ LockEntry *LockTable::GetLockEntry(const Slice& key) {
   LockEntry *old_entry;
 
   {
-    boost::shared_lock<rw_spinlock> table_rdlock(lock_.get_lock());
+    shared_lock<rw_spinlock> l(lock_.get_lock());
     Bucket *bucket = FindBucket(new_entry->key_hash_);
     {
-      boost::lock_guard<simple_spinlock> bucket_lock(bucket->lock);
+      std::lock_guard<simple_spinlock> bucket_lock(bucket->lock);
       LockEntry **node = FindSlot(bucket, new_entry->key_, new_entry->key_hash_);
       old_entry = *node;
       if (old_entry != nullptr) {
@@ -186,7 +189,7 @@ LockEntry *LockTable::GetLockEntry(const Slice& key) {
   }
 
   if (base::subtle::NoBarrier_AtomicIncrement(&item_count_, 1) > size_) {
-    boost::unique_lock<percpu_rwlock> table_wrlock(lock_, boost::try_to_lock);
+    std::unique_lock<percpu_rwlock> table_wrlock(lock_, std::try_to_lock);
     // if we can't take the lock, means that someone else is resizing.
     // (The percpu_rwlock try_lock waits for readers to complete)
     if (table_wrlock.owns_lock()) {
@@ -200,10 +203,10 @@ LockEntry *LockTable::GetLockEntry(const Slice& key) {
 void LockTable::ReleaseLockEntry(LockEntry *entry) {
   bool removed = false;
   {
-    boost::lock_guard<rw_spinlock> table_rdlock(lock_.get_lock());
+    std::lock_guard<rw_spinlock> table_rdlock(lock_.get_lock());
     Bucket *bucket = FindBucket(entry->key_hash_);
     {
-      boost::lock_guard<simple_spinlock> bucket_lock(bucket->lock);
+      std::lock_guard<simple_spinlock> bucket_lock(bucket->lock);
       LockEntry **node = FindEntry(bucket, entry);
       if (node != nullptr) {
         // ASSUMPTION: There are few updates, so locking the same row at the same time is rare
@@ -225,7 +228,7 @@ void LockTable::ReleaseLockEntry(LockEntry *entry) {
 void LockTable::Resize() {
   // Calculate a new table size
   size_t new_size = 16;
-  while (new_size < item_count_) {
+  while (new_size < base::subtle::NoBarrier_Load(&item_count_)) {
     new_size <<= 1;
   }
 
@@ -278,12 +281,12 @@ ScopedRowLock::ScopedRowLock(LockManager *manager,
   }
 }
 
-ScopedRowLock::ScopedRowLock(RValue other) {
-  TakeState(other.object);
+ScopedRowLock::ScopedRowLock(ScopedRowLock&& other) {
+  TakeState(&other);
 }
 
-ScopedRowLock& ScopedRowLock::operator=(RValue other) {
-  TakeState(other.object);
+ScopedRowLock& ScopedRowLock::operator=(ScopedRowLock&& other) {
+  TakeState(&other);
   return *this;
 }
 
@@ -341,9 +344,6 @@ LockManager::LockStatus LockManager::Lock(const Slice& key,
     // we opt to perform more fine grained locking, possibly letting transactions
     // release a portion of the locks they no longer need, this no longer is OK.
     if (ANNOTATE_UNPROTECTED_READ((*entry)->holder_) == tx) {
-      // TODO: this is likely to be problematic even today: if you issue two
-      // UPDATEs for the same row in the same transaction, we can get:
-      // "deltamemstore.cc:74] Check failed: !mutation.exists() Already have an entry ..."
       (*entry)->recursion_++;
       return LOCK_ACQUIRED;
     }
@@ -351,17 +351,22 @@ LockManager::LockStatus LockManager::Lock(const Slice& key,
     // If we couldn't immediately acquire the lock, do a timed lock so we can
     // warn if it takes a long time.
     // TODO: would be nice to hook in some histogram metric about lock acquisition
-    // time.
+    // time. For now we just associate with per-request metrics.
+    TRACE_COUNTER_INCREMENT("row_lock_wait_count", 1);
+    MicrosecondsInt64 start_wait_us = GetMonoTimeMicros();
     int waited_seconds = 0;
     while (!(*entry)->sem.TimedAcquire(MonoDelta::FromSeconds(1))) {
       const TransactionState* cur_holder = ANNOTATE_UNPROTECTED_READ((*entry)->holder_);
       LOG(WARNING) << "Waited " << (++waited_seconds) << " seconds to obtain row lock on key "
-                   << key.ToDebugString() << " cur holder: " << cur_holder;
-      // TODO: add RPC trace annotation here. Above warning should also include an RPC
-      // trace ID.
-      // TODO: would be nice to also include some info about the blocking transaction,
+                   << KUDU_REDACT(key.ToDebugString()) << " cur holder: " << cur_holder;
+      // TODO(unknown): would be nice to also include some info about the blocking transaction,
       // but it's a bit tricky to do in a non-racy fashion (the other transaction may
       // complete at any point)
+    }
+    MicrosecondsInt64 wait_us = GetMonoTimeMicros() - start_wait_us;
+    TRACE_COUNTER_INCREMENT("row_lock_wait_us", wait_us);
+    if (wait_us > 100 * 1000) {
+      TRACE("Waited $0us for lock on $1", wait_us, KUDU_REDACT(key.ToDebugString()));
     }
   }
 

@@ -24,9 +24,11 @@
 
 #include "kudu/util/os-util.h"
 
+#include <fcntl.h>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <sys/resource.h>
 #include <vector>
 #include <unistd.h>
 
@@ -37,7 +39,7 @@
 
 using std::ifstream;
 using std::istreambuf_iterator;
-using std::stringstream;
+using std::ostringstream;
 using strings::Split;
 using strings::Substitute;
 
@@ -105,7 +107,7 @@ Status GetThreadStats(int64_t tid, ThreadStats* stats) {
     return Status::NotSupported("ThreadStats not supported");
   }
 
-  stringstream proc_path;
+  ostringstream proc_path;
   proc_path << "/proc/self/task/" << tid << "/stat";
   ifstream proc_file(proc_path.str().c_str());
   if (!proc_file.is_open()) {
@@ -118,31 +120,23 @@ Status GetThreadStats(int64_t tid, ThreadStats* stats) {
   return ParseStat(buffer, nullptr, stats); // don't want the name
 }
 
-bool RunShellProcess(const string& cmd, string* msg) {
-  DCHECK(msg != nullptr);
-  FILE* fp = popen(cmd.c_str(), "r");
-  if (fp == nullptr) {
-    *msg = Substitute("Failed to execute shell cmd: '$0', error was: $1", cmd,
-        ErrnoToString(errno));
-    return false;
-  }
-  // Read the first 1024 bytes of any output before pclose() so we have some idea of what
-  // happened on failure.
-  char buf[1024];
-  size_t len = fread(buf, 1, 1024, fp);
-  string output;
-  output.assign(buf, len);
+void DisableCoreDumps() {
+  struct rlimit lim;
+  PCHECK(getrlimit(RLIMIT_CORE, &lim) == 0);
+  lim.rlim_cur = 0;
+  PCHECK(setrlimit(RLIMIT_CORE, &lim) == 0);
 
-  // pclose() returns an encoded form of the sub-process' exit code.
-  int status = pclose(fp);
-  if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-    *msg = output;
-    return true;
+  // Set coredump_filter to not dump any parts of the address space.
+  // Although the above disables core dumps to files, if core_pattern
+  // is set to a pipe rather than a file, it's not sufficient. Setting
+  // this pattern results in piping a very minimal dump into the core
+  // processor (eg abrtd), thus speeding up the crash.
+  int f = open("/proc/self/coredump_filter", O_WRONLY);
+  if (f >= 0) {
+    write(f, "00000000", 8);
+    close(f);
   }
-
-  *msg = Substitute("Shell cmd: '$0' exited with an error: '$1'. Output was: '$2'", cmd,
-      ErrnoToString(errno), output);
-  return false;
 }
+
 
 } // namespace kudu

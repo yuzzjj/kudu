@@ -37,7 +37,6 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/mini_cluster.h"
 #include "kudu/master/mini_master.h"
-#include "kudu/tablet/maintenance_manager.h"
 #include "kudu/tablet/tablet.h"
 #include "kudu/tablet/tablet_metrics.h"
 #include "kudu/tablet/tablet_peer.h"
@@ -47,6 +46,7 @@
 #include "kudu/util/async_util.h"
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/errno.h"
+#include "kudu/util/maintenance_manager.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
@@ -55,6 +55,8 @@
 #include "kudu/util/thread.h"
 #include "kudu/util/random.h"
 #include "kudu/util/random_util.h"
+
+DEFINE_bool(skip_scans, false, "Whether to skip the scan part of the test.");
 
 // Test size parameters
 DEFINE_int32(concurrent_inserts, -1, "Number of inserting clients to launch");
@@ -134,16 +136,10 @@ class FullStackInsertScanTest : public KuduTest {
     gscoped_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
     ASSERT_OK(table_creator->table_name(kTableName)
              .schema(&schema_)
+             .set_range_partition_columns({ "key" })
              .num_replicas(1)
              .Create());
     ASSERT_OK(client_->OpenTable(kTableName, &reader_table_));
-  }
-
-  virtual void TearDown() OVERRIDE {
-    if (cluster_) {
-      cluster_->Shutdown();
-    }
-    KuduTest::TearDown();
   }
 
   void DoConcurrentClientInserts();
@@ -163,7 +159,7 @@ class FullStackInsertScanTest : public KuduTest {
 
   void InitCluster() {
     // Start mini-cluster with 1 tserver, config client options
-    cluster_.reset(new MiniCluster(env_.get(), MiniClusterOptions()));
+    cluster_.reset(new MiniCluster(env_, MiniClusterOptions()));
     ASSERT_OK(cluster_->Start());
     KuduClientBuilder builder;
     builder.add_master_server_addr(
@@ -237,12 +233,14 @@ gscoped_ptr<Subprocess> MakePerfRecord() {
 
 void InterruptNotNull(gscoped_ptr<Subprocess> sub) {
   if (!sub) return;
+
   ASSERT_OK(sub->Kill(SIGINT));
-  int exit_status = 0;
-  ASSERT_OK(sub->Wait(&exit_status));
-  if (!exit_status) {
-    LOG(WARNING) << "Subprocess returned " << exit_status
-                 << ": " << ErrnoToString(exit_status);
+  ASSERT_OK(sub->Wait());
+  int exit_status;
+  string exit_info_str;
+  ASSERT_OK(sub->GetExitStatus(&exit_status, &exit_info_str));
+  if (exit_status != 0) {
+    LOG(WARNING) << exit_info_str;
   }
 }
 
@@ -308,22 +306,30 @@ void FullStackInsertScanTest::DoConcurrentClientInserts() {
 }
 
 void FullStackInsertScanTest::DoTestScans() {
+  if (FLAGS_skip_scans) {
+    LOG(INFO) << "Skipped scan part of the test.";
+    return;
+  }
   LOG(INFO) << "Doing test scans on table of " << kNumRows << " rows.";
 
   gscoped_ptr<Subprocess> stat = MakePerfStat();
+  if (stat) {
+    ASSERT_OK(stat->Start());
+  }
   gscoped_ptr<Subprocess> record = MakePerfRecord();
-  if (stat) stat->Start();
-  if (record) record->Start();
+  if (record) {
+    ASSERT_OK(record->Start());
+  }
 
-  NO_FATALS(ScanProjection(vector<string>(), "empty projection, 0 col"));
+  NO_FATALS(ScanProjection({}, "empty projection, 0 col"));
   NO_FATALS(ScanProjection({ "key" }, "key scan, 1 col"));
   NO_FATALS(ScanProjection(AllColumnNames(), "full schema scan, 10 col"));
   NO_FATALS(ScanProjection(StringColumnNames(), "String projection, 1 col"));
   NO_FATALS(ScanProjection(Int32ColumnNames(), "Int32 projection, 4 col"));
   NO_FATALS(ScanProjection(Int64ColumnNames(), "Int64 projection, 4 col"));
 
-  NO_FATALS(InterruptNotNull(record.Pass()));
-  NO_FATALS(InterruptNotNull(stat.Pass()));
+  NO_FATALS(InterruptNotNull(std::move(record)));
+  NO_FATALS(InterruptNotNull(std::move(stat)));
 }
 
 void FullStackInsertScanTest::FlushToDisk() {

@@ -18,38 +18,40 @@
 #include "kudu/rpc/reactor.h"
 
 #include <arpa/inet.h>
-#include <boost/intrusive/list.hpp>
-#include <ev++.h>
 #include <netinet/in.h>
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <mutex>
 #include <string>
 
+#include <boost/intrusive/list.hpp>
+#include <ev++.h>
 #include <glog/logging.h>
 
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stringprintf.h"
+#include "kudu/rpc/client_negotiation.h"
 #include "kudu/rpc/connection.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/negotiation.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/rpc_introspection.pb.h"
-#include "kudu/rpc/sasl_client.h"
-#include "kudu/rpc/sasl_server.h"
+#include "kudu/rpc/server_negotiation.h"
 #include "kudu/rpc/transfer.h"
 #include "kudu/util/countdown_latch.h"
+#include "kudu/util/debug/sanitizer_scopes.h"
 #include "kudu/util/errno.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/monotime.h"
-#include "kudu/util/thread.h"
-#include "kudu/util/threadpool.h"
-#include "kudu/util/thread_restrictions.h"
-#include "kudu/util/trace.h"
-#include "kudu/util/status.h"
 #include "kudu/util/net/socket.h"
+#include "kudu/util/status.h"
+#include "kudu/util/thread.h"
+#include "kudu/util/thread_restrictions.h"
+#include "kudu/util/threadpool.h"
+#include "kudu/util/trace.h"
 
 // When compiling on Mac OS X, use 'kqueue' instead of the default, 'select', for the event loop.
 // Otherwise we run into problems because 'select' can't handle connections when more than 1024
@@ -63,7 +65,10 @@ static const int kDefaultLibEvFlags = ev::AUTO;
 using std::string;
 using std::shared_ptr;
 
-DEFINE_int64(rpc_negotiation_timeout_ms, 3000,
+// TODO(KUDU-1580). This timeout has been bumped from 3 seconds up to
+// 15 seconds to workaround a bug. We should drop it back down when
+// KUDU-1580 is fixed.
+DEFINE_int64(rpc_negotiation_timeout_ms, 15000,
              "Timeout for negotiating an RPC connection.");
 TAG_FLAG(rpc_negotiation_timeout_ms, advanced);
 TAG_FLAG(rpc_negotiation_timeout_ms, runtime);
@@ -80,9 +85,9 @@ Status ShutdownError(bool aborted) {
 }
 } // anonymous namespace
 
-ReactorThread::ReactorThread(Reactor *reactor, const MessengerBuilder &bld)
+ReactorThread::ReactorThread(Reactor *reactor, const MessengerBuilder& bld)
   : loop_(kDefaultLibEvFlags),
-    cur_time_(MonoTime::Now(MonoTime::COARSE)),
+    cur_time_(MonoTime::Now()),
     last_unused_tcp_scan_(cur_time_),
     reactor_(reactor),
     connection_keepalive_time_(bld.connection_keepalive_time_),
@@ -147,6 +152,9 @@ void ReactorThread::ShutdownInternal() {
     task->Abort(aborted); // should also free the task.
   }
   scheduled_tasks_.clear();
+
+  // Remove the OpenSSL thread state.
+  ERR_remove_thread_state(nullptr);
 }
 
 ReactorTask::ReactorTask() {
@@ -175,6 +183,10 @@ Status ReactorThread::DumpRunningRpcs(const DumpRunningRpcsRequestPB& req,
 }
 
 void ReactorThread::WakeThread() {
+  // libev uses some lock-free synchronization, but doesn't have TSAN annotations.
+  // See http://lists.schmorp.de/pipermail/libev/2013q2/002178.html or KUDU-366
+  // for examples.
+  debug::ScopedTSANIgnoreReadsAndWrites ignore_tsan;
   async_.send();
 }
 
@@ -182,7 +194,7 @@ void ReactorThread::WakeThread() {
 // threads that want to bring something to our attention, like the fact that
 // we're shutting down, or the fact that there is a new outbound Transfer
 // ready to send.
-void ReactorThread::AsyncHandler(ev::async &watcher, int revents) {
+void ReactorThread::AsyncHandler(ev::async& /*watcher*/, int /*revents*/) {
   DCHECK(IsCurrentThread());
 
   if (PREDICT_FALSE(reactor_->closing())) {
@@ -195,45 +207,29 @@ void ReactorThread::AsyncHandler(ev::async &watcher, int revents) {
   reactor_->DrainTaskQueue(&tasks);
 
   while (!tasks.empty()) {
-    ReactorTask &task = tasks.front();
+    ReactorTask& task = tasks.front();
     tasks.pop_front();
     task.Run(this);
   }
 }
 
-void ReactorThread::RegisterConnection(const scoped_refptr<Connection>& conn) {
+void ReactorThread::RegisterConnection(scoped_refptr<Connection> conn) {
   DCHECK(IsCurrentThread());
 
-  // Set a limit on how long the server will negotiate with a new client.
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(MonoDelta::FromMilliseconds(FLAGS_rpc_negotiation_timeout_ms));
-
-  Status s = StartConnectionNegotiation(conn, deadline);
-  if (!s.ok()) {
+  Status s = StartConnectionNegotiation(conn);
+  if (PREDICT_FALSE(!s.ok())) {
     LOG(ERROR) << "Server connection negotiation failed: " << s.ToString();
     DestroyConnection(conn.get(), s);
+    return;
   }
-  server_conns_.push_back(conn);
+  server_conns_.emplace_back(std::move(conn));
 }
 
-void ReactorThread::AssignOutboundCall(const shared_ptr<OutboundCall> &call) {
+void ReactorThread::AssignOutboundCall(const shared_ptr<OutboundCall>& call) {
   DCHECK(IsCurrentThread());
   scoped_refptr<Connection> conn;
 
-  // TODO: Move call deadline timeout computation into OutboundCall constructor.
-  const MonoDelta &timeout = call->controller()->timeout();
-  MonoTime deadline;
-  if (!timeout.Initialized()) {
-    LOG(WARNING) << "Client call " << call->remote_method().ToString()
-                 << " has no timeout set for connection id: "
-                 << call->conn_id().ToString();
-    deadline = MonoTime::Max();
-  } else {
-    deadline = MonoTime::Now(MonoTime::FINE);
-    deadline.AddDelta(timeout);
-  }
-
-  Status s = FindOrStartConnection(call->conn_id(), &conn, deadline);
+  Status s = FindOrStartConnection(call->conn_id(), &conn);
   if (PREDICT_FALSE(!s.ok())) {
     call->SetFailed(s);
     return;
@@ -249,15 +245,14 @@ void ReactorThread::AssignOutboundCall(const shared_ptr<OutboundCall> &call) {
 // 2. every tcp_conn_timeo_ seconds, close down connections older than
 //    tcp_conn_timeo_ seconds.
 //
-void ReactorThread::TimerHandler(ev::timer &watcher, int revents) {
+void ReactorThread::TimerHandler(ev::timer& /*watcher*/, int revents) {
   DCHECK(IsCurrentThread());
   if (EV_ERROR & revents) {
     LOG(WARNING) << "Reactor " << name() << " got an error in "
       "the timer handler.";
     return;
   }
-  MonoTime now(MonoTime::Now(MonoTime::COARSE));
-  VLOG(4) << name() << ": timer tick at " << now.ToString();
+  MonoTime now(MonoTime::Now());
   cur_time_ = now;
 
   ScanIdleConnections();
@@ -276,13 +271,13 @@ void ReactorThread::ScanIdleConnections() {
   for (; c != c_end; ) {
     const scoped_refptr<Connection>& conn = *c;
     if (!conn->Idle()) {
-      VLOG(3) << "Connection " << conn->ToString() << " not idle";
-      ++c; // TODO: clean up this loop
+      VLOG(10) << "Connection " << conn->ToString() << " not idle";
+      ++c; // TODO(todd): clean up this loop
       continue;
     }
 
-    MonoDelta connection_delta(cur_time_.GetDeltaSince(conn->last_activity_time()));
-    if (connection_delta.MoreThan(connection_keepalive_time_)) {
+    MonoDelta connection_delta(cur_time_ - conn->last_activity_time());
+    if (connection_delta > connection_keepalive_time_) {
       conn->Shutdown(Status::NetworkError(
                        StringPrintf("connection timed out after %s seconds",
                                     connection_keepalive_time_.ToString().c_str())));
@@ -301,7 +296,7 @@ void ReactorThread::ScanIdleConnections() {
   VLOG_IF(1, timed_out > 0) << name() << ": timed out " << timed_out << " TCP connections.";
 }
 
-const std::string &ReactorThread::name() const {
+const std::string& ReactorThread::name() const {
   return reactor_->name();
 }
 
@@ -329,9 +324,8 @@ void ReactorThread::RunThread() {
   reactor_->messenger_.reset();
 }
 
-Status ReactorThread::FindOrStartConnection(const ConnectionId &conn_id,
-                                            scoped_refptr<Connection>* conn,
-                                            const MonoTime &deadline) {
+Status ReactorThread::FindOrStartConnection(const ConnectionId& conn_id,
+                                            scoped_refptr<Connection>* conn) {
   DCHECK(IsCurrentThread());
   conn_map_t::const_iterator c = client_conns_.find(conn_id);
   if (c != client_conns_.end()) {
@@ -349,12 +343,14 @@ Status ReactorThread::FindOrStartConnection(const ConnectionId &conn_id,
   bool connect_in_progress;
   RETURN_NOT_OK(StartConnect(&sock, conn_id.remote(), &connect_in_progress));
 
+  std::unique_ptr<Socket> new_socket(new Socket(sock.Release()));
+
   // Register the new connection in our map.
-  *conn = new Connection(this, conn_id.remote(), sock.Release(), Connection::CLIENT);
-  (*conn)->set_user_credentials(conn_id.user_credentials());
+  *conn = new Connection(this, conn_id.remote(), std::move(new_socket), Connection::CLIENT);
+  (*conn)->set_local_user_credentials(conn_id.user_credentials());
 
   // Kick off blocking client connection negotiation.
-  Status s = StartConnectionNegotiation(*conn, deadline);
+  Status s = StartConnectionNegotiation(*conn);
   if (s.IsIllegalState()) {
     // Return a nicer error message to the user indicating -- if we just
     // forward the status we'd get something generic like "ThreadPool is closing".
@@ -368,20 +364,25 @@ Status ReactorThread::FindOrStartConnection(const ConnectionId &conn_id,
   return Status::OK();
 }
 
-Status ReactorThread::StartConnectionNegotiation(const scoped_refptr<Connection>& conn,
-    const MonoTime &deadline) {
+Status ReactorThread::StartConnectionNegotiation(const scoped_refptr<Connection>& conn) {
   DCHECK(IsCurrentThread());
+
+  // Set a limit on how long the server will negotiate with a new client.
+  MonoTime deadline = MonoTime::Now() +
+      MonoDelta::FromMilliseconds(FLAGS_rpc_negotiation_timeout_ms);
 
   scoped_refptr<Trace> trace(new Trace());
   ADOPT_TRACE(trace.get());
   TRACE("Submitting negotiation task for $0", conn->ToString());
+  auto authentication = reactor()->messenger()->authentication();
+  auto encryption = reactor()->messenger()->encryption();
   RETURN_NOT_OK(reactor()->messenger()->negotiation_pool()->SubmitClosure(
-      Bind(&Negotiation::RunNegotiation, conn, deadline)));
+        Bind(&Negotiation::RunNegotiation, conn, authentication, encryption, deadline)));
   return Status::OK();
 }
 
 void ReactorThread::CompleteConnectionNegotiation(const scoped_refptr<Connection>& conn,
-      const Status &status) {
+                                                  const Status& status) {
   DCHECK(IsCurrentThread());
   if (PREDICT_FALSE(!status.ok())) {
     DestroyConnection(conn.get(), status);
@@ -395,6 +396,7 @@ void ReactorThread::CompleteConnectionNegotiation(const scoped_refptr<Connection
     DestroyConnection(conn.get(), s);
     return;
   }
+
   conn->MarkNegotiationComplete();
   conn->EpollRegister(loop_);
 }
@@ -404,42 +406,41 @@ Status ReactorThread::CreateClientSocket(Socket *sock) {
   if (ret.ok()) {
     ret = sock->SetNoDelay(true);
   }
-  LOG_IF(WARNING, !ret.ok()) << "failed to create an "
-    "outbound connection because a new socket could not "
-    "be created: " << ret.ToString();
+  LOG_IF(WARNING, !ret.ok())
+      << "failed to create an outbound connection because a new socket could not be created: "
+      << ret.ToString();
   return ret;
 }
 
-Status ReactorThread::StartConnect(Socket *sock, const Sockaddr &remote, bool *in_progress) {
+Status ReactorThread::StartConnect(Socket *sock, const Sockaddr& remote, bool *in_progress) {
   Status ret = sock->Connect(remote);
   if (ret.ok()) {
     VLOG(3) << "StartConnect: connect finished immediately for " << remote.ToString();
     *in_progress = false; // connect() finished immediately.
-    return ret;
+    return Status::OK();
   }
 
   int posix_code = ret.posix_code();
-  if (Socket::IsTemporarySocketError(posix_code) || (posix_code == EINPROGRESS)) {
-    // The connect operation is in progress.
-    *in_progress = true;
+  if (Socket::IsTemporarySocketError(posix_code) || posix_code == EINPROGRESS) {
     VLOG(3) << "StartConnect: connect in progress for " << remote.ToString();
+    *in_progress = true; // The connect operation is in progress.
     return Status::OK();
-  } else {
-    LOG(WARNING) << "failed to create an outbound connection to " << remote.ToString()
-                 << " because connect failed: " << ret.ToString();
-    return ret;
   }
+
+  LOG(WARNING) << "Failed to create an outbound connection to " << remote.ToString()
+               << " because connect() failed: " << ret.ToString();
+  return ret;
 }
 
 void ReactorThread::DestroyConnection(Connection *conn,
-                                      const Status &conn_status) {
+                                      const Status& conn_status) {
   DCHECK(IsCurrentThread());
 
   conn->Shutdown(conn_status);
 
   // Unlink connection from lists.
   if (conn->direction() == Connection::CLIENT) {
-    ConnectionId conn_id(conn->remote(), conn->user_credentials());
+    ConnectionId conn_id(conn->remote(), conn->local_user_credentials());
     auto it = client_conns_.find(conn_id);
     CHECK(it != client_conns_.end()) << "Couldn't find connection " << conn->ToString();
     client_conns_.erase(it);
@@ -455,9 +456,12 @@ void ReactorThread::DestroyConnection(Connection *conn,
   }
 }
 
-DelayedTask::DelayedTask(boost::function<void(const Status &)> func,
+DelayedTask::DelayedTask(boost::function<void(const Status&)> func,
                          MonoDelta when)
-    : func_(std::move(func)), when_(std::move(when)), thread_(nullptr) {}
+    : func_(std::move(func)),
+      when_(when),
+      thread_(nullptr) {
+}
 
 void DelayedTask::Run(ReactorThread* thread) {
   DCHECK(thread_ == nullptr) << "Task has already been scheduled";
@@ -491,12 +495,12 @@ void DelayedTask::TimerHandler(ev::timer& watcher, int revents) {
   }
 }
 
-Reactor::Reactor(const shared_ptr<Messenger>& messenger,
-                 int index, const MessengerBuilder &bld)
-  : messenger_(messenger),
-    name_(StringPrintf("%s_R%03d", messenger->name().c_str(), index)),
-    closing_(false),
-    thread_(this, bld) {
+Reactor::Reactor(shared_ptr<Messenger> messenger,
+                 int index, const MessengerBuilder& bld)
+    : messenger_(std::move(messenger)),
+      name_(StringPrintf("%s_R%03d", messenger_->name().c_str(), index)),
+      closing_(false),
+      thread_(this, bld) {
 }
 
 Status Reactor::Init() {
@@ -506,7 +510,7 @@ Status Reactor::Init() {
 
 void Reactor::Shutdown() {
   {
-    lock_guard<LockType> l(&lock_);
+    std::lock_guard<LockType> l(lock_);
     if (closing_) {
       return;
     }
@@ -529,12 +533,12 @@ Reactor::~Reactor() {
   Shutdown();
 }
 
-const std::string &Reactor::name() const {
+const std::string& Reactor::name() const {
   return name_;
 }
 
 bool Reactor::closing() const {
-  lock_guard<LockType> l(&lock_);
+  std::lock_guard<LockType> l(lock_);
   return closing_;
 }
 
@@ -544,11 +548,11 @@ class RunFunctionTask : public ReactorTask {
   explicit RunFunctionTask(boost::function<Status()> f)
       : function_(std::move(f)), latch_(1) {}
 
-  virtual void Run(ReactorThread *reactor) OVERRIDE {
+  void Run(ReactorThread* /*reactor*/) override {
     status_ = function_();
     latch_.CountDown();
   }
-  virtual void Abort(const Status &status) OVERRIDE {
+  void Abort(const Status& status) override {
     status_ = status;
     latch_.CountDown();
   }
@@ -584,16 +588,16 @@ Status Reactor::DumpRunningRpcs(const DumpRunningRpcsRequestPB& req,
 
 class RegisterConnectionTask : public ReactorTask {
  public:
-  explicit RegisterConnectionTask(const scoped_refptr<Connection>& conn) :
-    conn_(conn)
-  {}
+  explicit RegisterConnectionTask(scoped_refptr<Connection> conn)
+      : conn_(std::move(conn)) {
+  }
 
-  virtual void Run(ReactorThread *thread) OVERRIDE {
-    thread->RegisterConnection(conn_);
+  void Run(ReactorThread* reactor) override {
+    reactor->RegisterConnection(std::move(conn_));
     delete this;
   }
 
-  virtual void Abort(const Status &status) OVERRIDE {
+  void Abort(const Status& /*status*/) override {
     // We don't need to Shutdown the connection since it was never registered.
     // This is only used for inbound connections, and inbound connections will
     // never have any calls added to them until they've been registered.
@@ -604,11 +608,11 @@ class RegisterConnectionTask : public ReactorTask {
   scoped_refptr<Connection> conn_;
 };
 
-void Reactor::RegisterInboundSocket(Socket *socket, const Sockaddr &remote) {
+void Reactor::RegisterInboundSocket(Socket *socket, const Sockaddr& remote) {
   VLOG(3) << name_ << ": new inbound connection to " << remote.ToString();
-  scoped_refptr<Connection> conn(
-    new Connection(&thread_, remote, socket->Release(), Connection::SERVER));
-  auto task = new RegisterConnectionTask(conn);
+  std::unique_ptr<Socket> new_socket(new Socket(socket->Release()));
+  auto task = new RegisterConnectionTask(
+      new Connection(&thread_, remote, std::move(new_socket), Connection::SERVER));
   ScheduleReactorTask(task);
 }
 
@@ -619,12 +623,12 @@ class AssignOutboundCallTask : public ReactorTask {
   explicit AssignOutboundCallTask(shared_ptr<OutboundCall> call)
       : call_(std::move(call)) {}
 
-  virtual void Run(ReactorThread *reactor) OVERRIDE {
+  void Run(ReactorThread* reactor) override {
     reactor->AssignOutboundCall(call_);
     delete this;
   }
 
-  virtual void Abort(const Status &status) OVERRIDE {
+  void Abort(const Status& status) override {
     call_->SetFailed(status);
     delete this;
   }
@@ -633,7 +637,7 @@ class AssignOutboundCallTask : public ReactorTask {
   shared_ptr<OutboundCall> call_;
 };
 
-void Reactor::QueueOutboundCall(const shared_ptr<OutboundCall> &call) {
+void Reactor::QueueOutboundCall(const shared_ptr<OutboundCall>& call) {
   DVLOG(3) << name_ << ": queueing outbound call "
            << call->ToString() << " to remote " << call->conn_id().remote().ToString();
   AssignOutboundCallTask *task = new AssignOutboundCallTask(call);
@@ -642,7 +646,7 @@ void Reactor::QueueOutboundCall(const shared_ptr<OutboundCall> &call) {
 
 void Reactor::ScheduleReactorTask(ReactorTask *task) {
   {
-    unique_lock<LockType> l(&lock_);
+    std::unique_lock<LockType> l(lock_);
     if (closing_) {
       // We guarantee the reactor lock is not taken when calling Abort().
       l.unlock();
@@ -655,7 +659,7 @@ void Reactor::ScheduleReactorTask(ReactorTask *task) {
 }
 
 bool Reactor::DrainTaskQueue(boost::intrusive::list<ReactorTask> *tasks) { // NOLINT(*)
-  lock_guard<LockType> l(&lock_);
+  std::lock_guard<LockType> l(lock_);
   if (closing_) {
     return false;
   }

@@ -17,10 +17,14 @@
 #ifndef KUDU_CLIENT_SCAN_PREDICATE_INTERNAL_H
 #define KUDU_CLIENT_SCAN_PREDICATE_INTERNAL_H
 
-#include "kudu/client/value.h"
+#include <vector>
+
+#include "kudu/client/scan_predicate.h"
 #include "kudu/client/value-internal.h"
+#include "kudu/client/value.h"
 #include "kudu/common/scan_spec.h"
 #include "kudu/gutil/macros.h"
+#include "kudu/util/memory/arena.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
@@ -30,7 +34,7 @@ class KuduPredicate::Data {
  public:
   Data();
   virtual ~Data();
-  virtual Status AddToScanSpec(ScanSpec* spec) = 0;
+  virtual Status AddToScanSpec(ScanSpec* spec, Arena* arena) = 0;
   virtual Data* Clone() const = 0;
 };
 
@@ -44,17 +48,17 @@ class KuduPredicate::Data {
 class ErrorPredicateData : public KuduPredicate::Data {
  public:
   explicit ErrorPredicateData(const Status& s)
-  : status_(s) {
+      : status_(s) {
   }
 
   virtual ~ErrorPredicateData() {
   }
 
-  virtual Status AddToScanSpec(ScanSpec* spec) OVERRIDE {
+  Status AddToScanSpec(ScanSpec* spec, Arena* arena) override {
     return status_;
   }
 
-  virtual ErrorPredicateData* Clone() const OVERRIDE {
+  ErrorPredicateData* Clone() const override {
     return new ErrorPredicateData(status_);
   }
 
@@ -72,10 +76,10 @@ class ComparisonPredicateData : public KuduPredicate::Data {
                           KuduValue* value);
   virtual ~ComparisonPredicateData();
 
-  virtual Status AddToScanSpec(ScanSpec* spec) OVERRIDE;
+  Status AddToScanSpec(ScanSpec* spec, Arena* arena) override;
 
-  virtual ComparisonPredicateData* Clone() const OVERRIDE {
-      return new ComparisonPredicateData(col_, op_, val_->Clone());
+  ComparisonPredicateData* Clone() const override {
+    return new ComparisonPredicateData(col_, op_, val_->Clone());
   }
 
  private:
@@ -84,9 +88,76 @@ class ComparisonPredicateData : public KuduPredicate::Data {
   ColumnSchema col_;
   KuduPredicate::ComparisonOp op_;
   gscoped_ptr<KuduValue> val_;
+};
 
-  // Owned.
-  ColumnRangePredicate* pred_;
+// A list predicate for a column and a list of constant values.
+class InListPredicateData : public KuduPredicate::Data {
+ public:
+  InListPredicateData(ColumnSchema col, std::vector<KuduValue*>* values);
+
+  virtual ~InListPredicateData();
+
+  Status AddToScanSpec(ScanSpec* spec, Arena* arena) override;
+
+  InListPredicateData* Clone() const override {
+    std::vector<KuduValue*> values;
+    values.reserve(vals_.size());
+    for (KuduValue* val : vals_) {
+      values.push_back(val->Clone());
+    }
+
+    return new InListPredicateData(col_, &values);
+  }
+
+ private:
+  friend class KuduScanner;
+
+  ColumnSchema col_;
+  std::vector<KuduValue*> vals_;
+};
+
+// A predicate for selecting non-null values.
+class IsNotNullPredicateData : public KuduPredicate::Data {
+ public:
+  explicit IsNotNullPredicateData(ColumnSchema col)
+      : col_(std::move(col)) {
+  }
+
+  Status AddToScanSpec(ScanSpec* spec, Arena* /*arena*/) override {
+    spec->AddPredicate(ColumnPredicate::IsNotNull(col_));
+    return Status::OK();
+  }
+
+  IsNotNullPredicateData* Clone() const override {
+    return new IsNotNullPredicateData(col_);
+  }
+
+ private:
+  friend class KuduScanner;
+
+  ColumnSchema col_;
+};
+
+// A predicate for selecting null values.
+class IsNullPredicateData : public KuduPredicate::Data {
+ public:
+  explicit IsNullPredicateData(ColumnSchema col)
+      : col_(std::move(col)) {
+  }
+
+  Status AddToScanSpec(ScanSpec* spec, Arena* /*arena*/) override {
+    spec->AddPredicate(ColumnPredicate::IsNull(col_));
+    return Status::OK();
+  }
+
+  IsNullPredicateData* Clone() const override {
+    return new IsNullPredicateData(col_);
+  }
+
+ private:
+  friend class KuduScanner;
+
+  ColumnSchema col_;
 };
 
 } // namespace client

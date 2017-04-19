@@ -31,44 +31,81 @@ namespace client {
 
 namespace internal {
 class Batcher;
+class ErrorCollector;
 class WriteRpc;
 } // namespace internal
 
 class KuduTable;
 
-// A write operation operates on a single table and partial row.
-// The KuduWriteOperation class itself allows the batcher to get to the
-// generic information that it needs to process all write operations.
-//
-// On its own, the class does not represent any specific change and thus cannot
-// be constructed independently.
-//
-// KuduWriteOperation also holds shared ownership of its KuduTable to allow client's
-// scope to end while the KuduWriteOperation is still alive.
+/// @brief A single-row write operation to be sent to a Kudu table.
+///
+/// This is the abstract base class from which the particular row operations
+/// (KuduInsert, KuduUpdate, etc) are derived. These subclasses are instantiated
+/// by KuduTable::NewInsert(), etc.
+///
+/// The row key, as well as the columns to be inserted or updated are set using
+/// the embedded KuduPartialRow object accessible via mutable_row().
+///
+/// Typical usage example:
+/// @code
+///   KuduInsert* t = table->NewInsert();
+///   KUDU_CHECK_OK(t->mutable_row()->SetInt32("key", 1234));
+///   KUDU_CHECK_OK(t->mutable_row()->SetStringCopy("foo", "bar"));
+///   session->Apply(t);
+/// @endcode
 class KUDU_EXPORT KuduWriteOperation {
  public:
+  /// @brief Write operation types.
   enum Type {
     INSERT = 1,
     UPDATE = 2,
     DELETE = 3,
+    UPSERT = 4
   };
   virtual ~KuduWriteOperation();
 
-  // See KuduPartialRow API for field setters, etc.
+  /// @note To work with a row, use the KuduPartialRow API for field getters,
+  ///   etc.
+  /// @return Immutable reference to the corresponding row-like object.
   const KuduPartialRow& row() const { return row_; }
+
+  /// @note To work with a row, use the KuduPartialRow API for field setters,
+  ///   etc.
+  /// @return Pointer to the corresponding row-like object.
   KuduPartialRow* mutable_row() { return &row_; }
 
+  /// @return String representation of the operation.
+  ///
+  /// @internal
+  /// @note this method does note redact row values. The
+  ///   caller must handle redaction themselves, if necessary.
   virtual std::string ToString() const = 0;
  protected:
+  /// @cond PROTECTED_MEMBERS_DOCUMENTED
+
+  /// Create a write operation on the specified table.
+  ///
+  /// @param [in] table
+  ///   Smart pointer to the target table.
   explicit KuduWriteOperation(const sp::shared_ptr<KuduTable>& table);
+
+  /// @return Type of the operation.
   virtual Type type() const = 0;
 
+  /// KuduWriteOperation holds shared ownership of its KuduTable
+  /// to allow the client's scope to end while the KuduWriteOperation
+  /// is still alive.
   sp::shared_ptr<KuduTable> const table_;
+
+  /// The partial row to access schema-related properties.
   KuduPartialRow row_;
+
+  /// @endcond
 
  private:
   friend class internal::Batcher;
   friend class internal::WriteRpc;
+  friend class internal::ErrorCollector;
 
   // Create and encode the key for this write (key must be set)
   //
@@ -78,48 +115,88 @@ class KUDU_EXPORT KuduWriteOperation {
   const KuduTable* table() const { return table_.get(); }
 
   // Return the number of bytes required to buffer this operation,
-  // including direct and indirect data.
+  // including direct and indirect data. Once called, the result is cached
+  // so subsequent calls will return the size previously computed.
   int64_t SizeInBuffer() const;
+
+  mutable int64_t size_in_buffer_;
 
   DISALLOW_COPY_AND_ASSIGN(KuduWriteOperation);
 };
 
-// A single row insert to be sent to the cluster.
-// Row operation is defined by what's in the PartialRow instance here.
-// Use mutable_row() to change the row being inserted
-// An insert requires all key columns from the table schema to be defined.
+
+/// @brief A single row insert to be sent to the cluster.
+///
+/// @pre An insert requires all key columns to be set, as well as all
+///   columns which do not have default values.
 class KUDU_EXPORT KuduInsert : public KuduWriteOperation {
  public:
   virtual ~KuduInsert();
 
+  /// @copydoc KuduWriteOperation::ToString()
   virtual std::string ToString() const OVERRIDE { return "INSERT " + row_.ToString(); }
 
  protected:
+  /// @cond PROTECTED_MEMBERS_DOCUMENTED
+
+  /// @copydoc KuduWriteOperation::type()
   virtual Type type() const OVERRIDE {
     return INSERT;
   }
+
+  /// @endcond
 
  private:
   friend class KuduTable;
   explicit KuduInsert(const sp::shared_ptr<KuduTable>& table);
 };
 
+/// @brief A single row upsert to be sent to the cluster.
+///
+/// See KuduInsert for more details.
+class KUDU_EXPORT KuduUpsert : public KuduWriteOperation {
+ public:
+  virtual ~KuduUpsert();
 
-// A single row update to be sent to the cluster.
-// Row operation is defined by what's in the PartialRow instance here.
-// Use mutable_row() to change the row being updated.
-// An update requires the key columns and at least one other column
-// in the schema to be defined.
+  /// @copydoc KuduWriteOperation::ToString()
+  virtual std::string ToString() const OVERRIDE { return "UPSERT " + row_.ToString(); }
+
+ protected:
+  /// @cond PROTECTED_MEMBERS_DOCUMENTED
+
+  /// @copydoc KuduWriteOperation::type()
+  virtual Type type() const OVERRIDE {
+    return UPSERT;
+  }
+
+  /// @endcond
+
+ private:
+  friend class KuduTable;
+  explicit KuduUpsert(const sp::shared_ptr<KuduTable>& table);
+};
+
+
+/// @brief A single row update to be sent to the cluster.
+///
+/// @pre An update requires the key columns and at least one other column
+///   in the schema to be set in the embedded KuduPartialRow object.
 class KUDU_EXPORT KuduUpdate : public KuduWriteOperation {
  public:
   virtual ~KuduUpdate();
 
+  /// @copydoc KuduWriteOperation::ToString()
   virtual std::string ToString() const OVERRIDE { return "UPDATE " + row_.ToString(); }
 
  protected:
+  /// @cond PROTECTED_MEMBERS_DOCUMENTED
+
+  /// @copydoc KuduWriteOperation::type()
   virtual Type type() const OVERRIDE {
     return UPDATE;
   }
+
+  /// @endcond
 
  private:
   friend class KuduTable;
@@ -127,20 +204,26 @@ class KUDU_EXPORT KuduUpdate : public KuduWriteOperation {
 };
 
 
-// A single row delete to be sent to the cluster.
-// Row operation is defined by what's in the PartialRow instance here.
-// Use mutable_row() to change the row being deleted
-// A delete requires just the key columns to be defined.
+/// @brief A single row delete to be sent to the cluster.
+///
+/// @pre A delete requires the key columns to be set in the embedded
+///   KuduPartialRow object.
 class KUDU_EXPORT KuduDelete : public KuduWriteOperation {
  public:
   virtual ~KuduDelete();
 
+  /// @copydoc KuduWriteOperation::ToString()
   virtual std::string ToString() const OVERRIDE { return "DELETE " + row_.ToString(); }
 
  protected:
+  /// @cond PROTECTED_MEMBERS_DOCUMENTED
+
+  /// @copydoc KuduWriteOperation::type()
   virtual Type type() const OVERRIDE {
     return DELETE;
   }
+
+  /// @endcond
 
  private:
   friend class KuduTable;

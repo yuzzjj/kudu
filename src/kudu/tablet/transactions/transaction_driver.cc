@@ -17,13 +17,18 @@
 
 #include "kudu/tablet/transactions/transaction_driver.h"
 
+#include <mutex>
+
 #include "kudu/consensus/consensus.h"
+#include "kudu/consensus/time_manager.h"
 #include "kudu/gutil/strings/strcat.h"
+#include "kudu/rpc/result_tracker.h"
 #include "kudu/tablet/tablet_peer.h"
 #include "kudu/tablet/transactions/transaction_tracker.h"
 #include "kudu/util/debug-util.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/logging.h"
+#include "kudu/util/pb_util.h"
 #include "kudu/util/threadpool.h"
 #include "kudu/util/trace.h"
 
@@ -37,10 +42,41 @@ using consensus::ReplicateMsg;
 using consensus::CommitMsg;
 using consensus::DriverType;
 using log::Log;
+using rpc::RequestIdPB;
+using rpc::ResultTracker;
 using std::shared_ptr;
 
 static const char* kTimestampFieldName = "timestamp";
 
+class FollowerTransactionCompletionCallback : public TransactionCompletionCallback {
+ public:
+  FollowerTransactionCompletionCallback(const RequestIdPB& request_id,
+                                        const google::protobuf::Message* response,
+                                        const scoped_refptr<ResultTracker>& result_tracker)
+      : request_id_(request_id),
+        response_(response),
+        result_tracker_(result_tracker) {}
+
+  virtual void TransactionCompleted() {
+    if (status_.ok()) {
+      result_tracker_->RecordCompletionAndRespond(request_id_, response_);
+    } else {
+      // For now we always respond with TOO_BUSY, meaning the client will retry (even if
+      // this is an unretryable failure), that works as the client-driven version of this
+      // transaction will get the right error.
+      result_tracker_->FailAndRespond(request_id_,
+                                      rpc::ErrorStatusPB::ERROR_SERVER_TOO_BUSY,
+                                      status_);
+    }
+  }
+
+  virtual ~FollowerTransactionCompletionCallback() {}
+
+ private:
+  const RequestIdPB& request_id_;
+  const google::protobuf::Message* response_;
+  scoped_refptr<ResultTracker> result_tracker_;
+};
 
 ////////////////////////////////////////////////////////////
 // TransactionDriver
@@ -59,23 +95,42 @@ TransactionDriver::TransactionDriver(TransactionTracker *txn_tracker,
       apply_pool_(apply_pool),
       order_verifier_(order_verifier),
       trace_(new Trace()),
-      start_time_(MonoTime::Now(MonoTime::FINE)),
+      start_time_(MonoTime::Now()),
       replication_state_(NOT_REPLICATING),
       prepare_state_(NOT_PREPARED) {
   if (Trace::CurrentTrace()) {
-    Trace::CurrentTrace()->AddChildTrace(trace_.get());
+    Trace::CurrentTrace()->AddChildTrace("txn", trace_.get());
   }
 }
 
 Status TransactionDriver::Init(gscoped_ptr<Transaction> transaction,
                                DriverType type) {
-  transaction_ = transaction.Pass();
+  transaction_ = std::move(transaction);
 
   if (type == consensus::REPLICA) {
-    boost::lock_guard<simple_spinlock> lock(opid_lock_);
+    std::lock_guard<simple_spinlock> lock(opid_lock_);
     op_id_copy_ = transaction_->state()->op_id();
     DCHECK(op_id_copy_.IsInitialized());
     replication_state_ = REPLICATING;
+    replication_start_time_ = MonoTime::Now();
+    // Start the replica transaction in the thread that is updating consensus, for non-leader
+    // transactions.
+    // Replica transactions were already assigned a timestamp so we don't need to acquire locks
+    // before calling Start(). Starting the the transaction here gives a strong guarantee
+    // to consensus that the transaction is on mvcc when it moves "safe" time so that we don't
+    // risk marking a timestamp "safe" before all transactions before it are in-flight are on mvcc.
+    RETURN_NOT_OK(transaction_->Start());
+    if (state()->are_results_tracked()) {
+      // If this is a follower transaction, make sure to set the transaction completion callback
+      // before the transaction has a chance to fail.
+      const rpc::RequestIdPB& request_id = state()->request_id();
+      const google::protobuf::Message* response = state()->response();
+      gscoped_ptr<TransactionCompletionCallback> callback(
+          new FollowerTransactionCompletionCallback(request_id,
+                                                    response,
+                                                    state()->result_tracker()));
+      mutable_state()->set_completion_callback(callback.Pass());
+    }
   } else {
     DCHECK_EQ(type, consensus::LEADER);
     gscoped_ptr<ReplicateMsg> replicate_msg;
@@ -83,18 +138,17 @@ Status TransactionDriver::Init(gscoped_ptr<Transaction> transaction,
     if (consensus_) { // sometimes NULL in tests
       // Unretained is required to avoid a refcount cycle.
       mutable_state()->set_consensus_round(
-        consensus_->NewRound(replicate_msg.Pass(),
+        consensus_->NewRound(std::move(replicate_msg),
                              Bind(&TransactionDriver::ReplicationFinished, Unretained(this))));
     }
   }
 
   RETURN_NOT_OK(txn_tracker_->Add(this));
-
   return Status::OK();
 }
 
 consensus::OpId TransactionDriver::GetOpId() {
-  boost::lock_guard<simple_spinlock> lock(opid_lock_);
+  std::lock_guard<simple_spinlock> lock(opid_lock_);
   return op_id_copy_;
 }
 
@@ -111,7 +165,7 @@ Transaction::TransactionType TransactionDriver::tx_type() const {
 }
 
 string TransactionDriver::ToString() const {
-  boost::lock_guard<simple_spinlock> lock(lock_);
+  std::lock_guard<simple_spinlock> lock(lock_);
   return ToStringUnlocked();
 }
 
@@ -140,7 +194,7 @@ Status TransactionDriver::ExecuteAsync() {
 
   if (s.ok()) {
     s = prepare_pool_->SubmitClosure(
-      Bind(&TransactionDriver::PrepareAndStartTask, Unretained(this)));
+      Bind(&TransactionDriver::PrepareTask, Unretained(this)));
   }
 
   if (!s.ok()) {
@@ -151,23 +205,50 @@ Status TransactionDriver::ExecuteAsync() {
   return Status::OK();
 }
 
-void TransactionDriver::PrepareAndStartTask() {
-  TRACE_EVENT_FLOW_END0("txn", "PrepareAndStartTask", this);
-  Status prepare_status = PrepareAndStart();
+void TransactionDriver::PrepareTask() {
+  TRACE_EVENT_FLOW_END0("txn", "PrepareTask", this);
+  Status prepare_status = Prepare();
   if (PREDICT_FALSE(!prepare_status.ok())) {
     HandleFailure(prepare_status);
   }
 }
 
-Status TransactionDriver::PrepareAndStart() {
-  TRACE_EVENT1("txn", "PrepareAndStart", "txn", this);
-  VLOG_WITH_PREFIX(4) << "PrepareAndStart()";
+void TransactionDriver::RegisterFollowerTransactionOnResultTracker() {
+  // If this is a transaction being executed by a follower and its result is being
+  // tracked, make sure that we're the driver of the transaction.
+  if (!state()->are_results_tracked()) return;
+
+  ResultTracker::RpcState rpc_state = state()->result_tracker()->TrackRpcOrChangeDriver(
+      state()->request_id());
+  switch (rpc_state) {
+    case ResultTracker::RpcState::NEW:
+      // We're the only ones trying to execute the transaction (normal case). Proceed.
+      return;
+      // If this RPC was previously completed or is already stale (like if the same tablet was
+      // bootstrapped twice) stop tracking the result. Only follower transactions can observe these
+      // states so we simply reset the callback and the result will not be tracked anymore.
+    case ResultTracker::RpcState::STALE:
+    case ResultTracker::RpcState::COMPLETED: {
+      mutable_state()->set_completion_callback(
+          gscoped_ptr<TransactionCompletionCallback>(new TransactionCompletionCallback()));
+      VLOG(2) << state()->result_tracker() << " Follower Rpc was already COMPLETED or STALE: "
+          << rpc_state << " OpId: " << SecureShortDebugString(state()->op_id())
+          << " RequestId: " << SecureShortDebugString(state()->request_id());
+      return;
+    }
+    default:
+      LOG(FATAL) << "Unexpected state: " << rpc_state;
+  }
+}
+
+Status TransactionDriver::Prepare() {
+  TRACE_EVENT1("txn", "Prepare", "txn", this);
+  VLOG_WITH_PREFIX(4) << "Prepare()";
+
   // Actually prepare and start the transaction.
   prepare_physical_timestamp_ = GetMonoTimeMicros();
+
   RETURN_NOT_OK(transaction_->Prepare());
-
-  RETURN_NOT_OK(transaction_->Start());
-
 
   // Only take the lock long enough to take a local copy of the
   // replication state and set our prepare state. This ensures that
@@ -175,31 +256,49 @@ Status TransactionDriver::PrepareAndStart() {
   // phase.
   ReplicationState repl_state_copy;
   {
-    boost::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard<simple_spinlock> lock(lock_);
     CHECK_EQ(prepare_state_, NOT_PREPARED);
     prepare_state_ = PREPARED;
     repl_state_copy = replication_state_;
+
+    // If this is a follower transaction we need to register the transaction on the tracker here,
+    // atomically with the change of the prepared state. Otherwise if the prepare thread gets
+    // preempted after the state is prepared apply can be triggered by another thread without the
+    // rpc being registered.
+    if (transaction_->type() == consensus::REPLICA) {
+      RegisterFollowerTransactionOnResultTracker();
+    // ... else we're a client-started transaction. Make sure we're still the driver of the
+    // RPC and give up if we aren't.
+    } else {
+      if (state()->are_results_tracked()
+          && !state()->result_tracker()->IsCurrentDriver(state()->request_id())) {
+        transaction_status_ = Status::AlreadyPresent(strings::Substitute(
+            "There's already an attempt of the same operation on the server for request id: $0",
+            SecureShortDebugString(state()->request_id())));
+        replication_state_ = REPLICATION_FAILED;
+        return transaction_status_;
+      }
+    }
   }
 
   switch (repl_state_copy) {
     case NOT_REPLICATING:
     {
-
-      // Set the timestamp in the message, now that it's prepared.
-      transaction_->state()->consensus_round()->replicate_msg()->set_timestamp(
-          transaction_->state()->timestamp().ToUint64());
-
-      VLOG_WITH_PREFIX(4) << "Triggering consensus repl";
-      // Trigger the consensus replication.
-
+      // Assign a timestamp to the transaction before we Start() it.
+      RETURN_NOT_OK(consensus_->time_manager()->AssignTimestamp(
+                        mutable_state()->consensus_round()->replicate_msg()));
+      RETURN_NOT_OK(transaction_->Start());
+      VLOG_WITH_PREFIX(4) << "Triggering consensus replication.";
+      // Trigger consensus replication.
       {
-        boost::lock_guard<simple_spinlock> lock(lock_);
+        std::lock_guard<simple_spinlock> lock(lock_);
         replication_state_ = REPLICATING;
+        replication_start_time_ = MonoTime::Now();
       }
-      Status s = consensus_->Replicate(mutable_state()->consensus_round());
 
+      Status s = consensus_->Replicate(mutable_state()->consensus_round());
       if (PREDICT_FALSE(!s.ok())) {
-        boost::lock_guard<simple_spinlock> lock(lock_);
+        std::lock_guard<simple_spinlock> lock(lock_);
         CHECK_EQ(replication_state_, REPLICATING);
         transaction_status_ = s;
         replication_state_ = REPLICATION_FAILED;
@@ -235,11 +334,10 @@ void TransactionDriver::HandleFailure(const Status& s) {
   ReplicationState repl_state_copy;
 
   {
-    boost::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard<simple_spinlock> lock(lock_);
     transaction_status_ = s;
     repl_state_copy = replication_state_;
   }
-
 
   switch (repl_state_copy) {
     case NOT_REPLICATING:
@@ -265,8 +363,11 @@ void TransactionDriver::HandleFailure(const Status& s) {
 }
 
 void TransactionDriver::ReplicationFinished(const Status& status) {
+  MonoTime replication_finished_time = MonoTime::Now();
+
+  ADOPT_TRACE(trace());
   {
-    boost::lock_guard<simple_spinlock> op_id_lock(opid_lock_);
+    std::lock_guard<simple_spinlock> op_id_lock(opid_lock_);
     // TODO: it's a bit silly that we have three copies of the opid:
     // one here, one in ConsensusRound, and one in TransactionState.
 
@@ -275,9 +376,17 @@ void TransactionDriver::ReplicationFinished(const Status& status) {
     mutable_state()->mutable_op_id()->CopyFrom(op_id_copy_);
   }
 
+  // If we're going to abort, do so before changing the state below. This avoids a race with
+  // the prepare thread, which would race with the thread calling this method to release the driver
+  // while we're aborting, if we were to do it afterwards.
+  if (!status.ok()) {
+    transaction_->AbortPrepare();
+  }
+
+  MonoDelta replication_duration;
   PrepareState prepare_state_copy;
   {
-    boost::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard<simple_spinlock> lock(lock_);
     CHECK_EQ(replication_state_, REPLICATING);
     if (status.ok()) {
       replication_state_ = REPLICATED;
@@ -286,7 +395,10 @@ void TransactionDriver::ReplicationFinished(const Status& status) {
       transaction_status_ = status;
     }
     prepare_state_copy = prepare_state_;
+    replication_duration = replication_finished_time - replication_start_time_;
   }
+
+  TRACE_COUNTER_INCREMENT("replication_time_us", replication_duration.ToMicroseconds());
 
   // If we have prepared and replicated, we're ready
   // to move ahead and apply this operation.
@@ -306,7 +418,7 @@ void TransactionDriver::Abort(const Status& status) {
 
   ReplicationState repl_state_copy;
   {
-    boost::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard<simple_spinlock> lock(lock_);
     repl_state_copy = replication_state_;
     transaction_status_ = status;
   }
@@ -323,16 +435,15 @@ void TransactionDriver::Abort(const Status& status) {
 
 Status TransactionDriver::ApplyAsync() {
   {
-    boost::unique_lock<simple_spinlock> lock(lock_);
+    std::unique_lock<simple_spinlock> lock(lock_);
     DCHECK_EQ(prepare_state_, PREPARED);
     if (transaction_status_.ok()) {
       DCHECK_EQ(replication_state_, REPLICATED);
-      order_verifier_->CheckApply(op_id_copy_.index(),
-                                  prepare_physical_timestamp_);
+      order_verifier_->CheckApply(op_id_copy_.index(), prepare_physical_timestamp_);
       // Now that the transaction is committed in consensus advance the safe time.
       if (transaction_->state()->external_consistency_mode() != COMMIT_WAIT) {
         transaction_->state()->tablet_peer()->tablet()->mvcc_manager()->
-            OfflineAdjustSafeTime(transaction_->state()->timestamp());
+            AdjustSafeTime(transaction_->state()->timestamp());
       }
     } else {
       DCHECK_EQ(replication_state_, REPLICATION_FAILED);
@@ -352,7 +463,7 @@ void TransactionDriver::ApplyTask() {
   ADOPT_TRACE(trace());
 
   {
-    boost::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard<simple_spinlock> lock(lock_);
     DCHECK_EQ(replication_state_, REPLICATED);
     DCHECK_EQ(prepare_state_, PREPARED);
   }
@@ -367,12 +478,18 @@ void TransactionDriver::ApplyTask() {
     commit_msg->mutable_commited_op_id()->CopyFrom(op_id_copy_);
     SetResponseTimestamp(transaction_->state(), transaction_->state()->timestamp());
 
+    {
+      TRACE_EVENT1("txn", "AsyncAppendCommit", "txn", this);
+      CHECK_OK(log_->AsyncAppendCommit(std::move(commit_msg),
+                                       Bind(CrashIfNotOkStatusCB,
+                                       "Enqueued commit operation failed to write to WAL")));
+    }
+
     // If the client requested COMMIT_WAIT as the external consistency mode
     // calculate the latest that the prepare timestamp could be and wait
     // until now.earliest > prepare_latest. Only after this are the locks
     // released.
     if (mutable_state()->external_consistency_mode() == COMMIT_WAIT) {
-      // TODO: only do this on the leader side
       TRACE("APPLY: Commit Wait.");
       // If we can't commit wait and have already applied we might have consistency
       // issues if we still reply to the client that the operation was a success.
@@ -381,11 +498,6 @@ void TransactionDriver::ApplyTask() {
       CHECK_OK(CommitWait());
     }
 
-    transaction_->PreCommit();
-    {
-      TRACE_EVENT1("txn", "AsyncAppendCommit", "txn", this);
-      CHECK_OK(log_->AsyncAppendCommit(commit_msg.Pass(), Bind(DoNothingStatusCB)));
-    }
     Finalize();
   }
 }
@@ -401,15 +513,12 @@ void TransactionDriver::SetResponseTimestamp(TransactionState* transaction_state
 }
 
 Status TransactionDriver::CommitWait() {
-  MonoTime before = MonoTime::Now(MonoTime::FINE);
+  MonoTime before = MonoTime::Now();
   DCHECK(mutable_state()->external_consistency_mode() == COMMIT_WAIT);
-  // TODO: we could plumb the RPC deadline in here, and not bother commit-waiting
-  // if the deadline is already expired.
-  RETURN_NOT_OK(
-      mutable_state()->tablet_peer()->clock()->WaitUntilAfter(mutable_state()->timestamp(),
-                                                              MonoTime::Max()));
+  RETURN_NOT_OK(mutable_state()->tablet_peer()->clock()->WaitUntilAfter(
+      mutable_state()->timestamp(), MonoTime::Max()));
   mutable_state()->mutable_metrics()->commit_wait_duration_usec =
-      MonoTime::Now(MonoTime::FINE).GetDeltaSince(before).ToMicroseconds();
+      (MonoTime::Now() - before).ToMicroseconds();
   return Status::OK();
 }
 
@@ -418,7 +527,7 @@ void TransactionDriver::Finalize() {
   // TODO: this is an ugly hack so that the Release() call doesn't delete the
   // object while we still hold the lock.
   scoped_refptr<TransactionDriver> ref(this);
-  boost::lock_guard<simple_spinlock> lock(lock_);
+  std::lock_guard<simple_spinlock> lock(lock_);
   transaction_->Finish(Transaction::COMMITTED);
   mutable_state()->completion_callback()->TransactionCompleted();
   txn_tracker_->Release(this);
@@ -464,7 +573,7 @@ std::string TransactionDriver::LogPrefix() const {
   string ts_string;
 
   {
-    boost::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard<simple_spinlock> lock(lock_);
     repl_state_copy = replication_state_;
     prep_state_copy = prepare_state_;
     ts_string = state()->has_timestamp() ? state()->timestamp().ToString() : "No timestamp";

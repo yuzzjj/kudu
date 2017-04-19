@@ -65,6 +65,19 @@ message SendTwoStringsResponsePB {
   required uint32 sidecar2 = 2;
 }
 
+// Push two strings to the server as part of the request, in sidecars.
+message PushTwoStringsRequestPB {
+  required uint32 sidecar1_idx = 1;
+  required uint32 sidecar2_idx = 2;
+}
+
+message PushTwoStringsResponsePB {
+  required uint32 size1 = 1;
+  required string data1 = 2;
+  required uint32 size2 = 3;
+  required string data2 = 4;
+}
+
 message EchoRequestPB {
   required string data = 1;
 }
@@ -90,12 +103,47 @@ message CalculatorError {
 message PanicRequestPB {}
 message PanicResponsePB {}
 
+message TestInvalidResponseRequestPB {
+  enum ErrorType {
+    MISSING_REQUIRED_FIELD = 1;
+    RESPONSE_TOO_LARGE = 2;
+  }
+  required ErrorType error_type = 1;
+}
+
+message TestInvalidResponseResponsePB {
+  required bytes response = 1;
+}
+
+enum FeatureFlags {
+  UNKNOWN=0;
+  FOO=1;
+}
+
+message ExactlyOnceRequestPB {
+  optional uint32 sleep_for_ms = 1 [default = 0];
+  required uint32 value_to_add = 2;
+  optional bool randomly_fail = 3 [default = false];
+}
+message ExactlyOnceResponsePB {
+  required uint32 current_val = 1;
+  required fixed64 current_time_micros = 2;
+}
+
 service CalculatorService {
+  option (kudu.rpc.default_authz_method) = "AuthorizeDisallowAlice";
+
   rpc Add(AddRequestPB) returns(AddResponsePB);
-  rpc Sleep(SleepRequestPB) returns(SleepResponsePB);
+  rpc Sleep(SleepRequestPB) returns(SleepResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeDisallowBob";
+  };
   rpc Echo(EchoRequestPB) returns(EchoResponsePB);
   rpc WhoAmI(WhoAmIRequestPB) returns (WhoAmIResponsePB);
   rpc TestArgumentsInDiffPackage(kudu.rpc_test_diff_package.ReqDiffPackagePB)
     returns(kudu.rpc_test_diff_package.RespDiffPackagePB);
   rpc Panic(PanicRequestPB) returns (PanicResponsePB);
+  rpc AddExactlyOnce(ExactlyOnceRequestPB) returns (ExactlyOnceResponsePB) {
+    option (kudu.rpc.track_rpc_result) = true;
+  }
+  rpc TestInvalidResponse(TestInvalidResponseRequestPB) returns (TestInvalidResponseResponsePB);
 }

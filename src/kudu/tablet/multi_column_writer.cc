@@ -29,6 +29,7 @@ namespace tablet {
 using cfile::CFileWriter;
 using fs::ScopedWritableBlockCloser;
 using fs::WritableBlock;
+using std::unique_ptr;
 
 MultiColumnWriter::MultiColumnWriter(FsManager* fs,
                                      const Schema* schema)
@@ -68,7 +69,7 @@ Status MultiColumnWriter::Open() {
     }
 
     // Open file for write.
-    gscoped_ptr<WritableBlock> block;
+    unique_ptr<WritableBlock> block;
     RETURN_NOT_OK_PREPEND(fs_->CreateNewBlock(&block),
                           "Unable to open output file for column " + col.ToString());
     BlockId block_id(block->id());
@@ -78,7 +79,7 @@ Status MultiColumnWriter::Open() {
         opts,
         col.type_info(),
         col.is_nullable(),
-        block.Pass()));
+        std::move(block)));
     RETURN_NOT_OK_PREPEND(writer->Start(),
                           "Unable to Start() writer for column " + col.ToString());
 

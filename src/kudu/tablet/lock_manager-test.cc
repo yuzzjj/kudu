@@ -16,10 +16,10 @@
 // under the License.
 
 #include <algorithm>
-#include <boost/thread/thread.hpp>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include "kudu/gutil/gscoped_ptr.h"
@@ -99,7 +99,7 @@ TEST_F(LockManagerTest, TestMoveLock) {
   ASSERT_TRUE(row_lock.acquired());
 
   // Move it to a new instance.
-  ScopedRowLock moved_lock(row_lock.Pass());
+  ScopedRowLock moved_lock(std::move(row_lock));
   ASSERT_TRUE(moved_lock.acquired());
   ASSERT_FALSE(row_lock.acquired());
 }
@@ -117,7 +117,7 @@ class LmTestResource {
   }
 
   void acquire(uint64_t tid) {
-    boost::unique_lock<boost::mutex> lock(lock_);
+    std::unique_lock<std::mutex> lock(lock_);
     CHECK(!is_owned_);
     CHECK_EQ(0, owner_);
     owner_ = tid;
@@ -125,7 +125,7 @@ class LmTestResource {
   }
 
   void release(uint64_t tid) {
-    boost::unique_lock<boost::mutex> lock(lock_);
+    std::unique_lock<std::mutex> lock(lock_);
     CHECK(is_owned_);
     CHECK_EQ(tid, owner_);
     owner_ = 0;
@@ -136,7 +136,7 @@ class LmTestResource {
   DISALLOW_COPY_AND_ASSIGN(LmTestResource);
 
   const Slice* id_;
-  boost::mutex lock_;
+  std::mutex lock_;
   uint64_t owner_;
   bool is_owned_;
 };

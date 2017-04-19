@@ -27,6 +27,8 @@
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/bitmap.h"
+#include "kudu/util/logging.h"
+#include "kudu/util/memory/overwrite.h"
 #include "kudu/util/status.h"
 
 using strings::Substitute;
@@ -186,8 +188,8 @@ Status KuduPartialRow::Set(int32_t column_idx, const uint8_t* val) {
       RETURN_NOT_OK(SetBinaryCopy(column_idx, *reinterpret_cast<const Slice*>(val)));
       break;
     };
-    case TIMESTAMP: {
-      RETURN_NOT_OK(SetTimestamp(column_idx, *reinterpret_cast<const int64_t*>(val)));
+    case UNIXTIME_MICROS: {
+      RETURN_NOT_OK(SetUnixTimeMicros(column_idx, *reinterpret_cast<const int64_t*>(val)));
       break;
     };
     default: {
@@ -238,20 +240,14 @@ Status KuduPartialRow::SetInt32(const Slice& col_name, int32_t val) {
 Status KuduPartialRow::SetInt64(const Slice& col_name, int64_t val) {
   return Set<TypeTraits<INT64> >(col_name, val);
 }
-Status KuduPartialRow::SetTimestamp(const Slice& col_name, int64_t val) {
-  return Set<TypeTraits<TIMESTAMP> >(col_name, val);
+Status KuduPartialRow::SetUnixTimeMicros(const Slice& col_name, int64_t val) {
+  return Set<TypeTraits<UNIXTIME_MICROS> >(col_name, val);
 }
 Status KuduPartialRow::SetFloat(const Slice& col_name, float val) {
   return Set<TypeTraits<FLOAT> >(col_name, val);
 }
 Status KuduPartialRow::SetDouble(const Slice& col_name, double val) {
   return Set<TypeTraits<DOUBLE> >(col_name, val);
-}
-Status KuduPartialRow::SetString(const Slice& col_name, const Slice& val) {
-  return Set<TypeTraits<STRING> >(col_name, val, false);
-}
-Status KuduPartialRow::SetBinary(const Slice& col_name, const Slice& val) {
-  return Set<TypeTraits<BINARY> >(col_name, val, false);
 }
 Status KuduPartialRow::SetBool(int col_idx, bool val) {
   return Set<TypeTraits<BOOL> >(col_idx, val);
@@ -268,14 +264,8 @@ Status KuduPartialRow::SetInt32(int col_idx, int32_t val) {
 Status KuduPartialRow::SetInt64(int col_idx, int64_t val) {
   return Set<TypeTraits<INT64> >(col_idx, val);
 }
-Status KuduPartialRow::SetTimestamp(int col_idx, int64_t val) {
-  return Set<TypeTraits<TIMESTAMP> >(col_idx, val);
-}
-Status KuduPartialRow::SetString(int col_idx, const Slice& val) {
-  return Set<TypeTraits<STRING> >(col_idx, val, false);
-}
-Status KuduPartialRow::SetBinary(int col_idx, const Slice& val) {
-  return Set<TypeTraits<BINARY> >(col_idx, val, false);
+Status KuduPartialRow::SetUnixTimeMicros(int col_idx, int64_t val) {
+  return Set<TypeTraits<UNIXTIME_MICROS> >(col_idx, val);
 }
 Status KuduPartialRow::SetFloat(int col_idx, float val) {
   return Set<TypeTraits<FLOAT> >(col_idx, val);
@@ -284,17 +274,43 @@ Status KuduPartialRow::SetDouble(int col_idx, double val) {
   return Set<TypeTraits<DOUBLE> >(col_idx, val);
 }
 
+Status KuduPartialRow::SetBinary(const Slice& col_name, const Slice& val) {
+  return SetBinaryCopy(col_name, val);
+}
+Status KuduPartialRow::SetString(const Slice& col_name, const Slice& val) {
+  return SetStringCopy(col_name, val);
+}
+Status KuduPartialRow::SetBinary(int col_idx, const Slice& val) {
+  return SetBinaryCopy(col_idx, val);
+}
+Status KuduPartialRow::SetString(int col_idx, const Slice& val) {
+  return SetStringCopy(col_idx, val);
+}
+
 Status KuduPartialRow::SetBinaryCopy(const Slice& col_name, const Slice& val) {
   return SetSliceCopy<TypeTraits<BINARY> >(col_name, val);
-}
-Status KuduPartialRow::SetBinaryCopy(int col_idx, const Slice& val) {
-  return SetSliceCopy<TypeTraits<BINARY> >(col_idx, val);
 }
 Status KuduPartialRow::SetStringCopy(const Slice& col_name, const Slice& val) {
   return SetSliceCopy<TypeTraits<STRING> >(col_name, val);
 }
+Status KuduPartialRow::SetBinaryCopy(int col_idx, const Slice& val) {
+  return SetSliceCopy<TypeTraits<BINARY> >(col_idx, val);
+}
 Status KuduPartialRow::SetStringCopy(int col_idx, const Slice& val) {
   return SetSliceCopy<TypeTraits<STRING> >(col_idx, val);
+}
+
+Status KuduPartialRow::SetBinaryNoCopy(const Slice& col_name, const Slice& val) {
+  return Set<TypeTraits<BINARY> >(col_name, val, false);
+}
+Status KuduPartialRow::SetStringNoCopy(const Slice& col_name, const Slice& val) {
+  return Set<TypeTraits<STRING> >(col_name, val, false);
+}
+Status KuduPartialRow::SetBinaryNoCopy(int col_idx, const Slice& val) {
+  return Set<TypeTraits<BINARY> >(col_idx, val, false);
+}
+Status KuduPartialRow::SetStringNoCopy(int col_idx, const Slice& val) {
+  return Set<TypeTraits<STRING> >(col_idx, val, false);
 }
 
 template<typename T>
@@ -395,9 +411,9 @@ Status KuduPartialRow::Set<TypeTraits<INT64> >(int col_idx,
                                                bool owned);
 
 template
-Status KuduPartialRow::Set<TypeTraits<TIMESTAMP> >(
+Status KuduPartialRow::Set<TypeTraits<UNIXTIME_MICROS> >(
     int col_idx,
-    const TypeTraits<TIMESTAMP>::cpp_type& val,
+    const TypeTraits<UNIXTIME_MICROS>::cpp_type& val,
     bool owned);
 
 template
@@ -446,9 +462,9 @@ Status KuduPartialRow::Set<TypeTraits<INT64> >(const Slice& col_name,
                                                bool owned);
 
 template
-Status KuduPartialRow::Set<TypeTraits<TIMESTAMP> >(
+Status KuduPartialRow::Set<TypeTraits<UNIXTIME_MICROS> >(
     const Slice& col_name,
-    const TypeTraits<TIMESTAMP>::cpp_type& val,
+    const TypeTraits<UNIXTIME_MICROS>::cpp_type& val,
     bool owned);
 
 template
@@ -524,8 +540,9 @@ Status KuduPartialRow::GetInt32(const Slice& col_name, int32_t* val) const {
 Status KuduPartialRow::GetInt64(const Slice& col_name, int64_t* val) const {
   return Get<TypeTraits<INT64> >(col_name, val);
 }
-Status KuduPartialRow::GetTimestamp(const Slice& col_name, int64_t* micros_since_utc_epoch) const {
-  return Get<TypeTraits<TIMESTAMP> >(col_name, micros_since_utc_epoch);
+Status KuduPartialRow::GetUnixTimeMicros(const Slice& col_name,
+                                         int64_t* micros_since_utc_epoch) const {
+  return Get<TypeTraits<UNIXTIME_MICROS> >(col_name, micros_since_utc_epoch);
 }
 Status KuduPartialRow::GetFloat(const Slice& col_name, float* val) const {
   return Get<TypeTraits<FLOAT> >(col_name, val);
@@ -555,8 +572,8 @@ Status KuduPartialRow::GetInt32(int col_idx, int32_t* val) const {
 Status KuduPartialRow::GetInt64(int col_idx, int64_t* val) const {
   return Get<TypeTraits<INT64> >(col_idx, val);
 }
-Status KuduPartialRow::GetTimestamp(int col_idx, int64_t* micros_since_utc_epoch) const {
-  return Get<TypeTraits<TIMESTAMP> >(col_idx, micros_since_utc_epoch);
+Status KuduPartialRow::GetUnixTimeMicros(int col_idx, int64_t* micros_since_utc_epoch) const {
+  return Get<TypeTraits<UNIXTIME_MICROS> >(col_idx, micros_since_utc_epoch);
 }
 Status KuduPartialRow::GetFloat(int col_idx, float* val) const {
   return Get<TypeTraits<FLOAT> >(col_idx, val);
@@ -649,6 +666,8 @@ bool KuduPartialRow::IsKeySet() const {
 
 
 std::string KuduPartialRow::ToString() const {
+  ScopedDisableRedaction no_redaction;
+
   ContiguousRow row(schema_, row_data_);
   std::string ret;
   bool first = true;

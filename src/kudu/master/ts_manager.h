@@ -30,11 +30,11 @@
 namespace kudu {
 
 class NodeInstancePB;
+class ServerRegistrationPB;
 
 namespace master {
 
 class TSDescriptor;
-class TSRegistrationPB;
 
 typedef std::vector<std::shared_ptr<TSDescriptor> > TSDescriptorVector;
 
@@ -58,19 +58,19 @@ class TSManager {
   // current instance ID for the TS, then a NotFound status is returned.
   // Otherwise, *desc is set and OK is returned.
   Status LookupTS(const NodeInstancePB& instance,
-                  std::shared_ptr<TSDescriptor>* desc);
+                  std::shared_ptr<TSDescriptor>* desc) const;
 
   // Lookup the tablet server descriptor for the given UUID.
   // Returns false if the TS has never registered.
   // Otherwise, *desc is set and returns true.
   bool LookupTSByUUID(const std::string& uuid,
-                        std::shared_ptr<TSDescriptor>* desc);
+                        std::shared_ptr<TSDescriptor>* desc) const;
 
   // Register or re-register a tablet server with the manager.
   //
   // If successful, *desc reset to the registered descriptor.
   Status RegisterTS(const NodeInstancePB& instance,
-                    const TSRegistrationPB& registration,
+                    const ServerRegistrationPB& registration,
                     std::shared_ptr<TSDescriptor>* desc);
 
   // Return all of the currently registered TS descriptors into the provided

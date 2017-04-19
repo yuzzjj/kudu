@@ -50,7 +50,7 @@ class BloomFileTestBase : public KuduTest {
   void SetUp() OVERRIDE {
     KuduTest::SetUp();
 
-    fs_manager_.reset(new FsManager(env_.get(), GetTestPath("fs_root")));
+    fs_manager_.reset(new FsManager(env_, GetTestPath("fs_root")));
     ASSERT_OK(fs_manager_->CreateInitialFileSystemLayout());
     ASSERT_OK(fs_manager_->Open());
   }
@@ -70,7 +70,7 @@ class BloomFileTestBase : public KuduTest {
   }
 
   void WriteTestBloomFile() {
-    gscoped_ptr<WritableBlock> sink;
+    std::unique_ptr<WritableBlock> sink;
     ASSERT_OK(fs_manager_->CreateNewBlock(&sink));
     block_id_ = sink->id();
 
@@ -82,7 +82,7 @@ class BloomFileTestBase : public KuduTest {
       << "Invalid parameters: --n_keys isn't set large enough to fill even "
       << "one bloom filter of the requested --bloom_size_bytes";
 
-    BloomFileWriter bfw(sink.Pass(), sizing);
+    BloomFileWriter bfw(std::move(sink), sizing);
 
     ASSERT_OK(bfw.Start());
     AppendBlooms(&bfw);
@@ -90,10 +90,10 @@ class BloomFileTestBase : public KuduTest {
   }
 
   Status OpenBloomFile() {
-    gscoped_ptr<ReadableBlock> source;
+    std::unique_ptr<ReadableBlock> source;
     RETURN_NOT_OK(fs_manager_->OpenBlock(block_id_, &source));
 
-    return BloomFileReader::Open(source.Pass(), ReaderOptions(), &bfr_);
+    return BloomFileReader::Open(std::move(source), ReaderOptions(), &bfr_);
   }
 
   uint64_t ReadBenchmark() {

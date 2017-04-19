@@ -19,7 +19,7 @@ System Requirements
 - Java 7
 - Maven 3
 - protobuf 2.6.1 (it needs to be the exact version)
-
+- MIT Kerberos (krb5)
 
 Building the Client
 ------------------------------------------------------------
@@ -27,7 +27,6 @@ Building the Client
 $ mvn package -DskipTests
 
 The client jar will can then be found at kudu-client/target.
-
 
 Running the Tests
 ------------------------------------------------------------
@@ -51,6 +50,20 @@ Integration tests, including tests which cover Hadoop integration,
 may be run with:
 
 $ mvn verify
+
+Building the Kudu-Spark integration for Spark 2.x with Scala 2.11
+------------------------------------------------------------
+
+The Spark integration builds for Spark 1.x and Scala 2.10 by default.
+Additionally, there is a build profile available for Spark 2.x with
+Scala 2.11: from the kudu-spark directory, run
+
+$ mvn clean package -P spark2_2.11
+
+The two artifactIds are
+
+1. kudu-spark_2.10 for Spark 1.x with Scala 2.10
+2. kudu-spark2_2.11 for Spark 2.x with Scala 2.11
 
 State of Eclipse integration
 ------------------------------------------------------------
@@ -123,25 +136,3 @@ likely a bug in maven-protoc-plugin.
 
 There's a simple workaround: delete the errant folder within
 Eclipse and refresh the kudu-client project.
-
-
-Building the Kudu Custom Service Descriptor (CSD)
-------------------------------------------------------------
-
-By default, the Kudu CSD will not be built with the client
-and isn't needed by any API.
-
-It requires access to the Kudu binaries which have to be built
-prior to building this module.
-
-Here's how to build the kudu-csd module:
-
-$ mvn package -DskipTests -PbuildCSD
-
-Also by default, building the CSD does not validate it,
-because (for the moment) this requires access to an internal
-Cloudera repository containing the validator maven plugin.
-
-Here's how to build the kudu-csd module with validation:
-
-$ mvn package -DskipTests -PbuildCSD -PvalidateCSD

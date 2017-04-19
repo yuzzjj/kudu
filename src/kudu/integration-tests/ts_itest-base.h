@@ -32,6 +32,7 @@
 #include "kudu/integration-tests/external_mini_cluster_fs_inspector.h"
 #include "kudu/master/master.proxy.h"
 #include "kudu/tserver/tablet_server-test-base.h"
+#include "kudu/util/pb_util.h"
 #include "kudu/util/random.h"
 #include "kudu/util/test_util.h"
 
@@ -97,6 +98,8 @@ class TabletServerIntegrationTestBase : public TabletServerTestBase {
     opts.num_tablet_servers = FLAGS_num_tablet_servers;
     opts.data_root = GetTestPath(data_root_path);
 
+    // Enable exactly once semantics for tests.
+
     // If the caller passed no flags use the default ones, where we stress consensus by setting
     // low timeouts and frequent cache misses.
     if (non_default_ts_flags.empty()) {
@@ -133,10 +136,8 @@ class TabletServerIntegrationTestBase : public TabletServerTestBase {
   // Waits that all replicas for a all tablets of 'kTableId' table are online
   // and creates the tablet_replicas_ map.
   void WaitForReplicasAndUpdateLocations() {
-    int num_retries = 0;
-
     bool replicas_missing = true;
-    do {
+    for (int num_retries = 0; replicas_missing && num_retries < kMaxRetries; num_retries++) {
       std::unordered_multimap<std::string, TServerDetails*> tablet_replicas;
       GetTableLocationsRequestPB req;
       GetTableLocationsResponsePB resp;
@@ -145,7 +146,25 @@ class TabletServerIntegrationTestBase : public TabletServerTestBase {
       controller.set_timeout(MonoDelta::FromSeconds(1));
       CHECK_OK(cluster_->master_proxy()->GetTableLocations(req, &resp, &controller));
       CHECK_OK(controller.status());
-      CHECK(!resp.has_error()) << "Response had an error: " << resp.error().ShortDebugString();
+      if (resp.has_error()) {
+        switch (resp.error().code()) {
+          case master::MasterErrorPB::TABLET_NOT_RUNNING:
+            LOG(WARNING)<< "At least one tablet is not yet running";
+            break;
+
+          case master::MasterErrorPB::NOT_THE_LEADER:   // fallthrough
+          case master::MasterErrorPB::CATALOG_MANAGER_NOT_INITIALIZED:
+            LOG(WARNING)<< "CatalogManager is not yet ready to serve requests";
+            break;
+
+          default:
+            FAIL() << "Response had a fatal error: "
+                   << SecureShortDebugString(resp.error());
+            break;  // unreachable
+        }
+        SleepFor(MonoDelta::FromSeconds(1));
+        continue;
+      }
 
       for (const master::TabletLocationsPB& location : resp.tablet_locations()) {
         for (const master::TabletLocationsPB_ReplicaPB& replica : location.replicas()) {
@@ -155,10 +174,9 @@ class TabletServerIntegrationTestBase : public TabletServerTestBase {
 
         if (tablet_replicas.count(location.tablet_id()) < FLAGS_num_replicas) {
           LOG(WARNING)<< "Couldn't find the leader and/or replicas. Location: "
-              << location.ShortDebugString();
+              << SecureShortDebugString(location);
           replicas_missing = true;
           SleepFor(MonoDelta::FromSeconds(1));
-          num_retries++;
           break;
         }
 
@@ -167,7 +185,29 @@ class TabletServerIntegrationTestBase : public TabletServerTestBase {
       if (!replicas_missing) {
         tablet_replicas_ = tablet_replicas;
       }
-    } while (replicas_missing && num_retries < kMaxRetries);
+    }
+
+    // GetTableLocations() does not guarantee that all replicas are actually
+    // running. Some may still be bootstrapping. Wait for them before
+    // returning.
+    //
+    // Just as with the above loop and its behavior once kMaxRetries is
+    // reached, the wait here is best effort only. That is, if the wait
+    // deadline expires, the resulting timeout failure is ignored.
+    for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+      ExternalTabletServer* ts = cluster_->tablet_server(i);
+      int expected_tablet_count = 0;
+      for (const auto& e : tablet_replicas_) {
+        if (ts->uuid() == e.second->uuid()) {
+          expected_tablet_count++;
+        }
+      }
+      LOG(INFO) << strings::Substitute(
+          "Waiting for $0 tablets on tserver $1 to finish bootstrapping",
+          expected_tablet_count, ts->uuid());
+      cluster_->WaitForTabletsRunning(ts, expected_tablet_count,
+                                      MonoDelta::FromSeconds(20));
+    }
   }
 
   // Returns the last committed leader of the consensus configuration. Tries to get it from master
@@ -393,9 +433,6 @@ class TabletServerIntegrationTestBase : public TabletServerTestBase {
   }
 
   virtual void TearDown() OVERRIDE {
-    if (cluster_) {
-      cluster_->Shutdown();
-    }
     STLDeleteValues(&tablet_servers_);
   }
 
@@ -414,11 +451,8 @@ class TabletServerIntegrationTestBase : public TabletServerTestBase {
     gscoped_ptr<client::KuduTableCreator> table_creator(client_->NewTableCreator());
     ASSERT_OK(table_creator->table_name(kTableId)
              .schema(&client_schema)
+             .set_range_partition_columns({ "key" })
              .num_replicas(FLAGS_num_replicas)
-             // NOTE: this is quite high as a timeout, but the default (5 sec) does not
-             // seem to be high enough in some cases (see KUDU-550). We should remove
-             // this once that ticket is addressed.
-             .timeout(MonoDelta::FromSeconds(20))
              .Create());
     ASSERT_OK(client_->OpenTable(kTableId, &table_));
   }
@@ -440,6 +474,32 @@ class TabletServerIntegrationTestBase : public TabletServerTestBase {
     ClusterVerifier v(cluster_.get());
     NO_FATALS(v.CheckCluster());
     NO_FATALS(v.CheckRowCount(kTableId, ClusterVerifier::EXACTLY, expected_result_count));
+  }
+
+  // Check for and restart any TS that have crashed.
+  // Returns the number of servers restarted.
+  int RestartAnyCrashedTabletServers() {
+    int restarted = 0;
+    for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+      if (!cluster_->tablet_server(i)->IsProcessAlive()) {
+        LOG(INFO) << "TS " << i << " appears to have crashed. Restarting.";
+        cluster_->tablet_server(i)->Shutdown();
+        CHECK_OK(cluster_->tablet_server(i)->Restart());
+        restarted++;
+      }
+    }
+    return restarted;
+  }
+
+  // Assert that no tablet servers have crashed.
+  // Tablet servers that have been manually Shutdown() are allowed.
+  void AssertNoTabletServersCrashed() {
+    for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+      if (cluster_->tablet_server(i)->IsShutdown()) continue;
+
+      ASSERT_TRUE(cluster_->tablet_server(i)->IsProcessAlive())
+                    << "Tablet server " << i << " crashed";
+    }
   }
 
  protected:

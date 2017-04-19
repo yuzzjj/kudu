@@ -18,10 +18,12 @@
 #define KUDU_TABLET_DELTA_KEY_H
 
 #include <string>
+
 #include "kudu/common/rowid.h"
 #include "kudu/gutil/endian.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/tablet/mvcc.h"
+#include "kudu/util/logging.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
@@ -70,15 +72,20 @@ class DeltaKey {
   // contain further data after that.
   // The 'key' slice is mutated so that, upon return, the decoded key has been removed from
   // its beginning.
-  Status DecodeFrom(Slice *key) {
+  //
+  // This function is called frequently, so is marked HOT to encourage inlining.
+  Status DecodeFrom(Slice *key) ATTRIBUTE_HOT {
     Slice orig(*key);
     if (!PREDICT_TRUE(DecodeRowId(key, &row_idx_))) {
-      return Status::Corruption("Bad delta key: bad rowid", orig.ToDebugString(20));
+      // Out-of-line the error case to keep this function small and inlinable.
+      return DeltaKeyError(orig, "bad rowid");
     }
 
     if (!PREDICT_TRUE(timestamp_.DecodeFrom(key))) {
-      return Status::Corruption("Bad delta key: bad timestamp", orig.ToDebugString(20));
+      // Out-of-line the error case to keep this function small and inlinable.
+      return DeltaKeyError(orig, "bad timestamp");
     }
+
     return Status::OK();
   }
 
@@ -98,6 +105,9 @@ class DeltaKey {
   const Timestamp &timestamp() const { return timestamp_; }
 
  private:
+  // Out-of-line error construction used by DecodeFrom.
+  static Status DeltaKeyError(const Slice& orig, const char* err);
+
   // The row which has been updated.
   rowid_t row_idx_;
 

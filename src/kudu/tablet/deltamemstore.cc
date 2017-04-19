@@ -42,26 +42,33 @@ using strings::Substitute;
 static const int kInitialArenaSize = 16;
 static const int kMaxArenaBufferSize = 5*1024*1024;
 
+Status DeltaMemStore::Create(int64_t id,
+                             int64_t rs_id,
+                             LogAnchorRegistry* log_anchor_registry,
+                             shared_ptr<MemTracker> parent_tracker,
+                             shared_ptr<DeltaMemStore>* dms) {
+  shared_ptr<DeltaMemStore> local_dms(new DeltaMemStore(id, rs_id,
+                                                        log_anchor_registry,
+                                                        std::move(parent_tracker)));
+
+  dms->swap(local_dms);
+  return Status::OK();
+}
+
 DeltaMemStore::DeltaMemStore(int64_t id,
                              int64_t rs_id,
                              LogAnchorRegistry* log_anchor_registry,
-                             const shared_ptr<MemTracker>& parent_tracker)
+                             shared_ptr<MemTracker> parent_tracker)
   : id_(id),
     rs_id_(rs_id),
-    anchorer_(log_anchor_registry, Substitute("Rowset-$0/DeltaMemStore-$1", rs_id_, id_)),
+    allocator_(new MemoryTrackingBufferAllocator(
+        HeapBufferAllocator::Get(), std::move(parent_tracker))),
+    arena_(new ThreadSafeMemoryTrackingArena(
+        kInitialArenaSize, kMaxArenaBufferSize, allocator_)),
+    tree_(arena_),
+    anchorer_(log_anchor_registry,
+              Substitute("Rowset-$0/DeltaMemStore-$1", rs_id_, id_)),
     disambiguator_sequence_number_(0) {
-  if (parent_tracker) {
-    CHECK(MemTracker::FindTracker(Tablet::kDMSMemTrackerId,
-                                  &mem_tracker_,
-                                  parent_tracker));
-  } else {
-    mem_tracker_ = MemTracker::GetRootTracker();
-  }
-  allocator_.reset(new MemoryTrackingBufferAllocator(
-      HeapBufferAllocator::Get(), mem_tracker_));
-  arena_.reset(new ThreadSafeMemoryTrackingArena(
-      kInitialArenaSize, kMaxArenaBufferSize, allocator_));
-  tree_.reset(new DMSTree(arena_));
 }
 
 Status DeltaMemStore::Init() {
@@ -80,7 +87,7 @@ Status DeltaMemStore::Update(Timestamp timestamp,
 
   Slice key_slice(buf);
   btree::PreparedMutation<DMSTreeTraits> mutation(key_slice);
-  mutation.Prepare(tree_.get());
+  mutation.Prepare(&tree_);
   if (PREDICT_FALSE(mutation.exists())) {
     // We already have a delta for this row at the same timestamp.
     // Try again with a disambiguating sequence number appended to the key.
@@ -88,7 +95,7 @@ Status DeltaMemStore::Update(Timestamp timestamp,
     PutMemcmpableVarint64(&buf, seq);
     key_slice = Slice(buf);
     mutation.Reset(key_slice);
-    mutation.Prepare(tree_.get());
+    mutation.Prepare(&tree_);
     CHECK(!mutation.exists())
       << "Appended a sequence number but still hit a duplicate "
       << "for rowid " << row_idx << " at timestamp " << timestamp;
@@ -106,7 +113,7 @@ Status DeltaMemStore::FlushToFile(DeltaFileWriter *dfw,
                                   gscoped_ptr<DeltaStats>* stats_ret) {
   gscoped_ptr<DeltaStats> stats(new DeltaStats());
 
-  gscoped_ptr<DMSTreeIter> iter(tree_->NewIterator());
+  gscoped_ptr<DMSTreeIter> iter(tree_.NewIterator());
   iter->SeekToStart();
   while (iter->IsValid()) {
     Slice key_slice, val;
@@ -118,7 +125,7 @@ Status DeltaMemStore::FlushToFile(DeltaFileWriter *dfw,
     stats->UpdateStats(key.timestamp(), rcl);
     iter->Next();
   }
-  RETURN_NOT_OK(dfw->WriteDeltaStats(*stats));
+  dfw->WriteDeltaStats(*stats);
 
   stats_ret->swap(stats);
   return Status::OK();
@@ -141,8 +148,8 @@ Status DeltaMemStore::CheckRowDeleted(rowid_t row_idx, bool *deleted) const {
 
   bool exact;
 
-  // TODO: can we avoid the allocation here?
-  gscoped_ptr<DMSTreeIter> iter(tree_->NewIterator());
+  // TODO(unknown): can we avoid the allocation here?
+  gscoped_ptr<DMSTreeIter> iter(tree_.NewIterator());
   if (!iter->SeekAtOrAfter(key_slice, &exact)) {
     return Status::OK();
   }
@@ -168,7 +175,7 @@ Status DeltaMemStore::CheckRowDeleted(rowid_t row_idx, bool *deleted) const {
 }
 
 void DeltaMemStore::DebugPrint() const {
-  tree_->DebugPrint();
+  tree_.DebugPrint();
 }
 
 ////////////////////////////////////////////////////////////
@@ -179,7 +186,7 @@ DMSIterator::DMSIterator(const shared_ptr<const DeltaMemStore>& dms,
                          const Schema* projection, MvccSnapshot snapshot)
     : dms_(dms),
       mvcc_snapshot_(std::move(snapshot)),
-      iter_(dms->tree_->NewIterator()),
+      iter_(dms->tree_.NewIterator()),
       initted_(false),
       prepared_idx_(0),
       prepared_count_(0),
@@ -229,7 +236,7 @@ Status DMSIterator::PrepareBatch(size_t nrows, PrepareFlag flag) {
   for (UpdatesForColumn& ufc : updates_by_col_) {
     ufc.clear();
   }
-  deletes_and_reinserts_.clear();
+  deleted_.clear();
   prepared_deltas_.clear();
 
   while (iter_->IsValid()) {
@@ -250,11 +257,9 @@ Status DMSIterator::PrepareBatch(size_t nrows, PrepareFlag flag) {
     if (flag == PREPARE_FOR_APPLY) {
       RowChangeListDecoder decoder((RowChangeList(val)));
       decoder.InitNoSafetyChecks();
-      if (decoder.is_delete() || decoder.is_reinsert()) {
-        DeleteOrReinsert dor;
-        dor.row_id = key.row_idx();
-        dor.exists = decoder.is_reinsert();
-        deletes_and_reinserts_.push_back(dor);
+      DCHECK(!decoder.is_reinsert()) << "Reinserts are not supported in the DeltaMemStore.";
+      if (decoder.is_delete()) {
+        deleted_.push_back(key.row_idx());
       } else {
         DCHECK(decoder.is_update());
         while (decoder.HasNext()) {
@@ -325,11 +330,9 @@ Status DMSIterator::ApplyDeletes(SelectionVector *sel_vec) {
   DCHECK_EQ(prepared_for_, PREPARED_FOR_APPLY);
   DCHECK_EQ(prepared_count_, sel_vec->nrows());
 
-  for (const DeleteOrReinsert& dor : deletes_and_reinserts_) {
-    uint32_t idx_in_block = dor.row_id - prepared_idx_;
-    if (!dor.exists) {
-      sel_vec->SetRowUnselected(idx_in_block);
-    }
+  for (auto& row_id : deleted_) {
+    uint32_t idx_in_block = row_id - prepared_idx_;
+    sel_vec->SetRowUnselected(idx_in_block);
   }
 
   return Status::OK();
@@ -344,7 +347,7 @@ Status DMSIterator::CollectMutations(vector<Mutation *> *dst, Arena *arena) {
     uint32_t rel_idx = key.row_idx() - prepared_idx_;
 
     Mutation *mutation = Mutation::CreateInArena(arena, key.timestamp(), changelist);
-    mutation->AppendToList(&dst->at(rel_idx));
+    mutation->PrependToList(&dst->at(rel_idx));
   }
   return Status::OK();
 }
@@ -360,6 +363,18 @@ bool DMSIterator::HasNext() {
   // TODO implement this if we ever want to include DeltaMemStore in minor
   // delta compaction.
   LOG(FATAL) << "Unimplemented";
+  return false;
+}
+
+bool DMSIterator::MayHaveDeltas() {
+  if (!deleted_.empty()) {
+    return true;
+  }
+  for (auto& col: updates_by_col_) {
+    if (!col.empty()) {
+      return true;
+    }
+  }
   return false;
 }
 

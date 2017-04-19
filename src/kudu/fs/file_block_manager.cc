@@ -17,32 +17,28 @@
 
 #include "kudu/fs/file_block_manager.h"
 
-#include <deque>
+#include <memory>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 #include "kudu/fs/block_manager_metrics.h"
-#include "kudu/fs/block_manager_util.h"
-#include "kudu/fs/fs.pb.h"
-#include "kudu/gutil/map-util.h"
-#include "kudu/gutil/strings/join.h"
+#include "kudu/fs/data_dirs.h"
+#include "kudu/gutil/strings/numbers.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/atomic.h"
 #include "kudu/util/env.h"
 #include "kudu/util/env_util.h"
+#include "kudu/util/file_cache.h"
 #include "kudu/util/malloc.h"
 #include "kudu/util/mem_tracker.h"
 #include "kudu/util/metrics.h"
-#include "kudu/util/oid_generator.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/random_util.h"
 #include "kudu/util/status.h"
 
-using kudu::env_util::ScopedFileDeleter;
 using std::shared_ptr;
 using std::string;
-using std::unordered_set;
+using std::unique_ptr;
 using std::vector;
 using strings::Substitute;
 
@@ -62,10 +58,10 @@ namespace internal {
 //
 // A block ID uniquely locates a block. Every ID is a uint64_t, broken down
 // into multiple logical components:
-// 1. Bytes 0 (MSB) and 1 identify the block's root path by path set index. See
+// 1. Bytes 0 (MSB) and 1 identify the block's data dir by path set index. See
 //    fs.proto for more details on path sets.
-// 2. Bytes 2-7 (LSB) uniquely identify the block within the root path. As more
-//    and more blocks are created in a root path, the likelihood of a collision
+// 2. Bytes 2-7 (LSB) uniquely identify the block within the data dir. As more
+//    and more blocks are created in a data dir, the likelihood of a collision
 //    becomes greater. In the event of a collision, the block manager will
 //    retry(see CreateBlock()).
 //
@@ -79,16 +75,16 @@ class FileBlockLocation {
   }
 
   // Construct a location from its constituent parts.
-  static FileBlockLocation FromParts(const string& root_path,
-                                     uint16_t root_path_idx,
+  static FileBlockLocation FromParts(DataDir* data_dir,
+                                     uint16_t data_dir_idx,
                                      const BlockId& block_id);
 
   // Construct a location from a full block ID.
-  static FileBlockLocation FromBlockId(const string& root_path,
+  static FileBlockLocation FromBlockId(DataDir* data_dir,
                                        const BlockId& block_id);
 
-  // Get the root path index of a given block ID.
-  static uint16_t GetRootPathIdx(const BlockId& block_id) {
+  // Get the data dir index of a given block ID.
+  static uint16_t GetDataDirIdx(const BlockId& block_id) {
     return block_id.id() >> 48;
   }
 
@@ -109,12 +105,12 @@ class FileBlockLocation {
   void GetAllParentDirs(vector<string>* parent_dirs) const;
 
   // Simple accessors.
-  const string& root_path() const { return root_path_; }
+  DataDir* data_dir() const { return data_dir_; }
   const BlockId& block_id() const { return block_id_; }
 
  private:
-  FileBlockLocation(string root_path, BlockId block_id)
-      : root_path_(std::move(root_path)), block_id_(std::move(block_id)) {}
+  FileBlockLocation(DataDir* data_dir, BlockId block_id)
+      : data_dir_(data_dir), block_id_(block_id) {}
 
   // These per-byte accessors yield subdirectories in which blocks are grouped.
   string byte2() const {
@@ -130,27 +126,27 @@ class FileBlockLocation {
                         (block_id_.id() & 0x00000000FF000000ULL) >> 24);
   }
 
-  string root_path_;
+  DataDir* data_dir_;
   BlockId block_id_;
 };
 
-FileBlockLocation FileBlockLocation::FromParts(const string& root_path,
-                                               uint16_t root_path_idx,
+FileBlockLocation FileBlockLocation::FromParts(DataDir* data_dir,
+                                               uint16_t data_dir_idx,
                                                const BlockId& block_id) {
-  // The combined ID consists of 'root_path_idx' (top 2 bytes) and 'block_id'
+  // The combined ID consists of 'data_dir_idx' (top 2 bytes) and 'block_id'
   // (bottom 6 bytes). The top 2 bytes of 'block_id' are dropped.
-  uint64_t combined_id = static_cast<uint64_t>(root_path_idx) << 48;
+  uint64_t combined_id = static_cast<uint64_t>(data_dir_idx) << 48;
   combined_id |= block_id.id() & ((1ULL << 48) - 1);
-  return FileBlockLocation(root_path, BlockId(combined_id));
+  return FileBlockLocation(data_dir, BlockId(combined_id));
 }
 
-FileBlockLocation FileBlockLocation::FromBlockId(const string& root_path,
+FileBlockLocation FileBlockLocation::FromBlockId(DataDir* data_dir,
                                                  const BlockId& block_id) {
-  return FileBlockLocation(root_path, block_id);
+  return FileBlockLocation(data_dir, block_id);
 }
 
 string FileBlockLocation::GetFullPath() const {
-  string p = root_path_;
+  string p = data_dir_->dir();
   p = JoinPathSegments(p, byte2());
   p = JoinPathSegments(p, byte3());
   p = JoinPathSegments(p, byte4());
@@ -160,10 +156,10 @@ string FileBlockLocation::GetFullPath() const {
 
 Status FileBlockLocation::CreateBlockDir(Env* env,
                                          vector<string>* created_dirs) {
-  DCHECK(env->FileExists(root_path_));
+  DCHECK(env->FileExists(data_dir_->dir()));
 
   bool path0_created;
-  string path0 = JoinPathSegments(root_path_, byte2());
+  string path0 = JoinPathSegments(data_dir_->dir(), byte2());
   RETURN_NOT_OK(env_util::CreateDirIfMissing(env, path0, &path0_created));
 
   bool path1_created;
@@ -181,13 +177,13 @@ Status FileBlockLocation::CreateBlockDir(Env* env,
     created_dirs->push_back(path0);
   }
   if (path0_created) {
-    created_dirs->push_back(root_path_);
+    created_dirs->push_back(data_dir_->dir());
   }
   return Status::OK();
 }
 
 void FileBlockLocation::GetAllParentDirs(vector<string>* parent_dirs) const {
-  string path0 = JoinPathSegments(root_path_, byte2());
+  string path0 = JoinPathSegments(data_dir_->dir(), byte2());
   string path1 = JoinPathSegments(path0, byte3());
   string path2 = JoinPathSegments(path1, byte4());
 
@@ -196,7 +192,7 @@ void FileBlockLocation::GetAllParentDirs(vector<string>* parent_dirs) const {
   parent_dirs->push_back(path2);
   parent_dirs->push_back(path1);
   parent_dirs->push_back(path0);
-  parent_dirs->push_back(root_path_);
+  parent_dirs->push_back(data_dir_->dir());
 }
 
 ////////////////////////////////////////////////////////////
@@ -304,6 +300,8 @@ Status FileWritableBlock::Append(const Slice& data) {
       << "Invalid state: " << state_;
 
   RETURN_NOT_OK(writer_->Append(data));
+  RETURN_NOT_OK(location_.data_dir()->RefreshIsFull(
+      DataDir::RefreshMode::ALWAYS));
   state_ = DIRTY;
   bytes_appended_ += data.size();
   return Status::OK();
@@ -409,7 +407,7 @@ FileReadableBlock::FileReadableBlock(const FileBlockManager* block_manager,
                                      BlockId block_id,
                                      shared_ptr<RandomAccessFile> reader)
     : block_manager_(block_manager),
-      block_id_(std::move(block_id)),
+      block_id_(block_id),
       reader_(std::move(reader)),
       closed_(false) {
   if (block_manager_->metrics_) {
@@ -477,7 +475,7 @@ Status FileBlockManager::SyncMetadata(const internal::FileBlockLocation& locatio
   // Figure out what directories to sync.
   vector<string> to_sync;
   {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     for (const string& parent_dir : parent_dirs) {
       if (dirty_dirs_.erase(parent_dir)) {
         to_sync.push_back(parent_dir);
@@ -496,167 +494,72 @@ Status FileBlockManager::SyncMetadata(const internal::FileBlockLocation& locatio
 
 bool FileBlockManager::FindBlockPath(const BlockId& block_id,
                                      string* path) const {
-  PathInstanceMetadataFile* metadata_file = FindPtrOrNull(
-      root_paths_by_idx_, internal::FileBlockLocation::GetRootPathIdx(block_id));
-  if (metadata_file) {
+  DataDir* dir = dd_manager_.FindDataDirByUuidIndex(
+      internal::FileBlockLocation::GetDataDirIdx(block_id));
+  if (dir) {
     *path = internal::FileBlockLocation::FromBlockId(
-        metadata_file->path(), block_id).GetFullPath();
+        dir, block_id).GetFullPath();
   }
-  return metadata_file != nullptr;
+  return dir != nullptr;
 }
 
 FileBlockManager::FileBlockManager(Env* env, const BlockManagerOptions& opts)
   : env_(DCHECK_NOTNULL(env)),
     read_only_(opts.read_only),
-    root_paths_(opts.root_paths),
+    dd_manager_(env, opts.metric_entity, kBlockManagerType, opts.root_paths),
     rand_(GetRandomSeed32()),
+    next_block_id_(rand_.Next64()),
     mem_tracker_(MemTracker::CreateTracker(-1,
                                            "file_block_manager",
                                            opts.parent_mem_tracker)) {
-  DCHECK_GT(root_paths_.size(), 0);
+
+  int64_t file_cache_capacity = GetFileCacheCapacityForBlockManager(env_);
+  if (file_cache_capacity != kint64max) {
+    file_cache_.reset(new FileCache<RandomAccessFile>("fbm",
+                                                      env_,
+                                                      file_cache_capacity,
+                                                      opts.metric_entity));
+  }
+
   if (opts.metric_entity) {
     metrics_.reset(new internal::BlockManagerMetrics(opts.metric_entity));
   }
 }
 
 FileBlockManager::~FileBlockManager() {
-  STLDeleteValues(&root_paths_by_idx_);
-  mem_tracker_->UnregisterFromParent();
 }
 
 Status FileBlockManager::Create() {
   CHECK(!read_only_);
-
-  deque<ScopedFileDeleter*> delete_on_failure;
-  ElementDeleter d(&delete_on_failure);
-
-  if (root_paths_.size() > kMaxPaths) {
-    return Status::NotSupported(
-        Substitute("File block manager supports a maximum of $0 paths", kMaxPaths));
-  }
-
-  // The UUIDs and indices will be included in every instance file.
-  ObjectIdGenerator oid_generator;
-  vector<string> all_uuids(root_paths_.size());
-  for (string& u : all_uuids) {
-    u = oid_generator.Next();
-  }
-  int idx = 0;
-
-  // Ensure the data paths exist and create the instance files.
-  unordered_set<string> to_sync;
-  for (const string& root_path : root_paths_) {
-    bool created;
-    RETURN_NOT_OK_PREPEND(env_util::CreateDirIfMissing(env_, root_path, &created),
-                          Substitute("Could not create directory $0", root_path));
-    if (created) {
-      delete_on_failure.push_front(new ScopedFileDeleter(env_, root_path));
-      to_sync.insert(DirName(root_path));
-    }
-
-    string instance_filename = JoinPathSegments(
-        root_path, kInstanceMetadataFileName);
-    PathInstanceMetadataFile metadata(env_, kBlockManagerType,
-                                      instance_filename);
-    RETURN_NOT_OK_PREPEND(metadata.Create(all_uuids[idx], all_uuids),
-                          Substitute("Could not create $0", instance_filename));
-    delete_on_failure.push_front(new ScopedFileDeleter(env_, instance_filename));
-    idx++;
-  }
-
-  // Ensure newly created directories are synchronized to disk.
-  if (FLAGS_enable_data_block_fsync) {
-    for (const string& dir : to_sync) {
-      RETURN_NOT_OK_PREPEND(env_->SyncDir(dir),
-                            Substitute("Unable to synchronize directory $0", dir));
-    }
-  }
-
-  // Success: don't delete any files.
-  for (ScopedFileDeleter* deleter : delete_on_failure) {
-    deleter->Cancel();
-  }
-  return Status::OK();
+  return dd_manager_.Create(
+      FLAGS_enable_data_block_fsync ? DataDirManager::FLAG_CREATE_FSYNC : 0);
 }
 
 Status FileBlockManager::Open() {
-  vector<PathInstanceMetadataFile*> instances;
-  ElementDeleter deleter(&instances);
-  instances.reserve(root_paths_.size());
-
-  for (const string& root_path : root_paths_) {
-    if (!env_->FileExists(root_path)) {
-      return Status::NotFound(Substitute(
-          "FileBlockManager at $0 not found", root_path));
-    }
-    string instance_filename = JoinPathSegments(
-        root_path, kInstanceMetadataFileName);
-    gscoped_ptr<PathInstanceMetadataFile> metadata(
-        new PathInstanceMetadataFile(env_, kBlockManagerType,
-                                     instance_filename));
-    RETURN_NOT_OK_PREPEND(metadata->LoadFromDisk(),
-                          Substitute("Could not open $0", instance_filename));
-    if (FLAGS_block_manager_lock_dirs) {
-      Status s = metadata->Lock();
-      if (!s.ok()) {
-        Status new_status = s.CloneAndPrepend(Substitute(
-            "Could not lock $0", instance_filename));
-        if (read_only_) {
-          // Not fatal in read-only mode.
-          LOG(WARNING) << new_status.ToString();
-          LOG(WARNING) << "Proceeding without lock";
-        } else {
-          return new_status;
-        }
-      }
-    }
-
-    instances.push_back(metadata.release());
+  DataDirManager::LockMode mode;
+  if (!FLAGS_block_manager_lock_dirs) {
+    mode = DataDirManager::LockMode::NONE;
+  } else if (read_only_) {
+    mode = DataDirManager::LockMode::OPTIONAL;
+  } else {
+    mode = DataDirManager::LockMode::MANDATORY;
   }
+  RETURN_NOT_OK(dd_manager_.Open(kMaxPaths, mode));
 
-  RETURN_NOT_OK_PREPEND(PathInstanceMetadataFile::CheckIntegrity(instances),
-                        Substitute("Could not verify integrity of files: $0",
-                                   JoinStrings(root_paths_, ",")));
-
-  PathMap instances_by_idx;
-  for (PathInstanceMetadataFile* instance : instances) {
-    const PathSetPB& path_set = instance->metadata()->path_set();
-    uint32_t idx = -1;
-    for (int i = 0; i < path_set.all_uuids_size(); i++) {
-      if (path_set.uuid() == path_set.all_uuids(i)) {
-        idx = i;
-        break;
-      }
-    }
-    DCHECK_NE(idx, -1); // Guaranteed by CheckIntegrity().
-    if (idx > kMaxPaths) {
-      return Status::NotSupported(
-          Substitute("File block manager supports a maximum of $0 paths", kMaxPaths));
-    }
-    InsertOrDie(&instances_by_idx, idx, instance);
+  if (file_cache_) {
+    RETURN_NOT_OK(file_cache_->Init());
   }
-  instances.clear();
-  instances_by_idx.swap(root_paths_by_idx_);
-  next_root_path_ = root_paths_by_idx_.begin();
   return Status::OK();
 }
 
 Status FileBlockManager::CreateBlock(const CreateBlockOptions& opts,
-                                     gscoped_ptr<WritableBlock>* block) {
+                                     unique_ptr<WritableBlock>* block) {
   CHECK(!read_only_);
 
-  // Pick a root path using a simple round-robin block placement strategy.
-  uint16_t root_path_idx;
-  string root_path;
-  {
-    lock_guard<simple_spinlock> l(&lock_);
-    root_path_idx = next_root_path_->first;
-    root_path = next_root_path_->second->path();
-    next_root_path_++;
-    if (next_root_path_ == root_paths_by_idx_.end()) {
-      next_root_path_ = root_paths_by_idx_.begin();
-    }
-  }
+  DataDir* dir;
+  RETURN_NOT_OK(dd_manager_.GetNextDataDir(&dir));
+  uint16_t uuid_idx;
+  CHECK(dd_manager_.FindUuidIndexByDataDir(dir, &uuid_idx));
 
   string path;
   vector<string> created_dirs;
@@ -664,19 +567,25 @@ Status FileBlockManager::CreateBlock(const CreateBlockOptions& opts,
   internal::FileBlockLocation location;
   shared_ptr<WritableFile> writer;
 
+  int attempt_num = 0;
   // Repeat in case of block id collisions (unlikely).
   do {
     created_dirs.clear();
+
+    // If we failed to generate a unique ID, start trying again from a random
+    // part of the key space.
+    if (attempt_num++ > 0) {
+      next_block_id_.Store(rand_.Next64());
+    }
 
     // Make sure we don't accidentally create a location using the magic
     // invalid ID value.
     BlockId id;
     do {
-      id.SetId(rand_.Next64());
+      id.SetId(next_block_id_.Increment());
     } while (id.IsNull());
 
-    location = internal::FileBlockLocation::FromParts(
-        root_path, root_path_idx, id);
+    location = internal::FileBlockLocation::FromParts(dir, uuid_idx, id);
     path = location.GetFullPath();
     RETURN_NOT_OK_PREPEND(location.CreateBlockDir(env_, &created_dirs), path);
     WritableFileOptions wr_opts;
@@ -689,7 +598,7 @@ Status FileBlockManager::CreateBlock(const CreateBlockOptions& opts,
       // Update dirty_dirs_ with those provided as well as the block's
       // directory, which may not have been created but is definitely dirty
       // (because we added a file to it).
-      lock_guard<simple_spinlock> l(&lock_);
+      std::lock_guard<simple_spinlock> l(lock_);
       for (const string& created : created_dirs) {
         dirty_dirs_.insert(created);
       }
@@ -700,12 +609,12 @@ Status FileBlockManager::CreateBlock(const CreateBlockOptions& opts,
   return s;
 }
 
-Status FileBlockManager::CreateBlock(gscoped_ptr<WritableBlock>* block) {
+Status FileBlockManager::CreateBlock(unique_ptr<WritableBlock>* block) {
   return CreateBlock(CreateBlockOptions(), block);
 }
 
 Status FileBlockManager::OpenBlock(const BlockId& block_id,
-                                   gscoped_ptr<ReadableBlock>* block) {
+                                   unique_ptr<ReadableBlock>* block) {
   string path;
   if (!FindBlockPath(block_id, &path)) {
     return Status::NotFound(
@@ -715,7 +624,11 @@ Status FileBlockManager::OpenBlock(const BlockId& block_id,
   VLOG(1) << "Opening block with id " << block_id.ToString() << " at " << path;
 
   shared_ptr<RandomAccessFile> reader;
-  RETURN_NOT_OK(env_util::OpenFileForRandom(env_, path, &reader));
+  if (file_cache_) {
+    RETURN_NOT_OK(file_cache_->OpenExistingFile(path, &reader));
+  } else {
+    RETURN_NOT_OK(env_util::OpenFileForRandom(env_, path, &reader));
+  }
   block->reset(new internal::FileReadableBlock(this, block_id, reader));
   return Status::OK();
 }
@@ -728,7 +641,11 @@ Status FileBlockManager::DeleteBlock(const BlockId& block_id) {
     return Status::NotFound(
         Substitute("Block $0 not found", block_id.ToString()));
   }
-  RETURN_NOT_OK(env_->DeleteFile(path));
+  if (file_cache_) {
+    RETURN_NOT_OK(file_cache_->DeleteFile(path));
+  } else {
+    RETURN_NOT_OK(env_->DeleteFile(path));
+  }
 
   // We don't bother fsyncing the parent directory as there's nothing to be
   // gained by ensuring that the deletion is made durable. Even if we did
@@ -756,6 +673,79 @@ Status FileBlockManager::CloseBlocks(const vector<WritableBlock*>& blocks) {
   // Now close each block, waiting for each to become durable.
   for (WritableBlock* block : blocks) {
     RETURN_NOT_OK(block->Close());
+  }
+  return Status::OK();
+}
+
+namespace {
+
+Status GetAllBlockIdsForDataDirCb(DataDir* dd,
+                                  vector<BlockId>* block_ids,
+                                  Env::FileType file_type,
+                                  const string& dirname,
+                                  const string& basename) {
+  if (file_type != Env::FILE_TYPE) {
+    // Skip directories.
+    return Status::OK();
+  }
+
+  uint64_t numeric_id;
+  if (!safe_strtou64(basename, &numeric_id)) {
+    // Skip files with non-numerical names.
+    return Status::OK();
+  }
+
+  // Verify that this block ID look-alike is, in fact, a block ID.
+  //
+  // We could also verify its contents, but that'd be quite expensive.
+  BlockId block_id(numeric_id);
+  internal::FileBlockLocation loc(
+      internal::FileBlockLocation::FromBlockId(dd, block_id));
+  if (loc.GetFullPath() != JoinPathSegments(dirname, basename)) {
+    return Status::OK();
+  }
+
+  block_ids->push_back(block_id);
+  return Status::OK();
+}
+
+void GetAllBlockIdsForDataDir(Env* env,
+                              DataDir* dd,
+                              vector<BlockId>* block_ids,
+                              Status* status) {
+  *status = env->Walk(dd->dir(), Env::PRE_ORDER,
+                      Bind(&GetAllBlockIdsForDataDirCb, dd, block_ids));
+}
+
+} // anonymous namespace
+
+Status FileBlockManager::GetAllBlockIds(vector<BlockId>* block_ids) {
+  const auto& dds = dd_manager_.data_dirs();
+  block_ids->clear();
+
+  // The FBM does not maintain block listings in memory, so off we go to the
+  // filesystem. The search is parallelized across data directories.
+  vector<vector<BlockId>> block_id_vecs(dds.size());
+  vector<Status> statuses(dds.size());
+  for (int i = 0; i < dds.size(); i++) {
+    dds[i]->ExecClosure(Bind(&GetAllBlockIdsForDataDir,
+                             env_,
+                             dds[i].get(),
+                             &block_id_vecs[i],
+                             &statuses[i]));
+  }
+  for (const auto& dd : dd_manager_.data_dirs()) {
+    dd->WaitOnClosures();
+  }
+
+  // A failure on any data directory is fatal.
+  for (const auto& s : statuses) {
+    RETURN_NOT_OK(s);
+  }
+
+  // Collect the results into 'blocks'.
+  for (const auto& ids : block_id_vecs) {
+    block_ids->insert(block_ids->begin(), ids.begin(), ids.end());
   }
   return Status::OK();
 }
